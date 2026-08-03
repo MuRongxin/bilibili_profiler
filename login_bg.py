@@ -47,6 +47,10 @@ def main():
         code = result.get("data", {}).get("code", -1)
         
         if code == 0:
+            # 从扫码响应中提取 refresh_token（用于后续 cookie 自动刷新）
+            refresh_token = result.get("data", {}).get("refresh_token", "")
+            if refresh_token:
+                client._refresh_token = refresh_token
             print("\n[Login] 登录成功!")
             save_cookie(client)
             print(f"[Login] Cookie已保存: {COOKIE_PATH}")

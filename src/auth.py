@@ -9,6 +9,7 @@ import json
 import time
 import os
 import re
+import tempfile
 import uuid
 import qrcode
 import requests
@@ -60,16 +61,34 @@ def save_cookie(client: BiliAPIClient) -> None:
     # 同时保存 refresh_token
     if hasattr(client, "_refresh_token"):
         cookie_dict["_refresh_token"] = client._refresh_token
-    with open(COOKIE_PATH, "w", encoding="utf-8") as f:
-        json.dump(cookie_dict, f, ensure_ascii=False, indent=2)
+    # 原子写入：先写临时文件再 os.replace，避免中断留下截断的 JSON
+    dir_ = os.path.dirname(COOKIE_PATH) or "."
+    fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cookie_dict, f, ensure_ascii=False, indent=2)
+        # cookie 即账号凭证，收紧权限为仅当前用户可读写
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, COOKIE_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     print(f"[Auth] Cookie已保存到 {COOKIE_PATH}")
 
 
 def load_cookie() -> dict | None:
     if not os.path.exists(COOKIE_PATH):
         return None
-    with open(COOKIE_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(COOKIE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        # cookie 文件损坏（如上次写入被中断），降级为重新登录而非崩溃
+        print(f"[Auth] 警告: Cookie文件损坏（{COOKIE_PATH}），请重新登录")
+        return None
 
 
 def verify_cookie(client: BiliAPIClient) -> bool:

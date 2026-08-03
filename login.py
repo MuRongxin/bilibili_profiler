@@ -67,6 +67,10 @@ def main():
     code = result.get("data", {}).get("code", -1)
 
     if code == 0:
+        # 从扫码响应中提取 refresh_token（用于后续 cookie 自动刷新）
+        refresh_token = result.get("data", {}).get("refresh_token", "")
+        if refresh_token:
+            client._refresh_token = refresh_token
         print("[✓] 登录成功!")
         save_cookie(client)
         print(f"\n  Cookie已保存到: {COOKIE_PATH}")
@@ -88,6 +92,10 @@ def main():
         result = poll_qrcode(qrcode_key, client)
         code = result.get("data", {}).get("code", -1)
         if code == 0:
+            # 从扫码响应中提取 refresh_token（用于后续 cookie 自动刷新）
+            refresh_token = result.get("data", {}).get("refresh_token", "")
+            if refresh_token:
+                client._refresh_token = refresh_token
             print("[✓] 登录成功!")
             save_cookie(client)
             print(f"\n  Cookie已保存到: {COOKIE_PATH}")
