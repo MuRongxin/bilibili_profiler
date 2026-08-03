@@ -110,7 +110,9 @@ class BiliAPIClient:
         """限速与请求发出原子化（线程安全）；冷却 sleep 在锁外，不阻塞其他线程"""
         with self._lock:
             self._sleep_if_needed(url)
-            return self.session.request(method, url, timeout=15, **kwargs)
+            # setdefault：调用方显式传 timeout（如 _get_wbi_key 的 timeout=10）时保留，避免关键字冲突
+            kwargs.setdefault("timeout", 15)
+            return self.session.request(method, url, **kwargs)
 
     def get(self, url: str, params: dict = None, headers: dict = None, **kwargs) -> dict:
         merged_headers = {**(headers or {})}
