@@ -24,13 +24,17 @@ class BiliAPIClient:
 
     线程安全：限速与请求发出通过同一把 RLock 原子化，多线程并发调用时
     限速为全局限速（所有线程共享同一速率，整体请求频率不会超过配置上限）。
-    注意：冷却/退避 sleep（重试退避、-412/-352 等待）在锁外执行，不阻塞其他线程。
+    注意：重试退避 sleep（-352/-403 等待、指数退避）在锁外执行，不阻塞其他线程；
+    但 -412 风控冷却通过全局共享时间戳 _risk_cooldown_until 在锁内等待，
+    所有线程一起暂停（全局冷却的预期语义，避免多线程各自命中 -412 加重风控）。
     """
 
     def __init__(self, session: requests.Session = None):
         self.session = session or requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
         self._last_request_time = 0
+        # -412 风控全局冷却截止时刻（时间戳），所有线程共享；0 表示无冷却
+        self._risk_cooldown_until = 0.0
         # RLock：_get_wbi_key/_ensure_buvid3 在持有锁的请求路径中可能嵌套发请求
         self._lock = threading.RLock()
         self._wbi_key = None
@@ -122,6 +126,13 @@ class BiliAPIClient:
             pass  # 非必需，失败不影响主流程
 
     def _sleep_if_needed(self, url: str):
+        # -412 全局冷却：本方法在 _request_locked 的锁内执行，
+        # 冷却等待会阻塞其他线程拿锁，即所有请求一起暂停（全局冷却的预期语义）
+        remaining = self._risk_cooldown_until - time.time()
+        if remaining > 0:
+            if remaining > 1:
+                print(f"[API] 风控冷却中，等待 {remaining:.0f} 秒...")
+            time.sleep(remaining)
         delay = REQUEST_DELAY_LONG if self._is_risk_api(url) else REQUEST_DELAY
         delay += random.uniform(0.1, 0.4)
         elapsed = time.time() - self._last_request_time
@@ -130,7 +141,7 @@ class BiliAPIClient:
         self._last_request_time = time.time()
 
     def _request_locked(self, method: str, url: str, **kwargs) -> requests.Response:
-        """限速与请求发出原子化（线程安全）；冷却 sleep 在锁外，不阻塞其他线程"""
+        """限速与请求发出原子化（线程安全）；全局冷却等待在锁内的 _sleep_if_needed 中执行"""
         with self._lock:
             self._sleep_if_needed(url)
             # setdefault：调用方显式传 timeout（如 _get_wbi_key 的 timeout=10）时保留，避免关键字冲突
@@ -158,6 +169,8 @@ class BiliAPIClient:
                     # 风控拦截：短退避无意义，改长冷却；最后一次不再浪费冷却，直接降级返回
                     if attempt < MAX_RETRY - 1:
                         wait = RISK_COOLDOWN + random.uniform(0, 60)
+                        # 记录全局冷却截止时刻，其他线程在 _sleep_if_needed 中一起等待
+                        self._risk_cooldown_until = time.time() + wait
                         print(f"[API] 触发风控-412，冷却 {wait:.0f} 秒后重试...")
                         time.sleep(wait)
                         continue
@@ -184,6 +197,8 @@ class BiliAPIClient:
                     # HTTP 412 与业务码 -412 同等处理：长冷却重试，耗尽后降级返回
                     if attempt < MAX_RETRY - 1:
                         wait = RISK_COOLDOWN + random.uniform(0, 60)
+                        # 记录全局冷却截止时刻，其他线程在 _sleep_if_needed 中一起等待
+                        self._risk_cooldown_until = time.time() + wait
                         print(f"[API] 触发风控HTTP412，冷却 {wait:.0f} 秒后重试...")
                         time.sleep(wait)
                         continue
