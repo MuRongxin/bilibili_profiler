@@ -4,10 +4,11 @@
 import time
 import random
 import hashlib
+import hmac
 import threading
 import requests
 from urllib.parse import quote
-from config import DEFAULT_HEADERS, REQUEST_DELAY, REQUEST_DELAY_LONG, MAX_RETRY, RETRY_BACKOFF, RISK_COOLDOWN, NAV_URL
+from config import DEFAULT_HEADERS, REQUEST_DELAY, REQUEST_DELAY_LONG, MAX_RETRY, RETRY_BACKOFF, RISK_COOLDOWN, NAV_URL, BILI_TICKET_ENABLED
 
 
 # WBI 密钥混淆数组（来自 biliscope）
@@ -19,7 +20,7 @@ WBI_OE = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45,
 
 
 class BiliAPIClient:
-    """B站API客户端，统一处理请求、限速、重试、WBI签名、buvid3
+    """B站API客户端，统一处理请求、限速、重试、WBI签名、buvid3/buvid4/bili_ticket
 
     线程安全：限速与请求发出通过同一把 RLock 原子化，多线程并发调用时
     限速为全局限速（所有线程共享同一速率，整体请求频率不会超过配置上限）。
@@ -81,7 +82,7 @@ class BiliAPIClient:
         return params
 
     def _ensure_buvid3(self):
-        """获取并缓存 buvid3 设备指纹，减少风控"""
+        """获取并缓存 buvid3/buvid4 设备指纹，减少风控"""
         if self._buvid3:
             return self._buvid3
         try:
@@ -94,9 +95,31 @@ class BiliAPIClient:
             self._buvid3 = data.get("b_3", "")
             if self._buvid3:
                 self.session.cookies.set("buvid3", self._buvid3, domain=".bilibili.com")
+            # spi 同时返回 b_4（buvid4），一并写入 cookie
+            buvid4 = data.get("b_4", "")
+            if buvid4:
+                self.session.cookies.set("buvid4", buvid4, domain=".bilibili.com")
         except Exception:
             pass
         return self._buvid3 or ""
+
+    def _ensure_bili_ticket(self):
+        """申请 bili_ticket（3天有效），降低风控概率；失败静默降级"""
+        if not BILI_TICKET_ENABLED or getattr(self, "_bili_ticket_ok", False):
+            return
+        self._bili_ticket_ok = True  # 每次会话只尝试一次
+        try:
+            ts = int(time.time())
+            hexsign = hmac.new(b"XgwSnGZ1p", f"ts{ts}".encode(), hashlib.sha256).hexdigest()
+            data = self.post(
+                "https://api.bilibili.com/bapis/bilibili.api.ticket.v1.Ticket/GenWebTicket",
+                params={"key_id": "ec02", "hexsign": hexsign, "context[ts]": ts, "csrf": ""},
+            )
+            ticket = (data.get("data") or {}).get("ticket", "")
+            if ticket:
+                self.session.cookies.set("bili_ticket", ticket, domain=".bilibili.com")
+        except Exception:
+            pass  # 非必需，失败不影响主流程
 
     def _sleep_if_needed(self, url: str):
         delay = REQUEST_DELAY_LONG if self._is_risk_api(url) else REQUEST_DELAY
@@ -118,8 +141,9 @@ class BiliAPIClient:
         merged_headers = {**(headers or {})}
         params = dict(params or {})
 
-        # buvid3 反爬
+        # buvid3/bili_ticket 反爬
         self._ensure_buvid3()
+        self._ensure_bili_ticket()
 
         # WBI 签名
         if self._is_wbi_api(url):
