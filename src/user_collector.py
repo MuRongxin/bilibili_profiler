@@ -18,6 +18,14 @@ from config import (
 )
 
 
+def _safe_int(v, default=0):
+    """B站数值字段可能返回 '--' 等字符串，强转失败时降级为默认值"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 # ========== 维度1：用户主页信息 ==========
 
 def get_user_card(uid: int, client: BiliAPIClient) -> dict:
@@ -94,9 +102,9 @@ def get_user_videos(uid: int, client: BiliAPIClient, max_pages: int = MAX_VIDEO_
                 "bvid": v.get("bvid", ""),
                 "title": v.get("title", ""),
                 "description": v.get("description", ""),
-                "play": v.get("play", 0),
-                "comment": v.get("comment", 0),
-                "created": v.get("created", 0),
+                "play": _safe_int(v.get("play", 0)),
+                "comment": _safe_int(v.get("comment", 0)),
+                "created": _safe_int(v.get("created", 0)),
                 "length": v.get("length", ""),
                 "typeid": v.get("typeid", 0),
                 "tag": v.get("tag", ""),
@@ -150,7 +158,7 @@ def get_user_dynamics(uid: int, client: BiliAPIClient, max_pages: int = MAX_DYNA
                 video_info = {
                     "title": archive.get("title", ""),
                     "bvid": archive.get("bvid", ""),
-                    "play": archive.get("stat", {}).get("view", 0),
+                    "play": _safe_int(archive.get("stat", {}).get("view", 0)),
                 }
 
             stat = modules.get("module_stat", {})
@@ -160,9 +168,9 @@ def get_user_dynamics(uid: int, client: BiliAPIClient, max_pages: int = MAX_DYNA
                 "content": content[:500],
                 "images": images[:4],
                 "timestamp": author.get("pub_ts", 0),
-                "like": stat.get("like", {}).get("count", 0),
-                "comment": stat.get("comment", {}).get("count", 0),
-                "repost": stat.get("forward", {}).get("count", 0),
+                "like": _safe_int(stat.get("like", {}).get("count", 0)),
+                "comment": _safe_int(stat.get("comment", {}).get("count", 0)),
+                "repost": _safe_int(stat.get("forward", {}).get("count", 0)),
                 "video_info": video_info,
             })
 
@@ -185,7 +193,7 @@ def get_favorite_folders(uid: int, client: BiliAPIClient) -> list[dict]:
         folders.append({
             "id": f.get("id", 0),
             "title": f.get("title", ""),
-            "media_count": f.get("media_count", 0),
+            "media_count": _safe_int(f.get("media_count", 0)),
             "attr": f.get("attr", 0),  # 0:公开, 1:私密
         })
     return folders
@@ -207,7 +215,7 @@ def get_favorite_contents(media_id: int, client: BiliAPIClient, max_items: int =
             "upper": item.get("upper", {}).get("name", ""),
             "type": item.get("type", 0),
             "bvid": item.get("bvid", ""),
-            "play": item.get("cnt_info", {}).get("play", 0),
+            "play": _safe_int(item.get("cnt_info", {}).get("play", 0)),
         })
     return items
 

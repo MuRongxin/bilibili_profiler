@@ -250,13 +250,17 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
             "video_times": sender_groups.get(mid_hash, {}).get("video_times", []),
         }
 
-        profile = analyze_profile(user_data, danmaku_stats, spam)
-        # 碰撞风险标记传入报告，供"可能误识别"徽标展示
-        profile["collision_risk"] = info.get("collision_risk", False)
-        profiles.append(profile)
+        # 逐人容错：单个用户分析/落库失败只跳过该用户，不中断整个阶段（对齐阶段5粒度）
+        try:
+            profile = analyze_profile(user_data, danmaku_stats, spam)
+            # 碰撞风险标记传入报告，供"可能误识别"徽标展示
+            profile["collision_risk"] = info.get("collision_risk", False)
+            profiles.append(profile)
 
-        # 保存到数据库
-        save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0), user_data, profile)
+            # 保存到数据库
+            save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0), user_data, profile)
+        except Exception as e:
+            print(f"  [Phase 6] 警告: UID:{uid} 画像分析失败，已跳过: {e}")
 
     print(f"[Phase 6] 生成 {len(profiles)} 份画像")
     return profiles
@@ -300,6 +304,11 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
     # 阶段2: 弹幕
     video_info, danmaku_list, sender_groups = phase_danmaku(bvid, client)
     aid = video_info.get("aid", 0)
+
+    # 弹幕为空时提前终止：后续评论/解析/画像均无意义，避免白跑全流程产出空报告
+    if not danmaku_list:
+        print("[Main] 弹幕为空，终止分析")
+        return
 
     # 阶段3: 评论
     comments, comment_uid_map = phase_comment(aid, client)
