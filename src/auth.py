@@ -106,12 +106,11 @@ def verify_cookie(client: BiliAPIClient) -> bool:
 def _check_needs_refresh(client: BiliAPIClient) -> bool:
     """检查 cookie 是否需要刷新（还没完全过期但快过期）"""
     try:
-        resp = client.session.get(
+        data = client.get(
             "https://passport.bilibili.com/x/passport-login/web/cookie/info",
-            timeout=10,
         )
-        data = resp.json()
-        return data.get("data", {}).get("refresh", False)
+        # get() 降级返回 {"code": -1} 时 data 字段为 None，用 or {} 防御
+        return (data.get("data") or {}).get("refresh", False)
     except Exception:
         return False
 
@@ -137,22 +136,25 @@ def _try_refresh_cookie(client: BiliAPIClient) -> bool:
         # Step 1: 获取 correspondPath
         correspond_path = _get_correspond_path()
 
-        # Step 2: 获取 refresh_csrf
-        sess = client.session
+        # Step 2: 获取 refresh_csrf（该页面是 HTML，需要原始响应用正则提取；
+        # get_raw 重试耗尽会 raise，这里接住降级为刷新失败）
         buvid = str(uuid.uuid1())
-        resp = sess.get(
-            f"https://www.bilibili.com/correspond/1/{correspond_path}",
-            cookies={"buvid3": buvid},
-            timeout=15,
-        )
+        try:
+            resp = client.get_raw(
+                f"https://www.bilibili.com/correspond/1/{correspond_path}",
+                cookies={"buvid3": buvid},
+            )
+        except Exception as e:
+            print(f"[Auth] 获取 refresh_csrf 请求失败: {e}")
+            return False
         match = re.search(r'<div id="1-name">(.+?)</div>', resp.text)
         if not match:
             print("[Auth] refresh_csrf 提取失败")
             return False
         refresh_csrf = match.group(1)
 
-        # Step 3: 执行刷新
-        resp = sess.post(
+        # Step 3: 执行刷新（requests.Session 会自动把响应 Set-Cookie 写入 cookie jar）
+        data = client.post(
             "https://passport.bilibili.com/x/passport-login/web/cookie/refresh",
             data={
                 "csrf": client.get_cookies_dict().get("bili_jct", ""),
@@ -161,26 +163,22 @@ def _try_refresh_cookie(client: BiliAPIClient) -> bool:
                 "source": "main_web",
             },
             cookies={"buvid3": str(uuid.uuid1())},
-            timeout=15,
         )
-        data = resp.json()
         if data.get("code") != 0:
             print(f"[Auth] 刷新失败: {data.get('message', '')}")
             return False
 
-        # Step 4: 更新 cookies
-        new_cookies = dict(resp.cookies)
-        sess.cookies.update(new_cookies)
-        new_refresh_token = data.get("data", {}).get("refresh_token", "")
+        # Step 4: 更新 cookies（Step 3 的新 cookie 已自动写入 session，直接读取）
+        new_cookies = client.get_cookies_dict()
+        new_refresh_token = (data.get("data") or {}).get("refresh_token", "")
 
         # Step 5: 确认刷新
-        sess.post(
+        client.post(
             "https://passport.bilibili.com/x/passport-login/web/confirm/refresh",
             data={
                 "csrf": new_cookies.get("bili_jct", ""),
                 "refresh_token": refresh_token,
             },
-            timeout=10,
         )
 
         client._refresh_token = new_refresh_token or refresh_token
@@ -208,11 +206,11 @@ def login_by_qrcode() -> BiliAPIClient:
         if verify_cookie(client):
             return client
 
-        # Cookie 无效，尝试刷新
-        if refresh_token and _check_needs_refresh(client):
-            if _try_refresh_cookie(client):
-                if verify_cookie(client):
-                    return client
+        # Cookie 验证失败但 refresh_token 可能仍有效：无条件先尝试一次刷新，
+        # 成功后再重新验证；仍失败才走重新扫码
+        if refresh_token and _try_refresh_cookie(client):
+            if verify_cookie(client):
+                return client
 
         print("[Auth] Cookie已过期，需要重新扫码登录...")
 

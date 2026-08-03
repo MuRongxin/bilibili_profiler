@@ -171,6 +171,34 @@ class BiliAPIClient:
                     return {"code": -1, "message": f"HTTP错误 {status}"}
         return {"code": -1, "message": "重试次数耗尽"}
 
+    def post(self, url: str, data: dict = None, params: dict = None, **kwargs) -> dict:
+        """POST 请求（限速+重试），返回解析后的 JSON dict
+
+        与 get() 同款限速/指数退避重试，耗尽降级返回 {"code": -1, ...} 不 raise。
+        不走 WBI 签名，也不调用 _ensure_buvid3（cookie 刷新等接口不需要，
+        且避免在 buvid3 获取路径中嵌套 POST 造成递归）。
+        """
+        for attempt in range(MAX_RETRY):
+            try:
+                resp = self._request_locked("POST", url, data=data, params=params, **kwargs)
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.Timeout, requests.ConnectionError, ValueError) as e:
+                # ValueError 含 resp.json() 解析失败（非 JSON 响应）
+                if attempt < MAX_RETRY - 1:
+                    wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait)
+                else:
+                    return {"code": -1, "message": f"请求异常: {e}"}
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response else 0
+                if attempt < MAX_RETRY - 1 and status >= 500:
+                    wait = RETRY_BACKOFF * (2 ** attempt)
+                    time.sleep(wait)
+                else:
+                    return {"code": -1, "message": f"HTTP错误 {status}"}
+        return {"code": -1, "message": "重试次数耗尽"}
+
     def get_raw(self, url: str, params: dict = None, **kwargs) -> requests.Response:
         """带重试的原始响应请求（弹幕 XML 等非 JSON 接口）
 
