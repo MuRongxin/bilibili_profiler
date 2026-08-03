@@ -7,7 +7,7 @@ import hashlib
 import threading
 import requests
 from urllib.parse import quote
-from config import DEFAULT_HEADERS, REQUEST_DELAY, REQUEST_DELAY_LONG, MAX_RETRY, RETRY_BACKOFF, NAV_URL
+from config import DEFAULT_HEADERS, REQUEST_DELAY, REQUEST_DELAY_LONG, MAX_RETRY, RETRY_BACKOFF, RISK_COOLDOWN, NAV_URL
 
 
 # WBI 密钥混淆数组（来自 biliscope）
@@ -131,9 +131,13 @@ class BiliAPIClient:
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("code") == -412:
-                    wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
-                    time.sleep(wait)
-                    continue
+                    # 风控拦截：短退避无意义，改长冷却；最后一次不再浪费冷却，直接降级返回
+                    if attempt < MAX_RETRY - 1:
+                        wait = RISK_COOLDOWN + random.uniform(0, 60)
+                        print(f"[API] 触发风控-412，冷却 {wait:.0f} 秒后重试...")
+                        time.sleep(wait)
+                        continue
+                    return {"code": -412, "message": "风控拦截"}
                 # 签名失效（一般接口 -352、评论 wbi 接口 -403，均伴随 v_voucher）：清缓存强制刷新密钥并重签
                 if data.get("code") in (-352, -403):
                     self._wbi_key = None
@@ -143,30 +147,47 @@ class BiliAPIClient:
                     params = self._sign_wbi(dict(params))
                     continue
                 return data
-            except (requests.Timeout, requests.ConnectionError):
+            except (requests.Timeout, requests.ConnectionError, ValueError) as e:
+                # ValueError 含 resp.json() 解析失败（风控 HTML 错误页等非 JSON 响应）
                 if attempt < MAX_RETRY - 1:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
                     time.sleep(wait)
                 else:
-                    raise
+                    return {"code": -1, "message": f"请求异常: {e}"}
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response else 0
                 if status == 412:
+                    # HTTP 412 与业务码 -412 同等处理：长冷却重试，耗尽后降级返回
                     if attempt < MAX_RETRY - 1:
-                        wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 2)
+                        wait = RISK_COOLDOWN + random.uniform(0, 60)
+                        print(f"[API] 触发风控HTTP412，冷却 {wait:.0f} 秒后重试...")
                         time.sleep(wait)
                         continue
-                    else:
-                        raise
+                    return {"code": -412, "message": "风控拦截"}
                 if attempt < MAX_RETRY - 1 and status >= 500:
                     wait = RETRY_BACKOFF * (2 ** attempt)
                     time.sleep(wait)
                 else:
-                    raise
-        return {"code": -1, "message": "Max retry exceeded"}
+                    return {"code": -1, "message": f"HTTP错误 {status}"}
+        return {"code": -1, "message": "重试次数耗尽"}
 
     def get_raw(self, url: str, params: dict = None, **kwargs) -> requests.Response:
-        return self._request_locked("GET", url, params=params, **kwargs)
+        """带重试的原始响应请求（弹幕 XML 等非 JSON 接口）
+
+        重试 MAX_RETRY 次（指数退避+抖动），耗尽后 raise 最后一个异常，由调用方兜底。
+        """
+        last_exc = None
+        for attempt in range(MAX_RETRY):
+            try:
+                resp = self._request_locked("GET", url, params=params, **kwargs)
+                resp.raise_for_status()
+                return resp
+            except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+                last_exc = e
+                if attempt < MAX_RETRY - 1:
+                    wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait)
+        raise last_exc
 
     def update_cookies(self, cookies: dict):
         self.session.cookies.update(cookies)
