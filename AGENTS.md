@@ -50,7 +50,7 @@ src/
 └── storage.py           # SQLite 持久化（data/profiler.db），支撑断点续采
 ```
 
-数据流：`run.py` → `main.run_analysis(bvid, force, max_users)`，各阶段通过 SQLite 缓存中间结果（已解析的 sender、已采集的 user_data、进度），因此 Ctrl+C 中断后重跑可恢复；`--force` 会忽略这些缓存。
+数据流：`run.py` → `main.run_analysis(bvid, force, max_users)`，各阶段通过 SQLite 缓存中间结果（已解析的 sender、已采集的 user_data），阶段5采集成功立即落库，因此 Ctrl+C 中断后重跑可恢复；`--force` 会清除该视频的缓存并强制重采全部用户。
 
 ## 开发约定
 

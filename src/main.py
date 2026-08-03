@@ -12,7 +12,7 @@ import argparse
 
 from config import MAX_ANALYZE_USERS, LLM_API_KEY
 from storage import init_db, save_video_info, save_sender, save_user_data
-from storage import load_user_data, has_user_data, get_resolved_uids, load_senders
+from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam
 from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders
@@ -293,13 +293,14 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
     # 初始化数据库
     init_db()
 
-    # --force: 清除该视频的全部缓存，后续阶段全部重新采集
+    # 阶段1: 登录
+    client = phase_login()
+
+    # --force: 登录成功后清除该视频的全部缓存，后续阶段全部重新采集
+    # （放在登录后，避免登录失败/取消时缓存已清但新数据未采）
     if force:
         clear_video_cache(bvid)
         print(f"[Main] --force 已清除 {bvid} 的缓存，全部重新采集")
-
-    # 阶段1: 登录
-    client = phase_login()
 
     # 阶段2: 弹幕
     video_info, danmaku_list, sender_groups = phase_danmaku(bvid, client)

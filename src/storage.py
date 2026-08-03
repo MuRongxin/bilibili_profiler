@@ -72,6 +72,10 @@ def init_db():
         ''')
 
         conn.commit()
+
+        # 清理旧版本的 progress 表（断点续采已改为纯 senders/users 缓存机制）
+        cursor.execute("DROP TABLE IF EXISTS progress")
+        conn.commit()
     print("[Storage] 数据库初始化完成")
 
 
@@ -157,15 +161,6 @@ def load_senders(bvid: str) -> list[dict]:
         "spam_level": r["spam_level"],
         "spam_score": r["spam_score"],
     } for r in rows]
-
-
-def get_resolved_uids(bvid: str) -> set[int]:
-    """获取已解析出UID的发送者"""
-    with closing(get_db()) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT uid FROM senders WHERE bvid = ? AND uid IS NOT NULL", (bvid,))
-        rows = cursor.fetchall()
-    return {r["uid"] for r in rows}
 
 
 # ========== 用户数据 ==========
