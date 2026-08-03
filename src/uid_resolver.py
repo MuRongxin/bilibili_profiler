@@ -161,7 +161,7 @@ def resolve_sender(
         (uid, confidence, method, user_info, collision_risk)
         uid: 解析出的UID，失败为None
         confidence: 置信度（高/中/低/无）；暴力破解路径上限为"中"
-        method: 解析方法（评论区验证/CRC32破解/未知）
+        method: 解析方法（评论区验证/CRC32破解/CRC32碰撞/未知）
         user_info: API验证返回的用户信息
         collision_risk: 是否有CRC32碰撞误识别风险（暴力破解路径为True）
     """
