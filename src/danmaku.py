@@ -27,13 +27,17 @@ def get_cid_for_page(video_info: dict, page_index: int = 0) -> int:
     return pages[0]["cid"]
 
 
+# 防御性XML解析器：禁用外部实体与网络访问，防XXE/实体膨胀攻击
+_SAFE_XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
+
+
 def parse_danmaku_xml(xml_bytes: bytes) -> list[dict]:
     """
     解析B站弹幕XML
     
     d标签属性: p="时间,模式,字号,颜色,时间戳,池,用户ID(hash),弹幕ID"
     """
-    root = etree.fromstring(xml_bytes)
+    root = etree.fromstring(xml_bytes, parser=_SAFE_XML_PARSER)
     danmaku_list = []
 
     for d in root.findall(".//d"):
@@ -74,18 +78,31 @@ def fetch_danmaku(cid: int, client: BiliAPIClient) -> list[dict]:
 
 
 def fetch_all_danmaku(video_info: dict, client: BiliAPIClient) -> list[dict]:
-    """获取视频所有分P的弹幕"""
+    """获取视频所有分P的弹幕（单页失败只跳过该页，不中断整体采集）"""
     pages = video_info.get("pages", [])
     if not pages:
         pages = [{"cid": video_info.get("cid", 0), "page": 1}]
 
     all_danmaku = []
+    failed_pages = []
     for idx, page in enumerate(pages):
         cid = page["cid"]
-        dms = fetch_danmaku(cid, client)
+        try:
+            dms = fetch_danmaku(cid, client)
+        except Exception as e:
+            # 降级而非中断：网络抖动或412错误页（非XML）等单页异常仅跳过该分P
+            failed_pages.append(idx + 1)
+            print(f"[Danmaku] 警告：分P {idx + 1} 弹幕采集失败，已跳过该页: {e}")
+            continue
         for dm in dms:
             dm["page"] = idx + 1
         all_danmaku.extend(dms)
+
+    if failed_pages:
+        print(f"[Danmaku] 警告：共 {len(failed_pages)}/{len(pages)} 页采集失败"
+              f"（失败分P: {failed_pages}），弹幕数据可能不完整")
+    if len(failed_pages) == len(pages) and pages:
+        print("[Danmaku] 【严重警告】所有分P弹幕均采集失败，返回空弹幕列表！")
 
     return all_danmaku
 
