@@ -149,7 +149,7 @@ def phase_spam(sender_groups: dict) -> dict:
 
 
 def phase_collect_users(resolved: dict, client, max_users: int = MAX_ANALYZE_USERS, force: bool = False):
-    """阶段5: 深度采集用户数据（force=True 时跳过缓存强制重采）"""
+    """阶段5: 深度采集用户数据（成功立即落库可断点续采；force=True 跳过缓存强制重采）"""
     print("\n[Phase 5/6] 深度采集用户信息...")
 
     # 筛选需要采集的用户（有UID且置信度 acceptable）
@@ -163,7 +163,20 @@ def phase_collect_users(resolved: dict, client, max_users: int = MAX_ANALYZE_USE
     # 按弹幕数量降序，限制最大分析数
     # 这里我们没法直接排序，因为resolved没有原始count，但我们可以 trust danmaku_count
     uids_to_collect.sort(key=lambda x: resolved[x[0]]["danmaku_count"], reverse=True)
-    uids_to_collect = uids_to_collect[:max_users]
+
+    # 同一 uid 可能被多个 mid_hash 命中（如评论交叉验证与 CRC32 破解指向同一人），
+    # 去重后只采集一次，后续 mid_hash 在阶段6复用 user_data_map 中同一份数据
+    seen_uids = set()
+    deduped = []
+    for mid_hash, uid in uids_to_collect:
+        if uid in seen_uids:
+            continue
+        seen_uids.add(uid)
+        deduped.append((mid_hash, uid))
+    skipped_dup = len(uids_to_collect) - len(deduped)
+    if skipped_dup > 0:
+        print(f"[Phase 5] 去重: {skipped_dup} 个 mid_hash 指向重复 UID，合并采集")
+    uids_to_collect = deduped[:max_users]
 
     total = len(uids_to_collect)
     print(f"[Phase 5] 需采集用户: {total} 人 (上限 {max_users})")
@@ -188,7 +201,11 @@ def phase_collect_users(resolved: dict, client, max_users: int = MAX_ANALYZE_USE
             if "error" not in data:
                 user_data_map[uid] = data
                 processed.add(uid)
+                # 立即落库：Ctrl+C 中断后已采集数据不丢失，重跑时命中上方缓存跳过。
+                # profile 暂存空 dict，阶段6分析后以 INSERT OR REPLACE 覆盖
+                save_user_data(uid, data.get("name", ""), data.get("level", 0), data, {})
             else:
+                # 失败不落库，重跑时会重新采集
                 print(f"  [失败] {data['error']}")
         except Exception as e:
             print(f"  [异常] {e}")
