@@ -144,6 +144,7 @@ def generate_user_card(profile: dict) -> str:
                     <span class="uid">UID:{uid}</span>
                     <span class="level-badge">Lv.{level}</span>
                     { '<span class="vip-badge">大会员</span>' if profile.get('vip_status')==1 else '' }
+                    { '<span class="risk-badge" title="该UID由CRC32暴力破解得出，存在碰撞误识别风险">可能误识别</span>' if profile.get('collision_risk') else '' }
                 </div>
                 <div class="tags">{tag_html}</div>
                 {f'<div class="sign">{sign}</div>' if sign else ''}
@@ -294,6 +295,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
 .uid {{ font-size:12px; color:#999; background:#f0f0f0; padding:2px8px; border-radius:10px; }}
 .level-badge {{ font-size:12px; background:#00a1d6; color:white; padding:2px8px; border-radius:10px; }}
 .vip-badge {{ font-size:12px; background:#fb7299; color:white; padding:2px8px; border-radius:10px; }}
+.risk-badge {{ font-size:12px; background:#ff9800; color:white; padding:2px8px; border-radius:10px; }}
 .sign {{ font-size:13px; color:#666; margin-top:4px; }}
 .tags {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }}
 .tag {{ font-size:12px; background:#e3f2fd; color:#1976d2; padding:3px10px; border-radius:12px; }}

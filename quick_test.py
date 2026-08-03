@@ -71,19 +71,21 @@ def main():
         group = sender_groups[mid_hash]
 
         # 解析 UID
-        uid, confidence, method, _ = resolve_sender(
+        uid, confidence, method, _, collision_risk = resolve_sender(
             mid_hash, group["contents"], comment_uid_map, client
         )
         if not uid:
             print(f"  ❌ UID 解析失败!")
             continue
-        print(f"  ✅ UID={uid} (方法: {method})")
+        risk_note = " ⚠️可能误识别" if collision_risk else ""
+        print(f"  ✅ UID={uid} (方法: {method}, 置信度: {confidence}){risk_note}")
 
         # 采集数据
         user_data = collect_user_data(uid, client)
         dm_stats = {"count": group["count"], "contents": group["contents"], "video_times": group.get("video_times", [])}
         spam = spam_results.get(mid_hash, {})
         profile = analyze_profile(user_data, dm_stats, spam)
+        profile["collision_risk"] = collision_risk
         profiles.append(profile)
 
     # 6. AI 分析（批量）

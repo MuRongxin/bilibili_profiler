@@ -135,13 +135,13 @@ def resolve_sender(
     comment_uid_map: dict[str, int],
     client: BiliAPIClient,
     max_search: int = CRC32_MAX_SEARCH
-) -> Tuple[Optional[int], str, str, Optional[dict]]:
+) -> Tuple[Optional[int], str, str, Optional[dict], bool]:
     """
     解析发送者UID，综合多种方法
     
     优先级：
     1. 评论区交叉验证（最可靠，100%准确）
-    2. CRC32反向破解（老用户，需API验证）
+    2. CRC32反向破解（老用户，需API验证，存在碰撞误识别风险）
     3. 标记为未知
     
     Args:
@@ -152,11 +152,12 @@ def resolve_sender(
         max_search: CRC32搜索上限
     
     Returns:
-        (uid, confidence, method, user_info)
+        (uid, confidence, method, user_info, collision_risk)
         uid: 解析出的UID，失败为None
-        confidence: 置信度（高/中/低/无）
+        confidence: 置信度（高/中/低/无）；暴力破解路径上限为"中"
         method: 解析方法（评论区验证/CRC32破解/未知）
         user_info: API验证返回的用户信息
+        collision_risk: 是否有CRC32碰撞误识别风险（暴力破解路径为True）
     """
     uid = None
     method = "未知"
@@ -176,7 +177,7 @@ def resolve_sender(
                 confidence = "高"  # 评论区验证本身就很可靠
             else:
                 confidence = "中"
-            return uid, confidence, method, user_info
+            return uid, confidence, method, user_info, False
         else:
             uid = None  # 理论上不会发生，但做防御
 
@@ -187,10 +188,10 @@ def resolve_sender(
         if exists:
             uid = cracked_uid
             method = "CRC32破解"
-            # 弹幕越多，破解结果越可信（多条内容一致性）
-            unique_contents = set(danmaku_contents)
+            # 暴力破解存在碰撞风险（实测 calc_crc32(1) 会被破解成其他真实存在的UID，
+            # verify_uid_exists 无法拦截），因此置信度上限压到"中"，不得为"高"
             if len(danmaku_contents) >= 5:
-                confidence = "高"
+                confidence = "中"
             elif len(danmaku_contents) >= 3:
                 confidence = "中"
             elif len(danmaku_contents) >= 2:
@@ -198,14 +199,14 @@ def resolve_sender(
                 confidence = "中"
             else:
                 confidence = "低"  # 单条弹幕CRC32碰撞风险较高
-            return uid, confidence, method, user_info
+            return uid, confidence, method, user_info, True
         else:
             # CRC32破解出了数字，但API返回不存在 → 碰撞假阳性
             method = "CRC32碰撞"
             confidence = "无"
             uid = None
 
-    return uid, confidence, method, user_info
+    return uid, confidence, method, user_info, False
 
 
 def resolve_all_senders(
@@ -225,6 +226,7 @@ def resolve_all_senders(
             "user_info": dict,
             "danmaku_count": int,
             "contents": [str],
+            "collision_risk": bool,
         }}
     """
     results = {}
@@ -235,7 +237,7 @@ def resolve_all_senders(
 
     for idx, (mid_hash, group) in enumerate(sender_groups.items(), 1):
         contents = group["contents"]
-        uid, confidence, method, user_info = resolve_sender(
+        uid, confidence, method, user_info, collision_risk = resolve_sender(
             mid_hash, contents, comment_uid_map, client, max_search
         )
 
@@ -246,6 +248,7 @@ def resolve_all_senders(
             "user_info": user_info or {},
             "danmaku_count": group["count"],
             "contents": contents,
+            "collision_risk": collision_risk,
             "timestamps": group["timestamps"],
             "video_times": group["video_times"],
             "colors": group["colors"],

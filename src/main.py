@@ -116,6 +116,8 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                 "contents": c["contents"],
                 "spam_level": c.get("spam_level", "低"),
                 "spam_score": c.get("spam_score", 0.0),
+                # 缓存结果不含 collision_risk 字段，从 method 推断（不改表结构）
+                "collision_risk": c["method"] == "CRC32破解",
             }
         elif mid_hash in new_resolved:
             resolved[mid_hash] = new_resolved[mid_hash]
@@ -207,6 +209,8 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
         }
 
         profile = analyze_profile(user_data, danmaku_stats, spam)
+        # 碰撞风险标记传入报告，供"可能误识别"徽标展示
+        profile["collision_risk"] = info.get("collision_risk", False)
         profiles.append(profile)
 
         # 保存到数据库
