@@ -2,11 +2,12 @@
 UP主分析器 — 分析用户关注列表中UP主的投稿特征
 
 参考 biliscope 的思路，通过 UP主 的投稿历史分析其内容类型和活跃度。
-支持并行分析（ThreadPoolExecutor）加速。
+支持并行分析（ThreadPoolExecutor）加速：BiliAPIClient 已线程安全，
+限速为全局共享（多线程不会突破 config.REQUEST_DELAY 的请求频率）。
 """
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from config import USER_VIDEOS_URL, USER_CARD_URL
+from config import USER_VIDEOS_URL, USER_CARD_URL, COLLECT_WORKERS
 
 
 def _tokenize(text: str) -> list[str]:
@@ -135,7 +136,8 @@ def analyze_up(uid: int, client) -> dict:
 def summarize_followings(followings: list[dict], client, sample_size: int = 0) -> dict:
     """
     并行分析关注列表，汇总UP主特征
-    sample_size=0 表示分析全部
+    sample_size=0 表示分析全部；调用方应传 config.MAX_UP_SAMPLE 限制请求量。
+    analyze_up 内部全部使用局部变量，无共享可变状态，线程安全。
     """
     total = len(followings)
     sample = followings if sample_size <= 0 else followings[:sample_size]
@@ -146,9 +148,9 @@ def summarize_followings(followings: list[dict], client, sample_size: int = 0) -
     names = []
     results = []
 
-    # 并行分析每个 UP主
+    # 并行分析每个 UP主（受控并发：COLLECT_WORKERS 线程，限速由客户端全局共享）
     uids = [f.get("uid", 0) for f in sample if f.get("uid")]
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=COLLECT_WORKERS) as executor:
         futures = {executor.submit(analyze_up, uid, client): uid for uid in uids}
         for future in as_completed(futures):
             try:

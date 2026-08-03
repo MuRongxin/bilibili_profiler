@@ -14,7 +14,7 @@ from config import (
     USER_DYNAMICS_URL, USER_FOLLOWINGS_URL, USER_FOLLOWERS_URL,
     USER_FAV_FOLDERS_URL, USER_FAV_CONTENTS_URL, USER_BANGUMI_URL,
     MAX_VIDEO_PAGES, MAX_DYNAMIC_PAGES, MAX_FOLLOWING_PAGES,
-    MAX_FOLLOWER_PAGES, MAX_FAV_CONTENTS
+    MAX_FOLLOWER_PAGES, MAX_FAV_CONTENTS, MAX_UP_SAMPLE
 )
 
 
@@ -422,7 +422,7 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
     try:
         from up_analyzer import summarize_followings
         user_data["following_summary"] = summarize_followings(
-            user_data["followings"], client
+            user_data["followings"], client, sample_size=MAX_UP_SAMPLE
         )
     except Exception:
         user_data["following_summary"] = {}
