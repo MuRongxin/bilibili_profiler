@@ -13,7 +13,7 @@ import argparse
 from config import MAX_ANALYZE_USERS, LLM_API_KEY
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, get_resolved_uids, load_senders
-from storage import clear_video_cache
+from storage import clear_video_cache, update_sender_spam
 from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders
 from comment import collect_comment_data
@@ -69,11 +69,20 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     cached_map = {r["mid_hash"]: r for r in cached}
     print(f"[Phase 4] 数据库缓存: {len(cached_map)} 个已解析")
 
-    # 2. 筛选需要新解析的sender（不在缓存中的）
+    # 2. 筛选需要新解析的sender：不在缓存中的，以及缓存中 uid 为 NULL 的历史解析失败记录
+    #    （评论交叉验证随新评论变好，失败记录值得重试；save_sender 为 INSERT OR REPLACE 会覆盖旧记录）
     unresolved = {}
+    retry_failed = 0
     for mid_hash, group in sender_groups.items():
-        if mid_hash not in cached_map:
+        cached_row = cached_map.get(mid_hash)
+        if cached_row is None:
             unresolved[mid_hash] = group
+        elif cached_row["uid"] is None:
+            unresolved[mid_hash] = group
+            retry_failed += 1
+
+    if retry_failed > 0:
+        print(f"[Phase 4] {retry_failed} 个历史解析失败的发送者将重试")
 
     # 3. 按弹幕数降序排序，只取 top max_users 个
     sorted_unresolved = sorted(unresolved.items(), key=lambda x: x[1]["count"], reverse=True)
@@ -106,10 +115,12 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
         new_resolved = {}
         print("[Phase 4] 无需新解析，全部命中缓存")
 
-    # 5. 合并缓存 + 新解析结果
+    # 5. 合并缓存 + 新解析结果（新解析优先；缓存中 uid 为 NULL 且本轮未重试的记录视为未解析，不并入）
     resolved = {}
     for mid_hash, group in sender_groups.items():
-        if mid_hash in cached_map:
+        if mid_hash in new_resolved:
+            resolved[mid_hash] = new_resolved[mid_hash]
+        elif mid_hash in cached_map and cached_map[mid_hash]["uid"] is not None:
             c = cached_map[mid_hash]
             # 缓存结果不含 collision_risk 字段，从 method 推断（不改表结构）；
             # 历史缓存中暴力破解路径可能被标"高"，按现行策略压为"中"
@@ -128,23 +139,28 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                 "spam_score": c.get("spam_score", 0.0),
                 "collision_risk": is_crack,
             }
-        elif mid_hash in new_resolved:
-            resolved[mid_hash] = new_resolved[mid_hash]
 
-    cached_success = sum(1 for v in cached_map.values() if v.get("uid"))
+    # 只统计本轮 sender_groups 范围内、确实来自缓存的命中数（重试成功的不重复计入）
+    cached_success = sum(1 for h, v in resolved.items()
+                         if v.get("uid") and h in cached_map and h not in new_resolved)
     new_success = sum(1 for v in new_resolved.values() if v.get("uid"))
     total = len(resolved)
     print(f"\n[Phase 4] 解析完成: 缓存命中 {cached_success} + 新解析 {new_success} = {cached_success + new_success}/{total}")
     return resolved
 
 
-def phase_spam(sender_groups: dict) -> dict:
-    """阶段4.5: 刷屏检测"""
+def phase_spam(bvid: str, sender_groups: dict) -> dict:
+    """阶段4.5: 刷屏检测（检测完成后将真实结果回写数据库，修正阶段4落库时的占位值）"""
     print("\n[Phase 4.5/6] 刷屏行为检测...")
     spam_results = batch_detect_spam(sender_groups)
     high_spam = sum(1 for v in spam_results.values() if v["spam_level"] == "高")
     med_spam = sum(1 for v in spam_results.values() if v["spam_level"] == "中")
     print(f"[Phase 4.5] 检测完成: 高风险 {high_spam} | 中风险 {med_spam}")
+
+    # 回写所有 sender 的真实检测结果（阶段4 save_sender 时检测尚未运行，库中是 "低"/0.0 占位值）
+    for mid_hash, result in spam_results.items():
+        update_sender_spam(bvid, mid_hash, result["spam_level"], result["spam_score"])
+    print(f"[Phase 4.5] 已回写 {len(spam_results)} 个发送者的刷屏检测结果")
     return spam_results
 
 
@@ -292,7 +308,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
     resolved = phase_resolve(bvid, sender_groups, comment_uid_map, client, max_users=max_users)
 
     # 阶段4.5: 刷屏检测
-    spam_results = phase_spam(sender_groups)
+    spam_results = phase_spam(bvid, sender_groups)
 
     # 合并刷屏数据到resolved
     for mid_hash in resolved:

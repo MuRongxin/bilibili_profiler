@@ -127,6 +127,17 @@ def save_sender(bvid: str, mid_hash: str, uid: int | None, confidence: str,
         conn.commit()
 
 
+def update_sender_spam(bvid: str, mid_hash: str, spam_level: str, spam_score: float):
+    """回写发送者的刷屏检测结果（刷屏检测在 save_sender 之后运行，需单独 UPDATE）"""
+    with closing(get_db()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE senders SET spam_level = ?, spam_score = ?
+            WHERE bvid = ? AND mid_hash = ?
+        ''', (spam_level, spam_score, bvid, mid_hash))
+        conn.commit()
+
+
 def load_senders(bvid: str) -> list[dict]:
     """加载已解析的发送者"""
     with closing(get_db()) as conn:
