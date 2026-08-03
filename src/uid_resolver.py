@@ -12,6 +12,12 @@ from typing import Optional, Tuple
 from api_client import BiliAPIClient
 from config import CRC32_MAX_SEARCH, USER_CARD_URL
 
+# 解析方法标识（入库/缓存推断均引用这些常量，勿散落硬编码字符串）
+METHOD_COMMENT_VERIFY = "评论区验证"
+METHOD_CRC32_CRACK = "CRC32破解"
+METHOD_CRC32_COLLISION = "CRC32碰撞"
+METHOD_UNKNOWN = "未知"
+
 
 def calc_crc32(uid: int) -> str:
     """计算UID的标准CRC32（B站使用的算法）"""
@@ -160,7 +166,7 @@ def resolve_sender(
         collision_risk: 是否有CRC32碰撞误识别风险（暴力破解路径为True）
     """
     uid = None
-    method = "未知"
+    method = METHOD_UNKNOWN
     confidence = "无"
     user_info = None
 
@@ -169,7 +175,7 @@ def resolve_sender(
     if uid:
         exists, user_info = verify_uid_exists(uid, client)
         if exists:
-            method = "评论区验证"
+            method = METHOD_COMMENT_VERIFY
             # 弹幕越多，对该用户的置信度越高
             if len(danmaku_contents) >= 5:
                 confidence = "高"
@@ -187,22 +193,14 @@ def resolve_sender(
         exists, user_info = verify_uid_exists(cracked_uid, client)
         if exists:
             uid = cracked_uid
-            method = "CRC32破解"
+            method = METHOD_CRC32_CRACK
             # 暴力破解存在碰撞风险（实测 calc_crc32(1) 会被破解成其他真实存在的UID，
             # verify_uid_exists 无法拦截），因此置信度上限压到"中"，不得为"高"
-            if len(danmaku_contents) >= 5:
-                confidence = "中"
-            elif len(danmaku_contents) >= 3:
-                confidence = "中"
-            elif len(danmaku_contents) >= 2:
-                # 两条以上可以交叉验证内容是否相关
-                confidence = "中"
-            else:
-                confidence = "低"  # 单条弹幕CRC32碰撞风险较高
+            confidence = "中" if len(danmaku_contents) >= 2 else "低"  # 单条弹幕碰撞风险更高
             return uid, confidence, method, user_info, True
         else:
             # CRC32破解出了数字，但API返回不存在 → 碰撞假阳性
-            method = "CRC32碰撞"
+            method = METHOD_CRC32_COLLISION
             confidence = "无"
             uid = None
 
@@ -258,7 +256,8 @@ def resolve_all_senders(
         if uid:
             resolved += 1
             name = user_info.get("name", "?") if user_info else "?"
-            print(f"  [{idx}/{total}] ✅ {mid_hash} → UID:{uid} ({name}) 方法:{method} 置信度:{confidence}")
+            risk_note = " ⚠️可能误识别" if collision_risk else ""
+            print(f"  [{idx}/{total}] ✅ {mid_hash} → UID:{uid} ({name}) 方法:{method} 置信度:{confidence}{risk_note}")
         else:
             if idx % 10 == 0 or idx == total:
                 print(f"  [{idx}/{total}] 进度... 已解析:{resolved}")

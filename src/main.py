@@ -16,7 +16,7 @@ from storage import load_progress, load_user_data, has_user_data, get_resolved_u
 from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders
 from comment import collect_comment_data
-from uid_resolver import resolve_all_senders
+from uid_resolver import resolve_all_senders, METHOD_CRC32_CRACK
 from spam_detector import batch_detect_spam
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
@@ -107,17 +107,22 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     for mid_hash, group in sender_groups.items():
         if mid_hash in cached_map:
             c = cached_map[mid_hash]
+            # 缓存结果不含 collision_risk 字段，从 method 推断（不改表结构）；
+            # 历史缓存中暴力破解路径可能被标"高"，按现行策略压为"中"
+            is_crack = c["method"] == METHOD_CRC32_CRACK
+            confidence = c["confidence"]
+            if is_crack and confidence == "高":
+                confidence = "中"
             resolved[mid_hash] = {
                 "uid": c["uid"],
-                "confidence": c["confidence"],
+                "confidence": confidence,
                 "method": c["method"],
                 "user_info": {},
                 "danmaku_count": c["danmaku_count"],
                 "contents": c["contents"],
                 "spam_level": c.get("spam_level", "低"),
                 "spam_score": c.get("spam_score", 0.0),
-                # 缓存结果不含 collision_risk 字段，从 method 推断（不改表结构）
-                "collision_risk": c["method"] == "CRC32破解",
+                "collision_risk": is_crack,
             }
         elif mid_hash in new_resolved:
             resolved[mid_hash] = new_resolved[mid_hash]
