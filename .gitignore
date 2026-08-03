@@ -1,0 +1,28 @@
+# 虚拟环境
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 配置文件（含 API Key）
+src/config.py
+
+# 敏感数据
+data/cookie.json
+data/qrcode.png
+
+# 数据库
+data/profiler.db
+
+# 报告输出
+data/reports/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# LLM 分析中间数据（含用户画像）
+data/analysis_input.json
+data/analysis_prompt.txt

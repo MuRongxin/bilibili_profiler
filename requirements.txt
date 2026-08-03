@@ -1,0 +1,10 @@
+certifi==2026.5.20
+charset-normalizer==3.4.7
+idna==3.17
+lxml==6.1.1
+openai>=1.0
+pillow==12.2.0
+qrcode==8.2
+requests==2.34.2
+urllib3==2.7.0
+pycryptodome>=3.0
