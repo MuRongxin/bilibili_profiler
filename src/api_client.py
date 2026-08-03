@@ -56,7 +56,8 @@ class BiliAPIClient:
         key = self._get_wbi_key()
         if not key:
             return params
-        params = dict(params)
+        # 剔除残留的旧签名参数，避免旧 w_rid/wts 混入签名串导致重签无效（-403 恢复路径会传入旧值）
+        params = {k: v for k, v in params.items() if k not in ("w_rid", "wts")}
         params["wts"] = int(time.time())
         keys = sorted(params.keys())
         param_str = "&".join(f"{k}={params[k]}" for k in keys)
