@@ -44,14 +44,10 @@ def parse_danmaku_xml(xml_bytes: bytes) -> list[dict]:
             continue
 
         try:
-            uid_raw = attrs[6]
-            # uid可能是数字（老弹幕）或十六进制hash
-            if uid_raw.isdigit():
-                mid_hash = format(int(uid_raw), "08x")  # 转为8位hex统一处理
-                uid_hint = int(uid_raw)
-            else:
-                mid_hash = uid_raw.lower()
-                uid_hint = None
+            # 发送者标识固定为8位CRC32十六进制hash，统一按hex处理。
+            # 注意：不能用isdigit()特判——约2.3%的CRC32 hash恰好全是十进制数字
+            # （如"12345678"），误判为明文数字UID转码后会产生完全不同的值。
+            mid_hash = attrs[6].lower()
 
             danmaku_list.append({
                 "content": content,
@@ -61,8 +57,7 @@ def parse_danmaku_xml(xml_bytes: bytes) -> list[dict]:
                 "color": f"#{int(attrs[3]):06x}", # 颜色
                 "timestamp": int(attrs[4]),       # 发送时间戳
                 "pool": int(attrs[5]),            # 弹幕池
-                "mid_hash": mid_hash,             # 发送者标识（CRC32 hash或数字）
-                "uid_hint": uid_hint,             # 如果是数字uid，记录原始值
+                "mid_hash": mid_hash,             # 发送者标识（8位CRC32十六进制hash）
                 "dmid": int(attrs[7]) if attrs[7].isdigit() else 0,
             })
         except (ValueError, IndexError):
@@ -169,12 +164,5 @@ def collect_danmaku_data(bvid: str, client: BiliAPIClient) -> tuple[dict, list[d
 
     sender_groups = group_by_sender(danmaku_list)
     print(f"[Danmaku] 独立发送者: {len(sender_groups)} 人")
-
-    # 统计数字uid和hash uid
-    numeric_uids = sum(1 for mh in sender_groups if mh.isdigit() or all(c in "0123456789abcdef" for c in mh) and len(mh) == 8 and sender_groups[mh].get("uid_hint"))
-    # 重新统计：uid_hint不为None的表示原始就是数字uid
-    numeric_count = sum(1 for g in sender_groups.values() if g.get("uid_hint") is not None)
-    hash_count = len(sender_groups) - numeric_count
-    print(f"[Danmaku]   数字UID: {numeric_count} | Hash UID: {hash_count}")
 
     return video_info, danmaku_list, sender_groups
