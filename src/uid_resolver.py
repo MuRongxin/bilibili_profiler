@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 
 from api_client import BiliAPIClient
 from config import CRC32_MAX_SEARCH, USER_CARD_URL
+from crc_rainbow import build_table, lookup, table_exists
 
 # 解析方法标识（入库/缓存推断均引用这些常量，勿散落硬编码字符串）
 METHOD_COMMENT_VERIFY = "评论区验证"
@@ -24,13 +25,74 @@ def calc_crc32(uid: int) -> str:
     return format(zlib.crc32(str(uid).encode()) & 0xFFFFFFFF, "08x")
 
 
-def crack_crc32(crc32_hash: str, max_search: int = CRC32_MAX_SEARCH) -> Optional[int]:
+# 彩虹表构建每进程最多自动触发一次（失败后不再反复重建，直接走降级搜索）
+_table_build_attempted = False
+
+
+def crack_crc32(
+    crc32_hash: str,
+    max_search: int = CRC32_MAX_SEARCH,
+    client: Optional[BiliAPIClient] = None
+) -> Optional[int]:
     """
-    CRC32反向搜索破解UID
-    
+    CRC32反向破解UID：优先走彩虹表毫秒级查表，表不存在时自动一次性构建，
+    构建失败则降级为纯Python增量搜索（约75秒/人）。
+
+    流程：
+    1. 彩虹表存在 → lookup 得候选 UID 列表，逐个 verify_uid_exists 取第一个存在的返回
+       （多候选时打印碰撞警告）；候选全部不存在或表未命中 → None
+    2. 表不存在 → 自动触发一次性 build_table（约1-3分钟），成功后走查表路径
+    3. 构建失败 → 降级 _crack_crc32_fallback（旧的增量搜索）
+
+    注意：彩虹表与增量搜索均只覆盖 max_search（默认 CRC_TABLE_MAX_UID=5000万）以内
+    的老 UID；>10位的新 UID 经调研实证无法反推，不在覆盖范围，自然返回未命中（None）。
+
+    Args:
+        crc32_hash: 弹幕 mid_hash（8位hex）
+        max_search: UID 搜索/建表上限
+        client: API客户端（查表路径用于验证候选UID是否存在；为 None 时直接返回首个候选，
+                与旧路径一致——验证交由调用方 resolve_sender 负责）
+
+    Returns:
+        破解出的UID，或None
+    """
+    global _table_build_attempted
+
+    if not table_exists() and not _table_build_attempted:
+        _table_build_attempted = True
+        print("[Resolver] 首次使用彩虹表，开始一次性构建（约1-3分钟，约400MB磁盘）...")
+        try:
+            build_ok = build_table(max_uid=max_search)
+        except Exception as e:
+            print(f"[Resolver] 彩虹表构建异常：{e}，降级为增量搜索")
+            build_ok = False
+        if not build_ok:
+            print("[Resolver] 彩虹表不可用，降级为纯Python增量搜索（较慢）")
+
+    if table_exists():
+        candidates = lookup(crc32_hash)
+        if not candidates:
+            return None  # 表内未命中（新 UID 或超出覆盖范围）
+        if len(candidates) > 1:
+            print(f"[Resolver] 警告: hash {crc32_hash} 有 {len(candidates)} 个碰撞候选，取第一个")
+        for uid in candidates:
+            if client is None:
+                return uid  # 无客户端无法验证，返回首个候选（验证交给调用方）
+            exists, _ = verify_uid_exists(uid, client)
+            if exists:
+                return uid
+        return None  # 候选全部不存在（碰撞假阳性）
+
+    return _crack_crc32_fallback(crc32_hash, max_search)
+
+
+def _crack_crc32_fallback(crc32_hash: str, max_search: int = CRC32_MAX_SEARCH) -> Optional[int]:
+    """
+    CRC32反向搜索破解UID（纯Python增量搜索，彩虹表不可用时的降级路径）
+
     算法来自 bilibili_api.utils.utils.crack_uid（esterTion/BiliBili_crc2mid）
     搜索范围扩展到 max_search（默认5000万）
-    
+
     Returns:
         破解出的UID，或None
     """
@@ -187,8 +249,8 @@ def resolve_sender(
         else:
             uid = None  # 理论上不会发生，但做防御
 
-    # === 方法2：CRC32反向破解 ===
-    cracked_uid = crack_crc32(mid_hash, max_search=max_search)
+    # === 方法2：CRC32反向破解（彩虹表查表，内部按需自动建表/降级） ===
+    cracked_uid = crack_crc32(mid_hash, max_search=max_search, client=client)
     if cracked_uid:
         exists, user_info = verify_uid_exists(cracked_uid, client)
         if exists:
