@@ -133,18 +133,25 @@ def build_table(max_uid: int = CRC_TABLE_MAX_UID, workers: int = None) -> bool:
                     print(f"[彩虹表] 已归并 {written} 条", flush=True)
             _flush_buffer(f, out_buf)
         os.replace(partial_path, table_path)  # 原子替换，避免半成品被当作正式表
+        # 重建换了新 inode，作废旧 mmap 缓存（关闭旧句柄），否则同进程 lookup 仍读旧表
+        stale = _mmap_cache.pop(table_path, None)
+        if stale is not None:
+            try:
+                stale[1].close()
+                stale[0].close()
+            except (OSError, ValueError):
+                pass
         print(f"[彩虹表] 构建完成：{table_path}（{written} 条，"
               f"{os.path.getsize(table_path) / 1024 / 1024:.1f} MB）")
         return True
     except Exception as e:
         print(f"[彩虹表] 构建失败：{e}")
-        # 清理半成品正式表（.partial 留在原地不碍事，下次构建会覆盖，这里一并清掉）
-        for p in (table_path, table_path + ".partial"):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError:
-                pass
+        # 只清理半成品 .partial，绝不动 table_path——已有的好表必须保留
+        try:
+            if os.path.exists(table_path + ".partial"):
+                os.remove(table_path + ".partial")
+        except OSError:
+            pass
         return False
     finally:
         # 清理临时分片文件
@@ -160,6 +167,7 @@ def _get_mmap(table_path: str):
     """获取表的 mmap 只读映射（进程级缓存）。表不存在或为空返回 None。"""
     if table_path in _mmap_cache:
         return _mmap_cache[table_path][1]
+    f = None
     try:
         f = open(table_path, "rb")
         if os.fstat(f.fileno()).st_size == 0:
@@ -167,6 +175,9 @@ def _get_mmap(table_path: str):
             return None
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
     except (OSError, ValueError):
+        # mmap 失败时关闭已打开的文件句柄，避免泄漏（f.close 幂等，重复调用安全）
+        if f is not None:
+            f.close()
         return None
     _mmap_cache[table_path] = (f, mm)
     return mm
