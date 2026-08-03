@@ -202,14 +202,15 @@ def analyze_profile(user_data: dict, danmaku_stats: dict, spam_stats: dict) -> d
             seen.add(t)
             unique_tags.append(t)
 
-    # 账号年龄推断
-    account_age_days = None
-    create_time = user_data.get("first_seen", 0)
-    if create_time:
+    # 采样到的最早活跃距今（天）：first_seen 只是动态翻页（最多10页）采到的最早一条，
+    # 对新用户接近注册时间，对老用户仅覆盖近期，不能当作账号年龄
+    oldest_activity_days = None
+    first_seen = user_data.get("first_seen", 0)
+    if first_seen:
         try:
-            account_age_days = (datetime.now() - datetime.fromtimestamp(int(create_time))).days
+            oldest_activity_days = (datetime.now() - datetime.fromtimestamp(int(first_seen))).days
         except (ValueError, TypeError, OSError):
-            account_age_days = None
+            oldest_activity_days = None
 
     # 收藏夹分析
     folders = user_data.get("favorite_folders", [])
@@ -273,7 +274,7 @@ def analyze_profile(user_data: dict, danmaku_stats: dict, spam_stats: dict) -> d
         "coins": user_data.get("coins", 0),
         "archive_count": user_data.get("archive_count", 0),
         "tags": unique_tags,
-        "account_age_days": account_age_days,
+        "oldest_activity_days": oldest_activity_days,
         "activity_pattern": user_data.get("activity_pattern", {}),
         "favorite": fav_analysis,
         "following_analysis": following_analysis,
