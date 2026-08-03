@@ -4,6 +4,7 @@
 import time
 import random
 import hashlib
+import threading
 import requests
 from urllib.parse import quote
 from config import DEFAULT_HEADERS, REQUEST_DELAY, REQUEST_DELAY_LONG, MAX_RETRY, RETRY_BACKOFF, NAV_URL
@@ -18,12 +19,19 @@ WBI_OE = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45,
 
 
 class BiliAPIClient:
-    """B站API客户端，统一处理请求、限速、重试、WBI签名、buvid3"""
+    """B站API客户端，统一处理请求、限速、重试、WBI签名、buvid3
+
+    线程安全：限速与请求发出通过同一把 RLock 原子化，多线程并发调用时
+    限速为全局限速（所有线程共享同一速率，整体请求频率不会超过配置上限）。
+    注意：冷却/退避 sleep（重试退避、-412/-352 等待）在锁外执行，不阻塞其他线程。
+    """
 
     def __init__(self, session: requests.Session = None):
         self.session = session or requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
         self._last_request_time = 0
+        # RLock：_get_wbi_key/_ensure_buvid3 在持有锁的请求路径中可能嵌套发请求
+        self._lock = threading.RLock()
         self._wbi_key = None
         self._wbi_key_date = None  # WBI 密钥缓存日期，img_key/sub_key 全站统一、每日更替
         self._buvid3 = None
@@ -44,7 +52,7 @@ class BiliAPIClient:
         if self._wbi_key and self._wbi_key_date == today:
             return self._wbi_key
         try:
-            resp = self.session.get(NAV_URL, timeout=10)
+            resp = self._request_locked("GET", NAV_URL, timeout=10)
             data = resp.json().get("data", {}).get("wbi_img", {})
             img = data.get("img_url", "").split("/")[-1].split(".")[0]
             sub = data.get("sub_url", "").split("/")[-1].split(".")[0]
@@ -77,7 +85,8 @@ class BiliAPIClient:
         if self._buvid3:
             return self._buvid3
         try:
-            resp = self.session.get(
+            resp = self._request_locked(
+                "GET",
                 "https://api.bilibili.com/x/frontend/finger/spi",
                 timeout=10,
             )
@@ -97,6 +106,12 @@ class BiliAPIClient:
             time.sleep(delay - elapsed)
         self._last_request_time = time.time()
 
+    def _request_locked(self, method: str, url: str, **kwargs) -> requests.Response:
+        """限速与请求发出原子化（线程安全）；冷却 sleep 在锁外，不阻塞其他线程"""
+        with self._lock:
+            self._sleep_if_needed(url)
+            return self.session.request(method, url, timeout=15, **kwargs)
+
     def get(self, url: str, params: dict = None, headers: dict = None, **kwargs) -> dict:
         merged_headers = {**(headers or {})}
         params = dict(params or {})
@@ -109,9 +124,8 @@ class BiliAPIClient:
             params = self._sign_wbi(params)
 
         for attempt in range(MAX_RETRY):
-            self._sleep_if_needed(url)
             try:
-                resp = self.session.get(url, params=params, headers=merged_headers, timeout=15, **kwargs)
+                resp = self._request_locked("GET", url, params=params, headers=merged_headers, **kwargs)
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("code") == -412:
@@ -150,8 +164,7 @@ class BiliAPIClient:
         return {"code": -1, "message": "Max retry exceeded"}
 
     def get_raw(self, url: str, params: dict = None, **kwargs) -> requests.Response:
-        self._sleep_if_needed(url)
-        return self.session.get(url, params=params, timeout=15, **kwargs)
+        return self._request_locked("GET", url, params=params, **kwargs)
 
     def update_cookies(self, cookies: dict):
         self.session.cookies.update(cookies)
