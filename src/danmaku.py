@@ -38,6 +38,10 @@ def parse_danmaku_xml(xml_bytes: bytes) -> list[dict]:
     d标签属性: p="时间,模式,字号,颜色,时间戳,池,用户ID(hash),弹幕ID"
     """
     root = etree.fromstring(xml_bytes, parser=_SAFE_XML_PARSER)
+    # 根标签必须是 <i>（B站弹幕XML格式）；良构的错误页（如<html>）会被静默解析为0条弹幕，
+    # 这里抛出让上层把该页计入失败
+    if root.tag != "i":
+        raise etree.XMLSyntaxError(f"非弹幕XML（根标签<{root.tag}>）", 0, 0, 0)
     danmaku_list = []
 
     for d in root.findall(".//d"):
