@@ -32,7 +32,9 @@ def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT
             print(f"[Comment] 获取评论失败: {data.get('message')}")
             break
 
-        replies = data["data"].get("replies", [])
+        # 防御 data["data"] 为 None（风控/空结果时 API 会返回 data: null）
+        page_data = data.get("data") or {}
+        replies = page_data.get("replies") or []
         if not replies:
             break
 
@@ -49,7 +51,7 @@ def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT
                 "uid": mid,
                 "uname": member.get("uname", ""),
                 "sign": member.get("sign", ""),
-                "level": member.get("level_info", {}).get("current_level", 0),
+                "level": (member.get("level_info") or {}).get("current_level", 0),
                 "avatar": member.get("avatar", ""),
                 "content": r.get("content", {}).get("message", ""),
                 "like": r.get("like", 0),
@@ -72,7 +74,7 @@ def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT
                     "uid": sub_mid,
                     "uname": sub_member.get("uname", ""),
                     "sign": sub_member.get("sign", ""),
-                    "level": sub_member.get("level_info", {}).get("current_level", 0),
+                    "level": (sub_member.get("level_info") or {}).get("current_level", 0),
                     "avatar": sub_member.get("avatar", ""),
                     "content": sub.get("content", {}).get("message", ""),
                     "like": sub.get("like", 0),
@@ -81,7 +83,7 @@ def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT
                     "is_sub": True,
                 })
 
-        cursor = data["data"].get("cursor", {})
+        cursor = page_data.get("cursor") or {}
         next_page = cursor.get("next", 0)
         if cursor.get("is_end", False) or not next_page:
             break
@@ -108,7 +110,11 @@ def build_comment_uid_map(comments: list[dict]) -> dict[str, int]:
 
         # 计算该UID的CRC32（B站使用的标准CRC32）
         crc = format(zlib.crc32(str(uid).encode()) & 0xFFFFFFFF, "08x")
-        uid_map[crc] = uid
+        # CRC32碰撞时保留先见者并告警，避免弹幕发送者被误归属到后到的用户
+        if crc in uid_map and uid_map[crc] != uid:
+            print(f"[评论] 警告: CRC32碰撞 {crc}，已归属UID {uid_map[crc]}，忽略 {uid}")
+        else:
+            uid_map.setdefault(crc, uid)
 
     return uid_map
 
