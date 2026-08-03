@@ -6,10 +6,30 @@ HTML报告生成器
 import json
 import re
 import os
+import html as _html
 from datetime import datetime
 from collections import Counter
+from urllib.parse import urlparse
 
 from config import REPORT_DIR
+
+
+def esc(s):
+    """HTML 转义用户可控文本（含引号，防属性注入）"""
+    return _html.escape(str(s) if s is not None else "", quote=True)
+
+
+def safe_url(url):
+    """URL 白名单校验：仅允许 http/https，其余返回空串"""
+    url = str(url) if url else ""
+    if urlparse(url).scheme in ("http", "https"):
+        return esc(url)
+    return ""
+
+
+def js_json(obj):
+    """json.dumps 后转义 </，防 </script> 截断逃逸"""
+    return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
 
 
 def generate_user_card(profile: dict) -> str:
@@ -23,7 +43,7 @@ def generate_user_card(profile: dict) -> str:
     tags = profile.get("tags", [])
 
     # 标签HTML
-    tag_html = "".join(f'<span class="tag">{t}</span>' for t in tags)
+    tag_html = "".join(f'<span class="tag">{esc(t)}</span>' for t in tags)
 
     # 基础信息
     follower = profile.get("follower", 0)
@@ -41,11 +61,11 @@ def generate_user_card(profile: dict) -> str:
     dm_items = []
     for c, t in paired:
         m, s = int(t // 60), int(t % 60)
-        dm_items.append(f"<li>{c} <span class=\"dm-time\">{m:02d}:{s:02d}</span></li>")
+        dm_items.append(f"<li>{esc(c)} <span class=\"dm-time\">{m:02d}:{s:02d}</span></li>")
     dm_list = "".join(dm_items)
     spam_level = dm.get("spam_level", "低")
     spam_reason = dm.get("spam_reason", "")
-    spam_class = f"spam-{spam_level}"
+    spam_class = f"spam-{esc(spam_level)}"
 
     # 活动模式
     act = profile.get("activity_pattern", {})
@@ -80,7 +100,7 @@ def generate_user_card(profile: dict) -> str:
         for i, up in enumerate(fol_summary.get("up_details", [])):
             up_detail_map[up["name"]] = (i, up)
 
-        cats_str = "、".join(f"{c}({n})" for c, n in fol_summary.get("top_categories", [])[:4])
+        cats_str = "、".join(f"{esc(c)}({n})" for c, n in fol_summary.get("top_categories", [])[:4])
         up_names = ""
         for name in all_names:
             if name in up_detail_map:
@@ -91,19 +111,19 @@ def generate_user_card(profile: dict) -> str:
                 if kw:
                     tip += f" | 关键词: {kw}"
                 up_id = f"up_{uid}_{i}"
-                up_names += f'<span class="up-chip" data-upid="{up_id}" data-uid="{uid}" title="{tip}">{name}</span>'
+                up_names += f'<span class="up-chip" data-upid="{esc(up_id)}" data-uid="{esc(uid)}" title="{esc(tip)}">{esc(name)}</span>'
             else:
                 raw = raw_map.get(name, {})
                 sign = raw.get("sign", "")
                 tip = f"签名: {sign}" if sign else "未深度分析"
-                up_names += f'<span class="up-chip" title="{tip}">{name}</span>'
+                up_names += f'<span class="up-chip" title="{esc(tip)}">{esc(name)}</span>'
 
         total = fol_summary.get("total", len(all_names))
         fol_section = f'''
             <div class="section fol-section">
                 <h4>🕸️ 关注偏好</h4>
                 <div class="fol-stats">
-                    <span>关注 {total} 人 (全部展示)</span>
+                    <span>关注 {esc(total)} 人 (全部展示)</span>
                     <span>偏好: {cats_str}</span>
                 </div>
                 <div class="up-chips">{up_names}</div>
@@ -117,11 +137,9 @@ def generate_user_card(profile: dict) -> str:
     ai_text = profile.get("ai_analysis", "")
     ai_section = ""
     if ai_text:
-        # 简单渲染：转义 + 换行 + 粗体
-        safe = ai_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        safe = safe.replace("**", "<strong>", 1)
-        if "**" in safe:
-            safe = safe.replace("**", "</strong>", 1)
+        # 简单渲染：先转义，再用正则把成对的 **粗体** 渲染为 <strong>
+        safe = esc(ai_text)
+        safe = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", safe)
         paragraphs = safe.split("\n")
         ai_html = "".join(f"<p>{p}</p>" if p.strip() else "<br>" for p in paragraphs)
         ai_section = f'''
@@ -131,23 +149,23 @@ def generate_user_card(profile: dict) -> str:
             </div>'''
 
     # 头像 (可点击跳转B站主页)
-    profile_url = f"https://space.bilibili.com/{uid}"
-    avatar_html = f'<a href="{profile_url}" target="_blank"><img src="{face}" alt="{name}" loading="lazy" onerror="this.style.display=\'none\'"></a>' if face else f'<div class="avatar-text">{name[0] if name else "?"}</div>'
+    profile_url = safe_url(f"https://space.bilibili.com/{uid}")
+    avatar_html = f'<a href="{profile_url}" target="_blank"><img src="{safe_url(face)}" alt="{esc(name)}" loading="lazy" onerror="this.style.display=\'none\'"></a>' if face else f'<div class="avatar-text">{esc(name[0]) if name else "?"}</div>'
 
     return f'''
-    <div class="user-card" data-level="{level}" data-vip="{profile.get('vip_status',0)==1}" data-spam="{spam_level}" data-official="{profile.get('official_type',-1)>=0}">
+    <div class="user-card" data-level="{esc(level)}" data-vip="{profile.get('vip_status',0)==1}" data-spam="{esc(spam_level)}" data-official="{profile.get('official_type',-1)>=0}">
         <div class="card-header">
             <div class="avatar">{avatar_html}</div>
             <div class="header-info">
                 <div class="name-line">
-                    <a href="{profile_url}" target="_blank" class="username-link"><span class="username">{name}</span></a>
-                    <span class="uid">UID:{uid}</span>
-                    <span class="level-badge">Lv.{level}</span>
+                    <a href="{profile_url}" target="_blank" class="username-link"><span class="username">{esc(name)}</span></a>
+                    <span class="uid">UID:{esc(uid)}</span>
+                    <span class="level-badge">Lv.{esc(level)}</span>
                     { '<span class="vip-badge">大会员</span>' if profile.get('vip_status')==1 else '' }
                     { '<span class="risk-badge" title="该UID由CRC32暴力破解得出，存在碰撞误识别风险">可能误识别</span>' if profile.get('collision_risk') else '' }
                 </div>
                 <div class="tags">{tag_html}</div>
-                {f'<div class="sign">{sign}</div>' if sign else ''}
+                {f'<div class="sign">{esc(sign)}</div>' if sign else ''}
             </div>
         </div>
 
@@ -161,28 +179,28 @@ def generate_user_card(profile: dict) -> str:
 
         <div class="card-body">
             <div class="section">
-                <h4>🎤 弹幕行为 <span class="spam-badge {spam_class}">{spam_level}风险</span></h4>
-                <div class="detail">共发送 {dm_count} 条弹幕</div>
+                <h4>🎤 弹幕行为 <span class="spam-badge {spam_class}">{esc(spam_level)}风险</span></h4>
+                <div class="detail">共发送 {esc(dm_count)} 条弹幕</div>
                 <ol class="dm-list">{dm_list}</ol>
-                {f'<div class="reason">判定: {spam_reason}</div>' if spam_reason else ''}
+                {f'<div class="reason">判定: {esc(spam_reason)}</div>' if spam_reason else ''}
             </div>
             <div class="section">
                 <h4>👤 基础信息</h4>
                 <div class="info-grid">
-                    <span>性别: {sex or "未知"}</span>
-                    <span>活跃模式: {act_type}</span>
-                    {f'<span>高峰时段: {peak_hour}:00</span>' if peak_hour is not None else ''}
-                    {f'<span>活跃星期: {peak_day}</span>' if peak_day else ''}
+                    <span>性别: {esc(sex) or "未知"}</span>
+                    <span>活跃模式: {esc(act_type)}</span>
+                    {f'<span>高峰时段: {esc(peak_hour)}:00</span>' if peak_hour is not None else ''}
+                    {f'<span>活跃星期: {esc(peak_day)}</span>' if peak_day else ''}
                 </div>
             </div>
 
-            {f'''<div class="section"><h4>📁 收藏夹 ({fav.get("folder_count",0)}个)</h4><div class="samples">{''.join(f'<span class="sample">{n}</span>' for n in fav_names)}</div></div>''' if fav_names else ''}
+            {f'''<div class="section"><h4>📁 收藏夹 ({esc(fav.get("folder_count",0))}个)</h4><div class="samples">{''.join(f'<span class="sample">{esc(n)}</span>' for n in fav_names)}</div></div>''' if fav_names else ''}
 
-            {f'''<div class="section"><h4>🎬 最近投稿</h4><ul class="list">{''.join(f'<li>{t}</li>' for t in vid_titles)}</ul></div>''' if vid_titles else ''}
+            {f'''<div class="section"><h4>🎬 最近投稿</h4><ul class="list">{''.join(f'<li>{esc(t)}</li>' for t in vid_titles)}</ul></div>''' if vid_titles else ''}
 
             {fol_section}
 
-            {f'''<div class="section"><h4>📺 追番/追剧</h4><div class="samples">{''.join(f'<span class="sample">{b}</span>' for b in bangumi + dramas)}</div></div>''' if bangumi or dramas else ''}
+            {f'''<div class="section"><h4>📺 追番/追剧</h4><div class="samples">{''.join(f'<span class="sample">{esc(b)}</span>' for b in bangumi + dramas)}</div></div>''' if bangumi or dramas else ''}
 
 {ai_section}
         </div>
@@ -245,7 +263,7 @@ def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
             wf = up.get("word_freq", [])
             if wf:
                 up_id = f"up_{uid}_{i}"
-                up_wc_entries.append(f'"{up_id}":{json.dumps(wf, ensure_ascii=False)}')
+                up_wc_entries.append(f'{js_json(up_id)}:{js_json(wf)}')
     up_wc_js = "{" + ",".join(up_wc_entries) + "}"
 
     html = f'''<!DOCTYPE html>
@@ -253,7 +271,7 @@ def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>B站弹幕用户画像分析 - {title}</title>
+<title>B站弹幕用户画像分析 - {esc(title)}</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/wordcloud@1.2.2/src/wordcloud2.min.js"></script>
 <style>
@@ -363,8 +381,8 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
     <div class="header">
         <h1>🎬 B站弹幕用户画像分析</h1>
         <div class="meta">
-            <strong>{title}</strong><br>
-            BV: {bvid} | 播放: {video_info.get('stat',{}).get('view',0):,} | 
+            <strong>{esc(title)}</strong><br>
+            BV: {esc(bvid)} | 播放: {video_info.get('stat',{}).get('view',0):,} | 
             弹幕: {video_info.get('stat',{}).get('danmaku',0):,} | 
             评论: {video_info.get('stat',{}).get('reply',0):,}<br>
             分析用户数: {stats['total']} | 大会员: {stats['vip_count']} | 
@@ -480,19 +498,19 @@ function filter(type) {{
 
 new Chart(document.getElementById('levelChart'),{{
     type:'bar',
-    data:{{labels:{json.dumps(level_labels)},datasets:[{{label:'人数',data:{json.dumps(level_data)},backgroundColor:'#00a1d6',borderRadius:6}}]}},
+    data:{{labels:{js_json(level_labels)},datasets:[{{label:'人数',data:{js_json(level_data)},backgroundColor:'#00a1d6',borderRadius:6}}]}},
     options:{{responsive:true,plugins:{{legend:{{display:false}}}}}}
 }});
 
 new Chart(document.getElementById('spamChart'),{{
     type:'doughnut',
-    data:{{labels:['低风险','中风险','高风险'],datasets:[{{data:{json.dumps(spam_data)},backgroundColor:['#4caf50','#ff9800','#f44336']}}]}},
+    data:{{labels:['低风险','中风险','高风险'],datasets:[{{data:{js_json(spam_data)},backgroundColor:['#4caf50','#ff9800','#f44336']}}]}},
     options:{{responsive:true}}
 }});
 
 new Chart(document.getElementById('tagChart'),{{
     type:'bar',
-    data:{{labels:{json.dumps(tag_labels)},datasets:[{{label:'出现次数',data:{json.dumps(tag_data)},backgroundColor:'#ff9f43',borderRadius:6}}]}},
+    data:{{labels:{js_json(tag_labels)},datasets:[{{label:'出现次数',data:{js_json(tag_data)},backgroundColor:'#ff9f43',borderRadius:6}}]}},
     options:{{responsive:true,indexAxis:'y',plugins:{{legend:{{display:false}}}}}}
 }});
 </script>
