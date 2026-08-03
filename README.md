@@ -32,7 +32,7 @@ pip install -r requirements.txt
 # 分析视频
 python run.py BV1vu4y1b7Y9
 
-# 强制重新分析（忽略已有进度）
+# 强制重新分析（清除该视频全部缓存并强制重采全部用户）
 python run.py BV1vu4y1b7Y9 --force
 
 # 限制最大分析用户数
@@ -40,6 +40,13 @@ python run.py BV1vu4y1b7Y9 --max-users 50
 ```
 
 首次运行会提示扫码登录，请使用B站APP扫描终端显示的二维码。
+
+## 断点续采机制
+
+- 已解析的发送者（senders）与已采集的用户数据（users）持久化在 `data/profiler.db`。
+- 阶段5（用户采集）每采完一人立即落库，Ctrl+C 中断后重跑会自动跳过已完成的解析与采集。
+- 同一 UID 被多个弹幕 hash 命中时只采集一次；历史解析失败的发送者会在重跑时自动重试。
+- `--force` 会清除该视频的 senders/videos 缓存并强制重采该视频的全部用户（users 为用户级缓存，采集结果会覆盖更新）。
 
 ## 输出
 
