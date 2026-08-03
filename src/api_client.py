@@ -5,6 +5,7 @@ import time
 import random
 import hashlib
 import requests
+from urllib.parse import quote
 from config import DEFAULT_HEADERS, REQUEST_DELAY, REQUEST_DELAY_LONG, MAX_RETRY, RETRY_BACKOFF, NAV_URL
 
 
@@ -24,6 +25,7 @@ class BiliAPIClient:
         self.session.headers.update(DEFAULT_HEADERS)
         self._last_request_time = 0
         self._wbi_key = None
+        self._wbi_key_date = None  # WBI 密钥缓存日期，img_key/sub_key 全站统一、每日更替
         self._buvid3 = None
         self._risk_apis = {
             "relation/followings", "relation/followers",
@@ -37,8 +39,9 @@ class BiliAPIClient:
         return "/wbi/" in url
 
     def _get_wbi_key(self) -> str:
-        """获取并缓存 WBI mixin key"""
-        if self._wbi_key:
+        """获取并缓存 WBI mixin key（img_key/sub_key 全站统一、每日更替，跨日期自动刷新）"""
+        today = time.strftime("%Y-%m-%d")
+        if self._wbi_key and self._wbi_key_date == today:
             return self._wbi_key
         try:
             resp = self.session.get(NAV_URL, timeout=10)
@@ -47,22 +50,26 @@ class BiliAPIClient:
             sub = data.get("sub_url", "").split("/")[-1].split(".")[0]
             val = img + sub
             self._wbi_key = "".join(val[i] for i in WBI_OE)[:32]
+            self._wbi_key_date = today
         except Exception:
             self._wbi_key = ""
         return self._wbi_key
 
     def _sign_wbi(self, params: dict) -> dict:
-        """为 WBI 接口参数添加签名"""
+        """为 WBI 接口参数添加签名（规范：过滤 !'()*，urlencode 大写百分号，空格 %20）"""
         key = self._get_wbi_key()
         if not key:
             return params
-        # 剔除残留的旧签名参数，避免旧 w_rid/wts 混入签名串导致重签无效（-403 恢复路径会传入旧值）
+        # 剔除残留的旧签名参数，避免旧 w_rid/wts 混入签名串导致重签无效（-352/-403 恢复路径会传入旧值）
         params = {k: v for k, v in params.items() if k not in ("w_rid", "wts")}
         params["wts"] = int(time.time())
-        keys = sorted(params.keys())
-        param_str = "&".join(f"{k}={params[k]}" for k in keys)
-        sign = hashlib.md5((param_str + key).encode()).hexdigest()
-        params["w_rid"] = sign
+        items = []
+        for k in sorted(params.keys()):
+            # 规范要求过滤 value 中的 !'()* 字符后再编码
+            v = "".join(ch for ch in str(params[k]) if ch not in "!'()*")
+            items.append(f"{k}={quote(v, safe='')}")
+        param_str = "&".join(items)
+        params["w_rid"] = hashlib.md5((param_str + key).encode()).hexdigest()
         return params
 
     def _ensure_buvid3(self):
@@ -111,9 +118,12 @@ class BiliAPIClient:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
                     time.sleep(wait)
                     continue
-                # WBI key 过期时重新获取
-                if data.get("code") == -403:
+                # 签名失效（一般接口 -352、评论 wbi 接口 -403，均伴随 v_voucher）：清缓存强制刷新密钥并重签
+                if data.get("code") in (-352, -403):
                     self._wbi_key = None
+                    self._wbi_key_date = None
+                    # 退避后再重发，避免连续重发同一无效请求加重风控
+                    time.sleep(RETRY_BACKOFF)
                     params = self._sign_wbi(dict(params))
                     continue
                 return data
