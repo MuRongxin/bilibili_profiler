@@ -202,6 +202,7 @@ def clear_video_cache(bvid: str):
     - 删除该 bvid 的全部 senders 记录
     - users 表无 bvid 列，按 uid 关联：仅删除"该 bvid 的 senders 引用、
       且不再被其他 bvid 的 senders 引用"的用户数据，避免误删共享缓存
+    - 删除 videos 表中该 bvid 的视频信息记录
     """
     with closing(get_db()) as conn:
         cursor = conn.cursor()
@@ -210,6 +211,7 @@ def clear_video_cache(bvid: str):
         uids = [r["uid"] for r in cursor.fetchall()]
 
         cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,))
+        cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,))
 
         for uid in uids:
             cursor.execute("SELECT 1 FROM senders WHERE uid = ? LIMIT 1", (uid,))

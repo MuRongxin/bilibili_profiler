@@ -3,7 +3,7 @@ B站弹幕发送者用户画像分析系统 — 主控流程
 
 用法:
     python src/main.py BVxxxxxxxx [--force]
-    --force: 强制重新分析，忽略已有进度
+    --force: 清除该视频的全部缓存（senders/孤立 users/videos），强制重新采集全部用户
 """
 import sys
 import os
@@ -13,6 +13,7 @@ import argparse
 from config import MAX_ANALYZE_USERS, LLM_API_KEY
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, get_resolved_uids, load_senders
+from storage import clear_video_cache
 from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders
 from comment import collect_comment_data
@@ -48,6 +49,9 @@ def phase_danmaku(bvid: str, client):
 def phase_comment(aid: int, client):
     """阶段3: 采集评论（失败不影响后续流程）"""
     print("\n[Phase 3/6] 采集评论区数据...")
+    if not aid:
+        print("[Phase 3] 警告: 未获取到有效 aid，跳过评论采集（将仅用CRC32破解）")
+        return [], {}
     try:
         comments, comment_uid_map = collect_comment_data(aid, client)
         return comments, comment_uid_map
@@ -144,8 +148,8 @@ def phase_spam(sender_groups: dict) -> dict:
     return spam_results
 
 
-def phase_collect_users(resolved: dict, client, max_users: int = MAX_ANALYZE_USERS):
-    """阶段5: 深度采集用户数据"""
+def phase_collect_users(resolved: dict, client, max_users: int = MAX_ANALYZE_USERS, force: bool = False):
+    """阶段5: 深度采集用户数据（force=True 时跳过缓存强制重采）"""
     print("\n[Phase 5/6] 深度采集用户信息...")
 
     # 筛选需要采集的用户（有UID且置信度 acceptable）
@@ -170,8 +174,8 @@ def phase_collect_users(resolved: dict, client, max_users: int = MAX_ANALYZE_USE
     for idx, (mid_hash, uid) in enumerate(uids_to_collect, 1):
         print(f"\n  [{idx}/{total}] 采集 UID:{uid}...")
 
-        # 检查是否已缓存
-        if has_user_data(uid):
+        # 检查是否已缓存（--force 时跳过缓存强制重采，结果覆盖写 users 表）
+        if not force and has_user_data(uid):
             cached = load_user_data(uid)
             if cached:
                 user_data_map[uid] = cached[0]
@@ -247,12 +251,15 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
     """
     执行完整分析流程
     """
-    # TODO: force 强制重采逻辑由后续任务接管（调用 storage.clear_video_cache）
-    _ = force
     print_banner()
 
     # 初始化数据库
     init_db()
+
+    # --force: 清除该视频的全部缓存，后续阶段全部重新采集
+    if force:
+        clear_video_cache(bvid)
+        print(f"[Main] --force 已清除 {bvid} 的缓存，全部重新采集")
 
     # 阶段1: 登录
     client = phase_login()
@@ -277,7 +284,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
             resolved[mid_hash]["spam_score"] = spam_results[mid_hash]["spam_score"]
 
     # 阶段5: 用户采集
-    user_data_map = phase_collect_users(resolved, client)
+    user_data_map = phase_collect_users(resolved, client, max_users=max_users, force=force)
 
     # 阶段6: 画像分析
     profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups)
