@@ -10,12 +10,13 @@ import os
 import time
 import argparse
 
-from config import MAX_ANALYZE_USERS, LLM_API_KEY
+from config import MAX_ANALYZE_USERS, LLM_API_KEY, HISTORY_DANMAKU_ENABLED
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam
 from auth import get_auth_client
-from danmaku import collect_danmaku_data, get_top_senders
+from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page
+from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data
 from uid_resolver import resolve_all_senders, METHOD_CRC32_CRACK
 from spam_detector import batch_detect_spam
@@ -39,11 +40,61 @@ def phase_login():
 
 
 def phase_danmaku(bvid: str, client):
-    """阶段2: 采集弹幕"""
+    """阶段2: 采集弹幕（实时弹幕池 + 可选历史弹幕快照合并）"""
     print("\n[Phase 2/6] 采集弹幕数据...")
     video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, client)
     save_video_info(bvid, video_info)
+
+    # 实时弹幕池只保留最近几千条；开启历史弹幕时拉取每日弹幕池快照补全历史
+    if HISTORY_DANMAKU_ENABLED:
+        danmaku_list, sender_groups = _merge_history_danmaku(video_info, danmaku_list, client)
+
     return video_info, danmaku_list, sender_groups
+
+
+def _merge_history_danmaku(video_info: dict, danmaku_list: list[dict], client):
+    """拉取历史弹幕快照并与实时池合并，全局按 dmid 去重后重新聚合发送者。
+
+    历史 seg.so 返回的是"截至某日期的最新1000条弹幕池快照"，相邻日快照大量重叠，
+    原始合并结果含重复 dmid，必须先全局去重再 group_by_sender，否则发送者计数虚高。
+    实时池优先：其 weight/pool 等字段更全，历史快照中重复 dmid 直接丢弃；
+    dmid=0 的弹幕无法判重，按"不删除数据"约定保留。
+    历史采集失败降级为仅实时池，不中断主流程。
+    """
+    try:
+        # 多分P视频仅采集第1P的历史弹幕（历史接口按 cid 逐日拉取，逐P回溯成本高）
+        cid = get_cid_for_page(video_info, 0)
+        pubdate = video_info.get("pubdate", 0)
+        history_list = fetch_history_danmaku(cid, client, pubdate)
+    except Exception as e:
+        print(f"[Main] 警告：历史弹幕采集失败，降级为仅实时弹幕池: {e}")
+        return danmaku_list, group_by_sender(danmaku_list)
+
+    if not history_list:
+        print("[Main] 历史弹幕为空，使用实时弹幕池")
+        return danmaku_list, group_by_sender(danmaku_list)
+
+    merged = []
+    seen_dmids = set()
+    for dm in danmaku_list:  # 实时池优先入列
+        merged.append(dm)
+        if dm.get("dmid"):
+            seen_dmids.add(dm["dmid"])
+    history_new = 0
+    for dm in history_list:
+        dmid = dm.get("dmid", 0)
+        if dmid:
+            if dmid in seen_dmids:
+                continue  # 与实时池或前序日快照重复，丢弃
+            seen_dmids.add(dmid)
+        merged.append(dm)
+        history_new += 1
+
+    print(f"[Main] 实时池 {len(danmaku_list)} 条 + 历史快照 {len(history_list)} 条"
+          f"（去重后 {history_new} 条），合并后共 {len(merged)} 条弹幕")
+    print("[Main] 提示：历史弹幕为每日弹幕池快照（每日上限1000条），热门期弹幕滚动快，可能不完整")
+
+    return merged, group_by_sender(merged)
 
 
 def phase_comment(aid: int, client):
