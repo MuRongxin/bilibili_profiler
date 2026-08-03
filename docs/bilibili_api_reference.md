@@ -90,16 +90,21 @@ protobuf 分段参数：`type=1`（视频弹幕）、`oid=cid`（必要）、`pi
 
 `DanmakuElem` 字段含：`id`（dmid）、`progress`（视频内毫秒）、`mode`、`fontsize`、`color`、`midHash`（8 位 hex）、`content`、`ctime`、`weight`（0–10 智能屏蔽权重）等。
 
-### 2.2 历史弹幕（全量）[已证实]
+### 2.2 历史弹幕（弹幕池快照）[已证实 + 2026-08-03 本项目实测修正]
 
 来源：[history.md](https://github.com/pskdje/bilibili-API-collect/blob/main/docs/danmaku/history.md)
 
 - `GET /x/v2/dm/history/index?type=1&oid={cid}&month=YYYY-MM` → 该月有弹幕的日期列表（**需登录**）
-- `GET /x/v2/dm/web/history/seg.so?type=1&oid={cid}&date=YYYY-MM-DD` → 该日**全量弹幕** protobuf（**需 SESSDATA**）
+- `GET /x/v2/dm/web/history/seg.so?type=1&oid={cid}&date=YYYY-MM-DD` → 弹幕池快照 protobuf（**需 SESSDATA**）
 
-逐日遍历即可拿到视频自发布以来的全部历史弹幕（含早已被挤出实时池的）。XML 版历史接口已失效，现仅 protobuf。
+**⚠️ 本项目 2026-08-03 实测修正（与社区文档"该日全量弹幕"的描述不同）：**
+- seg.so 的真实语义是**"截至该日期的最新 1000 条弹幕池快照"**，不是"该日发送的弹幕"——返回弹幕的 ctime 可显著早于请求日期（实测请求 2024-09-15 返回 ctime 为 2024-05 的弹幕）。
+- **每日上限 1000 条**；相邻日快照可能零重叠（热门期池子整天滚动）或大量重叠（平静期）。
+- 逐日遍历 + 按 dmid 去重可逼近全量历史，但热门日期快照间滚出的弹幕仍会丢失。
+- 历史接口的 `midHash` **省略前导零**（6-8 字符不等），需 `zfill(8)` 后才能与实时池格式对齐。
+- `weight`/`pool` 字段不下发（恒 0）。
 
-解析提示：proto 消息为 `bilibili.community.service.dm.v1.DmSegMobileReply`，纯 Python 可手写 wire 格式解析（免 protoc 编译）。
+解析提示：proto 消息为 `bilibili.community.service.dm.v1.DmSegMobileReply`，纯 Python 可手写 wire 格式解析（免 protoc 编译），实现见本项目 `src/danmaku_history.py`。
 
 ### 2.3 弹幕元信息 dm/web/view [已证实]
 

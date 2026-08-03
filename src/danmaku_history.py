@@ -1,9 +1,15 @@
 """
-全量历史弹幕采集模块
+历史弹幕采集模块（弹幕池历史快照）
 
-实时弹幕池（XML 接口）只保留最近几千条，历史弹幕接口可按日拉取全量：
+实时弹幕池（XML 接口）只保留最近几千条，历史弹幕接口可按日拉取历史快照：
 - history/index：查询某月哪些日期有弹幕（需登录）
-- history/seg.so：拉取某日全量弹幕的 protobuf 字节流（需 SESSDATA）
+- history/seg.so：拉取某日期的弹幕池快照 protobuf（需 SESSDATA）
+
+【实测语义 2026-08-03 验证】seg.so 并非"该日发送的弹幕"，而是"截至该日期的
+最新 1000 条弹幕池快照"（每日上限 1000，弹幕 ctime 可早于请求日期；相邻日
+快照可能大量重叠或完全不重叠）。逐日遍历 + 按 dmid 去重可逼近全量历史弹幕，
+但热门日期（如发布初期）快照间的弹幕滚动仍可能丢失。
+另：历史接口的 midHash 省略前导零（需 zfill(8)）；weight/pool 字段不下发（恒 0）。
 
 protobuf 结构（DmSegMobileReply）：
     repeated DanmakuElem elems = 1;
@@ -151,20 +157,21 @@ def _fetch_month_dates(cid: int, month: str, client: BiliAPIClient) -> list[str]
 
 
 def _fetch_day_danmaku(cid: int, date: str, client: BiliAPIClient) -> list[dict]:
-    """拉取并解析某日全量弹幕"""
+    """拉取并解析某日期的弹幕池快照（截至该日的最新1000条，非"该日发送的弹幕"）"""
     resp = client.get_raw(DANMAKU_HISTORY_SEG_URL, params={"type": 1, "oid": cid, "date": date})
     return parse_danmaku_proto(resp.content)
 
 
 def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int] = None) -> list[dict]:
     """
-    采集视频全量历史弹幕
+    采集视频历史弹幕（弹幕池快照逐日遍历）
 
-    从 pubdate 月份起到当前月逐月查询日期索引，再逐日拉取 seg.so 合并。
+    从 pubdate 月份起到当前月逐月查询日期索引，再逐日拉取 seg.so。
+    返回的是原始快照合并结果（相邻日快照可能重叠），调用方需按 dmid 去重。
     受 HISTORY_MAX_MONTHS / HISTORY_MAX_DAYS 限制；单月/单日失败打印警告跳过，不中断。
 
     Returns:
-        与 danmaku.parse_danmaku_xml 同构的弹幕 dict 列表（另含 weight 字段）
+        与 danmaku.parse_danmaku_xml 同构的弹幕 dict 列表（另含 weight 字段，实测恒为 0）
     """
     if not HISTORY_DANMAKU_ENABLED:
         return []
