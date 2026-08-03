@@ -11,8 +11,8 @@ import time
 import argparse
 
 from config import MAX_ANALYZE_USERS, LLM_API_KEY
-from storage import init_db, save_video_info, save_sender, save_user_data, save_progress
-from storage import load_progress, load_user_data, has_user_data, get_resolved_uids, load_senders
+from storage import init_db, save_video_info, save_sender, save_user_data
+from storage import load_user_data, has_user_data, get_resolved_uids, load_senders
 from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders
 from comment import collect_comment_data
@@ -247,18 +247,12 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
     """
     执行完整分析流程
     """
+    # TODO: force 强制重采逻辑由后续任务接管（调用 storage.clear_video_cache）
+    _ = force
     print_banner()
 
     # 初始化数据库
     init_db()
-
-    # 检查已有进度
-    if not force:
-        progress = load_progress(bvid)
-        if progress:
-            stage, processed, total = progress
-            print(f"[Resume] 发现已有进度: {stage}, 已处理 {len(processed)}/{total}")
-            print("[Resume] 使用 --force 可强制重新分析")
 
     # 阶段1: 登录
     client = phase_login()
@@ -303,10 +297,6 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
     print("\n[Report] 生成HTML报告...")
     report_path = save_report(video_info, profiles)
     print(f"[Report] 报告已保存: {report_path}")
-
-    # 保存进度
-    all_uids = {info["uid"] for info in resolved.values() if info["uid"]}
-    save_progress(bvid, "完成", all_uids, len(resolved))
 
     print("\n" + "=" * 60)
     print("  分析完成!")
