@@ -29,27 +29,33 @@ def analyze_content_repeat(contents: list[str]) -> Tuple[float, list[float]]:
     if n <= 1:
         return 0.0, []
 
-    unique = set(contents)
+    counts = Counter(contents)
+    unique = list(counts)
     repeat_rate = 1 - len(unique) / n
 
-    # 计算所有两两相似度
+    # 先按内容去重，只对唯一内容两两比较，再用出现次数加权展开为全量两两相似度。
+    # 与原 O(n²) 全量比较数学等价（相同内容相似度恒为 1，唯一对 (a,b) 贡献
+    # count[a]*count[b] 个相同 sim），复杂度降为 O(u²)，u = 唯一内容数。
     similarities = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            sim = content_similarity(contents[i], contents[j])
-            similarities.append(sim)
+    for c in counts.values():
+        similarities.extend([1.0] * (c * (c - 1) // 2))
+    for i in range(len(unique)):
+        ci = counts[unique[i]]
+        for j in range(i + 1, len(unique)):
+            sim = content_similarity(unique[i], unique[j])
+            similarities.extend([sim] * (ci * counts[unique[j]]))
 
     return repeat_rate, similarities
 
 
-def detect_bot_pattern(timestamps: list[int], video_times: list[float]) -> float:
+def detect_bot_pattern(timestamps: list[int]) -> float:
     """
     检测机器人模式
-    
+
     特征：
     - 时间间隔过于规律（标准差极小）
     - 短时间内大量发送
-    
+
     Returns:
         bot_score (0-1)，越高越像机器人
     """
@@ -90,7 +96,7 @@ def detect_bot_pattern(timestamps: list[int], video_times: list[float]) -> float
     return min(1.0, bot_score)
 
 
-def analyze_spam(danmaku_contents: list[str], timestamps: list[int], video_times: list[float]) -> dict:
+def analyze_spam(danmaku_contents: list[str], timestamps: list[int]) -> dict:
     """
     综合分析刷屏程度
     
@@ -124,7 +130,7 @@ def analyze_spam(danmaku_contents: list[str], timestamps: list[int], video_times
         avg_interval = 0.0
 
     # 机器人检测
-    bot_score = detect_bot_pattern(timestamps, video_times)
+    bot_score = detect_bot_pattern(timestamps)
 
     # 综合刷屏评分
     spam_score = 0.0
@@ -191,8 +197,7 @@ def batch_detect_spam(sender_groups: dict[str, dict]) -> dict[str, dict]:
     for mid_hash, group in sender_groups.items():
         result = analyze_spam(
             group["contents"],
-            group["timestamps"],
-            group["video_times"]
+            group["timestamps"]
         )
         results[mid_hash] = result
     return results
