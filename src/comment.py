@@ -26,6 +26,7 @@ def _parse_comment(r: dict, is_sub: bool) -> dict | None:
 
     return {
         "uid": mid,
+        "rpid": r.get("rpid", 0),
         "uname": member.get("uname", ""),
         "sign": member.get("sign", ""),
         "level": (member.get("level_info") or {}).get("current_level", 0),
@@ -44,7 +45,9 @@ def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
     """补采子评论：rcount 超过内嵌预览数时按 pn 翻页拉取全量子评论。
 
     补采成功（拿到比预览更多的子评论）时以补采结果替换预览（reply/reply 返回
-    全量含预览条目，直接替换避免重复）；补采失败/无新增时保留预览，降级不中断。
+    全量通常含预览条目，替换避免重复）；但 rcount 超过补采上限被截断时，按热度
+    排序的预览条目可能不在已采前 N 页内，需把缺失的预览条目追加回去。
+    补采失败/无新增时保留预览，降级不中断。
     """
     if rcount <= len(preview):
         return preview
@@ -75,7 +78,16 @@ def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
         if not replies or pn * 20 >= total:
             break
 
-    return fetched if len(fetched) > len(preview) else preview
+    if len(fetched) <= len(preview):
+        return preview
+
+    # 截断边界：rcount 超过补采上限时，按热度排序的预览条目可能不在已采
+    # 结果内，把缺失的预览条目（按 rpid 判重）追加回去，避免丢其 UID/属地
+    fetched_rpids = {c["rpid"] for c in fetched}
+    for c in preview:
+        if c["rpid"] not in fetched_rpids:
+            fetched.append(c)
+    return fetched
 
 
 def _collect_page(replies: list, oid: int, client: BiliAPIClient) -> list[dict]:
@@ -102,6 +114,7 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list
     """wbi/main 游标翻页采集主评论。首页即失败返回 None（调用方降级旧接口）"""
     all_comments = []
     offset = ""
+    seen_offsets = {""}  # 已请求过的游标（含首页空游标），防 API 异常返回重复 next_offset
 
     for page in range(1, max_pages + 1):
         data = client.get(COMMENT_MAIN_WBI_URL, params={
@@ -124,13 +137,22 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list
         if not replies:
             break
 
-        all_comments.extend(_collect_page(replies, oid, client))
-
         # 翻页：cursor.pagination_reply.next_offset 为不透明游标字符串，is_end 终止
         cursor = page_data.get("cursor") or {}
         next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
+
+        # 游标重复防护：API 异常返回已采页的游标（含与本轮请求相同的自环）时，
+        # 本页为重复内容，丢弃并在入列前终止，避免重复采同页直到 max_pages
+        # 导致 comments 虚增与重复补采请求
+        if next_offset and next_offset in seen_offsets:
+            print(f"[Comment] wbi/main 游标重复 (offset={next_offset!r})，终止翻页")
+            break
+
+        all_comments.extend(_collect_page(replies, oid, client))
+
         if cursor.get("is_end", False) or not next_offset:
             break
+        seen_offsets.add(next_offset)
         offset = next_offset
 
     return all_comments
