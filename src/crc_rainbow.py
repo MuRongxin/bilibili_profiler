@@ -1,207 +1,82 @@
 """
-CRC32 彩虹表：mid_hash → UID 毫秒级反查
+MITM（中间相遇）CRC32 反查：mid_hash → 全部候选 UID
 
-表结构：8 字节定长记录 (crc32:uint32, uid:uint32)，struct '<II' 小端，
-全表按 (crc32, uid) 升序排序。查询时 mmap 只读映射 + 手写二分定位，
-碰撞（同 crc32 多个 uid）的记录相邻，二分后向两侧扫描收集全部候选。
+算法：zlib.crc32 可链式调用，且对定长 5 字节后缀 s，f_s(x)=crc32(s,x) 是 x 的
+仿射函数，线性部分与 s 内容无关（同 5 个 0x00 字节）。故
+    f_s(x) = _advance5(x) ^ crc32(b"\\x00"*5) ^ crc32(s)
+预计算 10 万个 5 位后缀串（"00000"~"99999"）的 crc 建内存小表（首次查询时
+惰性构建，秒级，无需落盘大表）；查询时枚举 ≤5 位前缀（6~10 位 UID 共 99999 个
+前缀），反查所需后缀 crc 得候选，最后逐候选 zlib 校验保证精确。
 
-构建流程：多进程分片计算 zlib.crc32(str(uid).encode())，片内排序写临时文件
-data/crc_tmp_N.bin，再 heapq.merge 做 k 路归并流式写入 CRC_TABLE_PATH，
-最后清理临时文件。纯标准库实现，不引入第三方依赖。
+参考：esterTion/BiliBili_crc2mid、Aruelius/crc32-crack（MoePus MITM）。
+覆盖范围：全部 ≤10 位 UID（16 位随机长 UID 数学上不可解，见 spec 第 9 节）。
+纯标准库实现，不引入第三方依赖。
 """
-import array
-import heapq
-import mmap
-import multiprocessing
-import os
-import struct
-import sys
 import zlib
 
-from config import CRC_TABLE_PATH, CRC_TABLE_MAX_UID, CRC_BUILD_CHUNK
+from config import MITM_MAX_UID
 
-_RECORD = struct.Struct("<II")   # (crc32, uid) 小端定长记录
-RECORD_SIZE = _RECORD.size       # 8 字节
+_SUFFIX_DIGITS = 5                    # 后缀定长（十进制位）
+_SUFFIX_COUNT = 10 ** _SUFFIX_DIGITS  # 100000
+_MAX_PREFIX = 10 ** _SUFFIX_DIGITS    # 前缀最多 5 位：99999
 
-# 归并/写出缓冲：每 100 万条记录（8MB）落一次盘，控制内存
-_FLUSH_RECORDS = 1_000_000
-
-# 进程级 mmap 缓存：{表路径: (文件对象, mmap对象)}，避免重复打开
-_mmap_cache: dict = {}
-
-
-def _get_table_path() -> str:
-    """返回当前生效的表路径（运行期读 config，便于测试 monkeypatch）"""
-    import config
-    return config.CRC_TABLE_PATH
+# 惰性构建的进程级缓存
+_suffix_crc_map: dict | None = None   # crc32("%05d" % n) -> [n, ...]
+_small_uid_map: dict | None = None    # crc32(str(uid)) -> [uid, ...]，uid < 100000
+_prefix_crc: list | None = None       # [crc32(str(p)) for p in range(100000)]
+_zeros5_crc: int = 0                  # crc32(b"\x00" * 5)
+_crc_byte_table: list | None = None   # 标准 CRC32 字节推进表（多项式 0xEDB88320）
 
 
-def _get_tmp_dir() -> str:
-    """临时分片文件目录（与表文件同目录）"""
-    return os.path.dirname(_get_table_path()) or "."
+def _get_byte_table() -> list:
+    """标准 CRC32 表（与 zlib 相同的多项式），用于手写字节推进"""
+    global _crc_byte_table
+    if _crc_byte_table is None:
+        table = []
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                c = (0xEDB88320 ^ (c >> 1)) if (c & 1) else (c >> 1)
+            table.append(c)
+        _crc_byte_table = table
+    return _crc_byte_table
 
 
-def _build_chunk(task):
-    """worker：计算 [start, end) 的 crc32，按 (crc32, uid) 排序后写临时分片文件"""
-    start, end, tmp_path = task
-    records = [(zlib.crc32(str(uid).encode()), uid) for uid in range(start, end)]
-    records.sort()
-    buf = array.array("I")
-    for crc, uid in records:
-        buf.append(crc)
-        buf.append(uid)
-    if sys.byteorder == "big":
-        buf.byteswap()  # 统一按小端落盘
-    with open(tmp_path, "wb") as f:
-        buf.tofile(f)
-    return tmp_path, len(records)
+def _advance5(crc: int) -> int:
+    """从链式值 crc 推进 5 个 0x00 字节，等价于 zlib.crc32(b"\\x00"*5, crc)"""
+    table = _get_byte_table()
+    state = crc ^ 0xFFFFFFFF
+    for _ in range(5):
+        state = table[state & 0xFF] ^ (state >> 8)
+    return state ^ 0xFFFFFFFF
 
 
-def _iter_chunk_file(path):
-    """流式读取一个有序分片文件，逐条产出 (crc32, uid)"""
-    buf = array.array("I")
-    with open(path, "rb") as f:
-        while True:
-            data = f.read(_FLUSH_RECORDS * RECORD_SIZE)
-            if not data:
-                break
-            buf.frombytes(data)
-            if sys.byteorder == "big":
-                buf.byteswap()
-            for i in range(0, len(buf), 2):
-                yield (buf[i], buf[i + 1])
-            del buf[:]
-
-
-def _flush_buffer(f, buf: array.array):
-    """把输出缓冲落盘并清空"""
-    if not buf:
+def _ensure_tables():
+    """首次查询时惰性构建全部内存表（约 1-2 秒，之后驻留内存仅几 MB）"""
+    global _suffix_crc_map, _small_uid_map, _prefix_crc, _zeros5_crc
+    if _suffix_crc_map is not None:
         return
-    out = array.array("I", buf)
-    if sys.byteorder == "big":
-        out.byteswap()
-    out.tofile(f)
-    del buf[:]
+    suffix_map: dict[int, list] = {}
+    small_map: dict[int, list] = {}
+    prefix_crc = [0] * _SUFFIX_COUNT
+    for n in range(_SUFFIX_COUNT):
+        suffix_map.setdefault(zlib.crc32(("%05d" % n).encode()), []).append(n)
+        small_map.setdefault(zlib.crc32(str(n).encode()), []).append(n)
+        prefix_crc[n] = zlib.crc32(str(n).encode())
+    _suffix_crc_map = suffix_map
+    _small_uid_map = small_map
+    _prefix_crc = prefix_crc
+    _zeros5_crc = zlib.crc32(b"\x00" * 5)
 
 
-def build_table(max_uid: int = CRC_TABLE_MAX_UID, workers: int = None) -> bool:
+def lookup(crc32_hash: str, max_uid: int = MITM_MAX_UID) -> list:
     """
-    构建彩虹表（一次性，带进度打印），返回是否成功。
-    多进程分片（每片 CRC_BUILD_CHUNK 条）并行计算 + 片内排序，
-    再 k 路归并流式写出最终表文件；失败时清理半成品返回 False。
-    """
-    if workers is None:
-        workers = os.cpu_count() or 1
-    table_path = _get_table_path()
-    tmp_dir = _get_tmp_dir()
-    os.makedirs(tmp_dir, exist_ok=True)
+    MITM 反查：输入 8 位 hex（如 '4200b4cd'），返回全部候选 UID（升序）。
 
-    # 分片任务：[i*chunk, (i+1)*chunk)
-    chunk = CRC_BUILD_CHUNK
-    tasks = []
-    start = 0
-    idx = 0
-    while start < max_uid:
-        end = min(start + chunk, max_uid)
-        tasks.append((start, end, os.path.join(tmp_dir, f"crc_tmp_{idx}.bin")))
-        start = end
-        idx += 1
-
-    tmp_paths = [t[2] for t in tasks]
-    print(f"[彩虹表] 开始构建：UID 范围 0 ~ {max_uid - 1}，共 {len(tasks)} 片，{workers} 进程")
-
-    try:
-        # 1) 多进程分片计算
-        done = 0
-        with multiprocessing.Pool(processes=workers) as pool:
-            for tmp_path, count in pool.imap_unordered(_build_chunk, tasks):
-                done += 1
-                print(f"[彩虹表] 分片完成 {done}/{len(tasks)}（{count} 条）", flush=True)
-
-        # 2) k 路归并，流式写出（不全量入内存）
-        print("[彩虹表] 开始归并写出 ...", flush=True)
-        out_buf = array.array("I")
-        written = 0
-        partial_path = table_path + ".partial"
-        with open(partial_path, "wb") as f:
-            for crc, uid in heapq.merge(*[_iter_chunk_file(p) for p in tmp_paths]):
-                out_buf.append(crc)
-                out_buf.append(uid)
-                written += 1
-                if len(out_buf) >= _FLUSH_RECORDS * 2:
-                    _flush_buffer(f, out_buf)
-                    print(f"[彩虹表] 已归并 {written} 条", flush=True)
-            _flush_buffer(f, out_buf)
-        os.replace(partial_path, table_path)  # 原子替换，避免半成品被当作正式表
-        # 重建换了新 inode，作废旧 mmap 缓存（关闭旧句柄），否则同进程 lookup 仍读旧表
-        stale = _mmap_cache.pop(table_path, None)
-        if stale is not None:
-            try:
-                stale[1].close()
-                stale[0].close()
-            except (OSError, ValueError):
-                pass
-        print(f"[彩虹表] 构建完成：{table_path}（{written} 条，"
-              f"{os.path.getsize(table_path) / 1024 / 1024:.1f} MB）")
-        return True
-    except Exception as e:
-        print(f"[彩虹表] 构建失败：{e}")
-        # 只清理半成品 .partial，绝不动 table_path——已有的好表必须保留
-        try:
-            if os.path.exists(table_path + ".partial"):
-                os.remove(table_path + ".partial")
-        except OSError:
-            pass
-        return False
-    finally:
-        # 清理临时分片文件
-        for p in tmp_paths:
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError:
-                pass
-
-
-def _get_mmap(table_path: str):
-    """获取表的 mmap 只读映射（进程级缓存）。表不存在或为空返回 None。"""
-    if table_path in _mmap_cache:
-        return _mmap_cache[table_path][1]
-    f = None
-    try:
-        f = open(table_path, "rb")
-        if os.fstat(f.fileno()).st_size == 0:
-            f.close()
-            return None
-        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    except (OSError, ValueError):
-        # mmap 失败时关闭已打开的文件句柄，避免泄漏（f.close 幂等，重复调用安全）
-        if f is not None:
-            f.close()
-        return None
-    _mmap_cache[table_path] = (f, mm)
-    return mm
-
-
-def _read_crc(mm, idx: int) -> int:
-    """读第 idx 条记录的 crc32"""
-    return _RECORD.unpack_from(mm, idx * RECORD_SIZE)[0]
-
-
-def table_exists() -> bool:
-    """表文件是否存在且大小合理（非空、为 8 的倍数）"""
-    table_path = _get_table_path()
-    try:
-        size = os.path.getsize(table_path)
-    except OSError:
-        return False
-    return size > 0 and size % RECORD_SIZE == 0
-
-
-def lookup(crc32_hash: str) -> list[int]:
-    """
-    查表：输入 8 位 hex 字符串（如 '4200b4cd'），返回所有匹配 uid（升序）。
-    表不存在或损坏、输入非法时返回空列表。
+    覆盖 ≤10 位 UID（由 max_uid 控制，默认 MITM_MAX_UID=10^10）。
+    每个返回候选都经过 zlib 校验，数学上精确；候选数平均约 2.3 个
+    （10^10 空间对 2^32 哈希空间），消歧由调用方负责。
+    输入非法时返回空列表。
     """
     try:
         target = int(crc32_hash.strip(), 16)
@@ -209,30 +84,29 @@ def lookup(crc32_hash: str) -> list[int]:
         return []
     if not (0 <= target <= 0xFFFFFFFF):
         return []
-    if not table_exists():
-        return []
 
-    mm = _get_mmap(_get_table_path())
-    if mm is None:
-        return []
-    try:
-        n = len(mm) // RECORD_SIZE
-        # 手写二分：定位第一条 crc32 >= target 的记录（约 log2(n) ≈ 26 次读取）
-        lo, hi = 0, n
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if _read_crc(mm, mid) < target:
-                lo = mid + 1
-            else:
-                hi = mid
-        # 从 lo 向后扫描收集全部同 crc32 的 uid（碰撞记录相邻）
-        results = []
-        i = lo
-        while i < n and _read_crc(mm, i) == target:
-            results.append(_RECORD.unpack_from(mm, i * RECORD_SIZE)[1])
-            i += 1
-        results.sort()
-        return results
-    except (OSError, ValueError, struct.error):
-        # mmap 读取异常（如表被外部截断）按表损坏处理
-        return []
+    _ensure_tables()
+    max_uid = min(max_uid, MITM_MAX_UID)
+    results = set()
+
+    # 1) UID < 100000（不足 6 位，无前缀可拆）：直接查小表
+    for uid in _small_uid_map.get(target, ()):
+        if uid <= max_uid:
+            results.add(uid)
+
+    # 2) 6~10 位 UID：前缀（str(prefix)）+ 5 位定长后缀
+    z5 = _zeros5_crc
+    suffix_map = _suffix_crc_map
+    prefix_crc = _prefix_crc
+    for prefix in range(1, _MAX_PREFIX):
+        uid_base = prefix * _SUFFIX_COUNT
+        if uid_base > max_uid:
+            break
+        need = target ^ _advance5(prefix_crc[prefix]) ^ z5
+        for n in suffix_map.get(need, ()):
+            uid = uid_base + n
+            if uid <= max_uid:
+                results.add(uid)
+
+    # 3) 逐候选 zlib 校验（仿射推导理论上精确，校验防御实现错误）并排序
+    return sorted(u for u in results if zlib.crc32(str(u).encode()) == target)
