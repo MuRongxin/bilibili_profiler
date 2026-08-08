@@ -8,7 +8,6 @@ B站弹幕发送者用户画像分析系统 — 主控流程
 """
 import sys
 import os
-import time
 import argparse
 
 from config import MAX_ANALYZE_USERS, LLM_API_KEY, HISTORY_DANMAKU_ENABLED
