@@ -17,7 +17,7 @@ from storage import clear_video_cache, update_sender_spam, save_global_uid, load
 from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page
 from danmaku_history import fetch_history_danmaku
-from comment import collect_comment_data
+from comment import collect_comment_data, fetch_charge_uid_map
 from uid_resolver import resolve_all_senders, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
 from spam_detector import batch_detect_spam
 from user_collector import collect_user_data
@@ -106,21 +106,27 @@ def _merge_history_danmaku(video_info: dict, danmaku_list: list[dict], client):
     return merged, group_by_sender(merged)
 
 
-def phase_comment(aid: int, client):
-    """阶段3: 采集评论（失败不影响后续流程）"""
+def phase_comment(video_info: dict, client):
+    """阶段3: 采集评论 + 充电名单（失败不影响后续流程）"""
     print("\n[Phase 3/6] 采集评论区数据...")
+    aid = video_info.get("aid", 0)
     if not aid:
-        print("[Phase 3] 警告: 未获取到有效 aid，跳过评论采集（将仅用CRC32破解）")
-        return [], {}, {}
+        print("[Phase 3] 警告: 未获取到有效 aid，跳过评论采集（将仅用MITM破解）")
+        return [], {}, {}, {}
+    comments, comment_uid_map, comment_location_map = [], {}, {}
     try:
         comments, comment_uid_map, comment_location_map = collect_comment_data(aid, client)
-        return comments, comment_uid_map, comment_location_map
     except Exception as e:
-        print(f"[Phase 3] 评论采集失败 (将仅用CRC32破解): {e}")
-        return [], {}, {}
+        print(f"[Phase 3] 评论采集失败 (将仅用其他来源): {e}")
+    # 充电名单（独立降级：评论失败也照常尝试）
+    up_mid = (video_info.get("owner") or {}).get("mid", 0)
+    charge_uid_map = {}
+    if up_mid:
+        charge_uid_map = fetch_charge_uid_map(video_info.get("bvid", ""), aid, up_mid, client)
+    return comments, comment_uid_map, comment_location_map, charge_uid_map
 
 
-def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client, max_users: int = MAX_ANALYZE_USERS):
+def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client, max_users: int = MAX_ANALYZE_USERS, charge_uid_map: dict | None = None):
     """阶段4: 解析发送者UID（支持数据库缓存 + 按弹幕数取top N）"""
     print("\n[Phase 4/6] 解析发送者UID...")
 
@@ -134,6 +140,15 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     global_map = load_global_uid_map()
     plain_uid_map = dict(comment_uid_map)  # 评论映射复制为底
     method_map = {h: METHOD_COMMENT_VERIFY for h in comment_uid_map}
+    # 1.6 充电名单合并（明文证据，置信度同评论验证；评论优先）
+    charge_hit = 0
+    for h, uid in (charge_uid_map or {}).items():
+        if h not in plain_uid_map:
+            plain_uid_map[h] = uid
+            method_map[h] = "充电名单"
+            charge_hit += 1
+    if charge_hit:
+        print(f"[Phase 4] 充电名单: 补充 {charge_hit} 条到交叉验证映射")
     global_hit = 0
     for h, ent in global_map.items():
         if h not in plain_uid_map:
@@ -399,11 +414,12 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
         print("[Main] 弹幕为空，终止分析")
         return
 
-    # 阶段3: 评论（comment_location_map 为 uid→IP属地，阶段6贯通进画像）
-    comments, comment_uid_map, comment_location_map = phase_comment(aid, client)
+    # 阶段3: 评论 + 充电名单（comment_location_map 为 uid→IP属地，阶段6贯通进画像）
+    comments, comment_uid_map, comment_location_map, charge_uid_map = phase_comment(video_info, client)
 
     # 阶段4: UID解析
-    resolved = phase_resolve(bvid, sender_groups, comment_uid_map, client, max_users=max_users)
+    resolved = phase_resolve(bvid, sender_groups, comment_uid_map, client,
+                             max_users=max_users, charge_uid_map=charge_uid_map)
 
     # 阶段4.5: 刷屏检测
     spam_results = phase_spam(bvid, sender_groups)

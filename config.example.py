@@ -23,6 +23,7 @@ DANMAKU_HISTORY_SEG_URL = "https://api.bilibili.com/x/v2/dm/web/history/seg.so"
 COMMENT_MAIN_WBI_URL = "https://api.bilibili.com/x/v2/reply/wbi/main"  # 主评论新接口（wbi签名+游标翻页）
 COMMENT_MAIN_URL = "https://api.bilibili.com/x/v2/reply/main"  # 旧版主评论接口（wbi/main 失败时降级用）
 COMMENT_REPLY_URL = "https://api.bilibili.com/x/v2/reply/reply"
+CHARGE_LIST_URL = "https://api.bilibili.com/x/web-interface/elec/show"  # 视频充电鸣谢名单（含明文pay_mid）
 
 USER_CARD_URL = "https://api.bilibili.com/x/web-interface/card"
 USER_CARDS_BATCH_URL = "https://api.bilibili.com/x/polymer/pc-electron/v1/user/cards"  # 批量名片（≤50人/请求，仅需登录）

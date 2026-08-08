@@ -11,7 +11,8 @@ import zlib
 
 from api_client import BiliAPIClient
 from config import COMMENT_MAIN_WBI_URL, COMMENT_MAIN_URL, COMMENT_REPLY_URL
-from config import MAX_COMMENT_PAGES, COMMENT_REPLY_MAX_PAGES
+from config import MAX_COMMENT_PAGES, COMMENT_REPLY_MAX_PAGES, CHARGE_LIST_URL
+from uid_resolver import calc_crc32
 
 
 def _parse_comment(r: dict, is_sub: bool) -> dict | None:
@@ -275,3 +276,33 @@ def collect_comment_data(aid: int, client: BiliAPIClient) -> tuple[list[dict], d
     print(f"[Comment] 获取到 {len(comments)} 条评论（含子评论 {sub_count} 条），"
           f"提取 {len(uid_map)} 个独立用户UID，{len(location_map)} 个IP属地")
     return comments, uid_map, location_map
+
+
+def fetch_charge_uid_map(bvid: str, aid: int, up_mid: int, client) -> dict:
+    """
+    视频充电鸣谢名单 → crc32->UID 映射（明文 UID 源，置信度同评论验证）
+
+    充电用户是重度粉丝，与弹幕发送者重合率高。名单仅含本月充电用户；
+    无充电数据（code=62001）或接口异常时返回空映射，零成本降级。
+
+    Returns:
+        {crc32_hex: uid}
+    """
+    uid_map = {}
+    try:
+        data = client.get(CHARGE_LIST_URL, params={"mid": up_mid, "aid": aid})
+        if data.get("code") != 0:
+            # 62001=不需要展示充电信息（无充电数据），属正常情况不告警
+            if data.get("code") != 62001:
+                print(f"[Comment] 充电名单获取失败: {data.get('message')}（降级跳过）")
+            return {}
+        for item in (data.get("data") or {}).get("list") or []:
+            pay_mid = item.get("pay_mid")
+            if pay_mid:
+                uid_map[calc_crc32(int(pay_mid))] = int(pay_mid)
+        if uid_map:
+            print(f"[Comment] 充电名单: {len(uid_map)} 个明文UID")
+    except Exception as e:
+        print(f"[Comment] 充电名单获取异常: {e}（降级跳过）")
+        return {}
+    return uid_map
