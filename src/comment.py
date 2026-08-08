@@ -120,7 +120,8 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list
     """wbi/main 游标翻页采集主评论。首页即失败返回 None（调用方降级旧接口）"""
     all_comments = []
     offset = ""
-    seen_offsets = {""}  # 已请求过的游标（含首页空游标），防 API 异常返回重复 next_offset
+    seen_rpids = set()  # 已采评论的 rpid：该接口的 next_offset 可能连续多页相同但内容不同（实测），
+                        # 只有"整页无新 rpid"才是真的重复页
 
     for page in range(1, max_pages + 1):
         data = client.get(COMMENT_MAIN_WBI_URL, params={
@@ -143,22 +144,21 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list
         if not replies:
             break
 
+        # 真重复页检测：整页 rpid 都已见过才终止（next_offset 重复不代表内容重复，实测确认）
+        new_replies = [r for r in replies if r.get("rpid") not in seen_rpids]
+        if not new_replies:
+            print(f"[Comment] wbi/main 第{page}页无新评论（真重复页），终止翻页")
+            break
+        seen_rpids.update(r.get("rpid") for r in new_replies)
+
         # 翻页：cursor.pagination_reply.next_offset 为不透明游标字符串，is_end 终止
         cursor = page_data.get("cursor") or {}
         next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
 
-        # 游标重复防护：API 异常返回已采页的游标（含与本轮请求相同的自环）时，
-        # 本页为重复内容，丢弃并在入列前终止，避免重复采同页直到 max_pages
-        # 导致 comments 虚增与重复补采请求
-        if next_offset and next_offset in seen_offsets:
-            print(f"[Comment] wbi/main 游标重复 (offset={next_offset!r})，终止翻页")
-            break
-
-        all_comments.extend(_collect_page(replies, oid, client))
+        all_comments.extend(_collect_page(new_replies, oid, client))
 
         if cursor.get("is_end", False) or not next_offset:
             break
-        seen_offsets.add(next_offset)
         offset = next_offset
 
     return all_comments

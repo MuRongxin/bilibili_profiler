@@ -132,6 +132,7 @@ protobuf 分段参数：`type=1`（视频弹幕）、`oid=cid`（必要）、`pi
 
 - **现行接口**：`GET /x/v2/reply/wbi/main`（旧 `/x/v2/reply/main` 已弃用），**需 wbi 签名**。
 - **cursor 分页**：响应 `data.cursor.pagination_reply.next_offset` 是"字符串皮 JSON"（如 `{"type":3,"direction":1,"Data":{"cursor":71859}}`）；下一页将其放入 URL 参数 `pagination_str={"offset":"<next_offset>"}`；`data.cursor.is_end` 判断终止。旧 `next` 参数已弃用。
+- **⚠️ 本项目 2026-08-08 实测修正**：`next_offset` 实测为不透明 base64 串，且**可能连续多页完全相同但每页内容不同**——不能用"游标重复"做终止条件，否则会在第 2 页误杀翻页。可靠的终止条件：`is_end`、空 replies 页、或"整页 rpid 无新增"（真重复页检测）。
 - 排序 `mode`：0/3 仅热度、1 热度+时间、2 仅时间。
 - 返回条目含 **IP 属地**（`reply_control.location`）。
 - 旧翻页接口 `/x/v2/reply`（`pn`/`ps`，ps≤20）文档中仍存在，需登录或 APP token。
