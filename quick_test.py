@@ -27,7 +27,7 @@ def main():
                         help="分析刷屏得分最高的前N个发送者 (默认 1)")
     args = parser.parse_args()
     bvid = args.bvid
-    top_n = args.top
+    top_n = max(1, args.top)  # 夹紧下限：--top 0/负数无意义
 
     print(f"🎯 快速分析: {bvid}  (刷屏 Top {top_n})")
     print(f"   策略: 全量弹幕 → 刷屏检测 → 只解 Top{top_n} UID\n")

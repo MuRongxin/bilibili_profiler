@@ -444,13 +444,15 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
 
 
 def load_batch_bvids(path: str) -> list[str]:
-    """读取批量 BV 号清单：逐行读取，忽略空行与 # 注释行"""
+    """读取批量 BV 号清单：逐行读取，忽略空行与 # 注释行，去重保持顺序"""
     bvids = []
+    seen = set()
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("#"):
+            if not line or line.startswith("#") or line in seen:
                 continue
+            seen.add(line)
             bvids.append(line)
     return bvids
 
@@ -508,8 +510,8 @@ def main():
     if args.batch:
         try:
             run_batch(args.batch, force=args.force, max_users=args.max_users)
-        except FileNotFoundError:
-            print(f"错误: 批量清单文件不存在: {args.batch}")
+        except OSError as e:
+            print(f"错误: 批量清单文件不可读: {args.batch} ({e})")
             sys.exit(1)
         return
 
