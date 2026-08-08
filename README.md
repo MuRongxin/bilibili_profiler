@@ -28,6 +28,12 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+首次使用需复制配置模板并按需修改（如需 LLM 分析请填入 `LLM_API_KEY`，或用环境变量覆盖）：
+
+```bash
+cp config.example.py src/config.py
+```
+
 ## 用法
 
 ```bash

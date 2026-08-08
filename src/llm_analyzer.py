@@ -6,7 +6,6 @@
     export LLM_BASE_URL="https://api.xiaomimimo.com/v1"
     export LLM_MODEL="mimo-v2.5-pro"
 """
-import os
 import re
 import json
 from datetime import datetime
@@ -18,7 +17,7 @@ class LLMAnalyzer:
     """通用 LLM 分析器，兼容所有 OpenAI 协议 API"""
 
     def __init__(self):
-        self.api_key = LLM_API_KEY or os.environ.get("LLM_API_KEY", "")
+        self.api_key = LLM_API_KEY
         self.base_url = LLM_BASE_URL
         self.model = LLM_MODEL
         self.max_tokens = LLM_MAX_TOKENS
@@ -48,7 +47,7 @@ class LLMAnalyzer:
                 "followings_sample": p.get("following_analysis", {}).get("top_names", []),
                 "following_summary": p.get("following_summary", {}),
                 "danmaku_count": dm.get("count", 0),
-                "danmaku_contents": dm.get("contents", []),
+                "danmaku_contents": dm.get("contents", [])[:30],  # 只取前30条，防止刷屏用户prompt超长
                 "spam_level": dm.get("spam_level", "低"),
                 "tags": p.get("tags", []),
             })
@@ -117,14 +116,18 @@ class LLMAnalyzer:
         response = client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=self.max_tokens,
+            max_tokens=self.max_tokens,
             temperature=1.0,
             top_p=0.95,
             stream=False,
         )
 
-        raw_text = response.choices[0].message.content
-        return self._parse_per_user(raw_text)
+        raw_text = response.choices[0].message.content or ""
+        per_user = self._parse_per_user(raw_text)
+        if not per_user:
+            # 解析为空时打印原始响应前200字符，帮助诊断输出格式问题
+            print(f"  警告: LLM响应解析为空，原始响应前200字符: {raw_text[:200]!r}")
+        return per_user
 
     def analyze(self, profiles: list[dict], video_info: dict, batch_size: int = 10) -> dict:
         """调用 LLM，分批分析，返回 per_user 结果"""
@@ -137,7 +140,12 @@ class LLMAnalyzer:
             total_batches = (len(profiles) + batch_size - 1) // batch_size
             print(f"  批次 {batch_num}/{total_batches}: 分析 {len(batch)} 人...")
 
-            per_user = self._analyze_batch(batch, video_info)
+            try:
+                per_user = self._analyze_batch(batch, video_info)
+            except Exception as e:
+                # 失败降级：跳过该批次，不中断整体分析
+                print(f"  警告: 批次 {batch_num} 分析失败（{e}），跳过该批次")
+                continue
             all_per_user.update(per_user)
             all_texts.append(f"--- batch {batch_num} ---")
             for uid, text in per_user.items():
