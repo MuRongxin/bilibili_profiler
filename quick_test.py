@@ -3,8 +3,10 @@
 用法: python quick_test.py [BV号] [--top N]
 """
 import sys, os
+import argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
+from config import LLM_API_KEY, HISTORY_DANMAKU_ENABLED
 from auth import get_auth_client
 from danmaku import collect_danmaku_data
 from spam_detector import batch_detect_spam
@@ -14,21 +16,18 @@ from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
 from report import save_report
+from main import _merge_history_danmaku
 
 
 def main():
-    bvid = "BV1vu4y1b7Y9"
-    top_n = 1
-    for a in sys.argv[1:]:
-        if a.startswith("BV"):
-            bvid = a
-        elif a == "--top" or a == "-n":
-            continue
-        else:
-            try:
-                top_n = int(a)
-            except ValueError:
-                pass
+    parser = argparse.ArgumentParser(description="快速分析 - 只分析刷屏得分最高的前N个发送者")
+    parser.add_argument("bvid", nargs="?", default="BV1vu4y1b7Y9",
+                        help="视频BV号 (默认 BV1vu4y1b7Y9)")
+    parser.add_argument("--top", "-n", type=int, default=1,
+                        help="分析刷屏得分最高的前N个发送者 (默认 1)")
+    args = parser.parse_args()
+    bvid = args.bvid
+    top_n = args.top
 
     print(f"🎯 快速分析: {bvid}  (刷屏 Top {top_n})")
     print(f"   策略: 全量弹幕 → 刷屏检测 → 只解 Top{top_n} UID\n")
@@ -41,6 +40,11 @@ def main():
     print("[2/6] 采集弹幕...")
     video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, client)
     print(f"   视频: {video_info.get('title')}")
+
+    # 对齐主流程：开启历史弹幕时合并每日弹幕池快照，保证刷屏 top-N 口径与 run.py 一致
+    if HISTORY_DANMAKU_ENABLED:
+        danmaku_list, sender_groups = _merge_history_danmaku(video_info, danmaku_list, client)
+
     print(f"   弹幕: {len(danmaku_list)} 条, 发送者: {len(sender_groups)} 人")
 
     # 3. 刷屏检测 → 取 Top N
@@ -60,7 +64,9 @@ def main():
     print("[4/6] 收集评论...")
     try:
         _, comment_uid_map, _ = collect_comment_data(video_info.get("aid", 0), client)
-    except Exception:
+    except Exception as e:
+        # 对齐主流程 phase_comment：评论采集失败降级为仅用CRC32破解，只警告不中断
+        print(f"   评论采集失败 (将仅用CRC32破解): {e}")
         comment_uid_map = {}
 
     # 5. 逐个解析 + 采集 + 画像 + AI
@@ -80,16 +86,19 @@ def main():
         risk_note = " ⚠️可能误识别" if collision_risk else ""
         print(f"  ✅ UID={uid} (方法: {method}, 置信度: {confidence}){risk_note}")
 
-        # 采集数据
+        # 采集数据（对齐主流程：采集失败跳过该用户，不生成幽灵画像）
         user_data = collect_user_data(uid, client)
+        if "error" in user_data:
+            print(f"  ❌ 用户数据采集失败: {user_data['error']}")
+            continue
         dm_stats = {"count": group["count"], "contents": group["contents"], "video_times": group.get("video_times", [])}
         spam = spam_results.get(mid_hash, {})
         profile = analyze_profile(user_data, dm_stats, spam)
         profile["collision_risk"] = collision_risk
         profiles.append(profile)
 
-    # 6. AI 分析（批量）
-    if profiles and os.environ.get("LLM_API_KEY"):
+    # 6. AI 分析（批量；Key 判断对齐主流程，走 config 含环境变量读取）
+    if profiles and LLM_API_KEY:
         print(f"\n[6/6] AI 画像分析 ({len(profiles)}人)...")
         try:
             analyzer = LLMAnalyzer()
