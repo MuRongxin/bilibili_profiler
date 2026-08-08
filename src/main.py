@@ -18,7 +18,7 @@ from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page
 from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data
-from uid_resolver import resolve_all_senders, METHOD_CRC32_CRACK
+from uid_resolver import resolve_all_senders, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
 from spam_detector import batch_detect_spam
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
@@ -133,7 +133,7 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     #     评论验证优先，全局库兜底；method_map 标注每个 mid_hash 的来源
     global_map = load_global_uid_map()
     plain_uid_map = dict(comment_uid_map)  # 评论映射复制为底
-    method_map = {h: "评论区验证" for h in comment_uid_map}
+    method_map = {h: METHOD_COMMENT_VERIFY for h in comment_uid_map}
     global_hit = 0
     for h, ent in global_map.items():
         if h not in plain_uid_map:
