@@ -52,7 +52,7 @@ def _advance5(crc: int) -> int:
 
 
 def _ensure_tables():
-    """首次查询时惰性构建全部内存表（约 1-2 秒，之后驻留内存仅几 MB）"""
+    """首次查询时惰性构建全部内存表（约 2 秒，之后驻留内存约 40MB）"""
     global _suffix_crc_map, _small_uid_map, _prefix_crc, _zeros5_crc
     if _suffix_crc_map is not None:
         return
@@ -60,9 +60,10 @@ def _ensure_tables():
     small_map: dict[int, list] = {}
     prefix_crc = [0] * _SUFFIX_COUNT
     for n in range(_SUFFIX_COUNT):
+        c = zlib.crc32(str(n).encode())
         suffix_map.setdefault(zlib.crc32(("%05d" % n).encode()), []).append(n)
-        small_map.setdefault(zlib.crc32(str(n).encode()), []).append(n)
-        prefix_crc[n] = zlib.crc32(str(n).encode())
+        small_map.setdefault(c, []).append(n)
+        prefix_crc[n] = c
     _suffix_crc_map = suffix_map
     _small_uid_map = small_map
     _prefix_crc = prefix_crc
