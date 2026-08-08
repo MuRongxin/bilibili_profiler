@@ -13,7 +13,7 @@ import argparse
 from config import MAX_ANALYZE_USERS, LLM_API_KEY, HISTORY_DANMAKU_ENABLED
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, load_senders
-from storage import clear_video_cache, update_sender_spam
+from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
 from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page
 from danmaku_history import fetch_history_danmaku
@@ -129,6 +129,19 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     cached_map = {r["mid_hash"]: r for r in cached}
     print(f"[Phase 4] 数据库缓存: {len(cached_map)} 个已解析")
 
+    # 1.5 全局 mid_hash→UID 映射库（跨视频累积）：与当视频评论映射合并，
+    #     评论验证优先，全局库兜底；method_map 标注每个 mid_hash 的来源
+    global_map = load_global_uid_map()
+    plain_uid_map = dict(comment_uid_map)  # 评论映射复制为底
+    method_map = {h: "评论区验证" for h in comment_uid_map}
+    global_hit = 0
+    for h, ent in global_map.items():
+        if h not in plain_uid_map:
+            plain_uid_map[h] = ent["uid"]
+            method_map[h] = ent["source"]
+            global_hit += 1
+    print(f"[Phase 4] 全局映射库: {len(global_map)} 条（补充 {global_hit} 条到交叉验证映射）")
+
     # 2. 筛选需要新解析的sender：不在缓存中的，以及缓存中 uid 为 NULL 的历史解析失败记录
     #    （评论交叉验证随新评论变好，失败记录值得重试；save_sender 为 INSERT OR REPLACE 会覆盖旧记录）
     unresolved = {}
@@ -156,7 +169,8 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     if to_resolve:
         to_resolve_dict = dict(to_resolve)
         print(f"[Phase 4] 需新解析: {len(to_resolve_dict)} 个发送者")
-        new_resolved = resolve_all_senders(to_resolve_dict, comment_uid_map, client)
+        new_resolved = resolve_all_senders(to_resolve_dict, plain_uid_map, client,
+                                           method_map=method_map)
 
         # 保存新解析结果到数据库
         for mid_hash, info in new_resolved.items():
@@ -171,6 +185,10 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                 spam_level=info.get("spam_level", "低"),
                 spam_score=0.0
             )
+            # 沉淀到全局映射库：多候选取最小的碰撞风险条目不入库（spec 4.2）
+            if info["uid"] is not None and not (
+                    info["method"] == METHOD_CRC32_CRACK and len(info.get("candidates", [])) > 1):
+                save_global_uid(mid_hash, info["uid"], info["method"])
     else:
         new_resolved = {}
         print("[Phase 4] 无需新解析，全部命中缓存")

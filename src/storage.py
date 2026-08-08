@@ -71,6 +71,18 @@ def init_db():
             )
         ''')
 
+        # 全局 mid_hash→UID 映射表（跨视频复用，只增不删）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS global_uid_map (
+                mid_hash TEXT PRIMARY KEY,
+                uid INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                hit_count INTEGER NOT NULL DEFAULT 1
+            )
+        ''')
+
         conn.commit()
 
         # 清理旧版本的 progress 表（断点续采已改为纯 senders/users 缓存机制）
@@ -225,3 +237,33 @@ def clear_video_cache(bvid: str):
                 cursor.execute("DELETE FROM users WHERE uid = ?", (uid,))
 
         conn.commit()
+
+
+# ========== 全局 mid_hash→UID 映射库（跨视频复用） ==========
+
+def save_global_uid(mid_hash: str, uid: int, source: str):
+    """
+    upsert 全局映射：新条目 hit_count=1；重复命中 hit_count+1 并刷新 last_seen
+    source: 评论区验证 / CRC32破解 / 充电名单 / 互动弹幕
+    """
+    now = datetime.now().isoformat()
+    with closing(get_db()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO global_uid_map (mid_hash, uid, source, first_seen, last_seen, hit_count)
+            VALUES (?, ?, ?, ?, ?, 1)
+            ON CONFLICT(mid_hash) DO UPDATE SET
+                uid=excluded.uid, source=excluded.source,
+                last_seen=excluded.last_seen, hit_count=hit_count+1
+        ''', (mid_hash, uid, source, now, now))
+        conn.commit()
+
+
+def load_global_uid_map() -> dict:
+    """读取全局映射库：{mid_hash: {"uid": int, "source": str, "hit_count": int}}"""
+    with closing(get_db()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT mid_hash, uid, source, hit_count FROM global_uid_map")
+        rows = cursor.fetchall()
+    return {r["mid_hash"]: {"uid": r["uid"], "source": r["source"], "hit_count": r["hit_count"]}
+            for r in rows}
