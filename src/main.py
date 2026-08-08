@@ -15,7 +15,7 @@ from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
 from auth import get_auth_client
-from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page
+from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page, fetch_command_dms, build_command_uid_map
 from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map
 from uid_resolver import resolve_all_senders, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
@@ -50,7 +50,11 @@ def phase_danmaku(bvid: str, client):
     if HISTORY_DANMAKU_ENABLED:
         danmaku_list, sender_groups = _merge_history_danmaku(video_info, danmaku_list, client)
 
-    return video_info, danmaku_list, sender_groups
+    # 互动弹幕（含明文mid，需SESSDATA；失败降级不影响主流程）
+    command_dms = fetch_command_dms(video_info, client)
+    video_info["command_dms"] = command_dms
+
+    return video_info, danmaku_list, sender_groups, command_dms
 
 
 def _merge_history_danmaku(video_info: dict, danmaku_list: list[dict], client):
@@ -126,7 +130,7 @@ def phase_comment(video_info: dict, client):
     return comments, comment_uid_map, comment_location_map, charge_uid_map
 
 
-def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client, max_users: int = MAX_ANALYZE_USERS, charge_uid_map: dict | None = None):
+def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client, max_users: int = MAX_ANALYZE_USERS, charge_uid_map: dict | None = None, command_uid_map: dict | None = None):
     """阶段4: 解析发送者UID（支持数据库缓存 + 按弹幕数取top N）"""
     print("\n[Phase 4/6] 解析发送者UID...")
 
@@ -149,6 +153,15 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
             charge_hit += 1
     if charge_hit:
         print(f"[Phase 4] 充电名单: 补充 {charge_hit} 条到交叉验证映射")
+    # 1.7 互动弹幕明文mid合并（基本只有UP主；评论/充电优先）
+    cmd_hit = 0
+    for h, uid in (command_uid_map or {}).items():
+        if h not in plain_uid_map:
+            plain_uid_map[h] = uid
+            method_map[h] = "互动弹幕"
+            cmd_hit += 1
+    if cmd_hit:
+        print(f"[Phase 4] 互动弹幕: 补充 {cmd_hit} 条到交叉验证映射")
     global_hit = 0
     for h, ent in global_map.items():
         if h not in plain_uid_map:
@@ -406,7 +419,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
         print(f"[Main] --force 已清除 {bvid} 的缓存，全部重新采集")
 
     # 阶段2: 弹幕
-    video_info, danmaku_list, sender_groups = phase_danmaku(bvid, client)
+    video_info, danmaku_list, sender_groups, command_dms = phase_danmaku(bvid, client)
     aid = video_info.get("aid", 0)
 
     # 弹幕为空时提前终止：后续评论/解析/画像均无意义，避免白跑全流程产出空报告
@@ -419,7 +432,8 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
 
     # 阶段4: UID解析
     resolved = phase_resolve(bvid, sender_groups, comment_uid_map, client,
-                             max_users=max_users, charge_uid_map=charge_uid_map)
+                             max_users=max_users, charge_uid_map=charge_uid_map,
+                             command_uid_map=build_command_uid_map(command_dms))
 
     # 阶段4.5: 刷屏检测
     spam_results = phase_spam(bvid, sender_groups)

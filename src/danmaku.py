@@ -6,7 +6,9 @@ from lxml import etree
 from typing import Optional
 
 from api_client import BiliAPIClient
-from config import VIDEO_INFO_URL, DANMAKU_XML_URL, MAX_ANALYZE_USERS
+from config import VIDEO_INFO_URL, DANMAKU_XML_URL, DANMAKU_VIEW_URL, MAX_ANALYZE_USERS
+from danmaku_history import _read_varint, _skip_field  # 复用历史弹幕的 wire 手写解析
+from uid_resolver import calc_crc32
 
 
 def get_video_info(bvid: str, client: BiliAPIClient) -> dict:
@@ -187,3 +189,79 @@ def collect_danmaku_data(bvid: str, client: BiliAPIClient) -> tuple[dict, list[d
     print(f"[Danmaku] 独立发送者: {len(sender_groups)} 人")
 
     return video_info, danmaku_list, sender_groups
+
+
+# ========== 互动弹幕（commandDms，含明文 mid） ==========
+
+def _parse_command_dm(data: bytes) -> dict:
+    """解析单个 CommandDm 嵌套消息：mid=3(varint), command=4, content=5"""
+    fields = {}
+    pos = 0
+    while pos < len(data):
+        tag, pos = _read_varint(data, pos)
+        field_no, wire_type = tag >> 3, tag & 0x07
+        if wire_type == 0:
+            value, pos = _read_varint(data, pos)
+            fields[field_no] = value
+        elif wire_type == 2:
+            length, pos = _read_varint(data, pos)
+            fields[field_no] = data[pos:pos + length]
+            pos += length
+        else:
+            pos = _skip_field(data, pos, wire_type)
+
+    def _s(field_no: int) -> str:
+        raw = fields.get(field_no, b"")
+        return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else ""
+
+    return {
+        "mid": fields.get(3, 0),
+        "command": _s(4),
+        "content": _s(5),
+    }
+
+
+def fetch_command_dms(video_info: dict, client: BiliAPIClient) -> list[dict]:
+    """
+    采集互动弹幕 commandDms（UP主头像弹幕/关联视频/引导关注，含明文 mid）
+
+    接口需 SESSDATA；protobuf wire 手写解析（复用 danmaku_history 先例）。
+    多分P视频只采集第一P（互动弹幕按 cid 维度，主价值是UP主mid）。
+    失败降级返回空列表，不影响主流程。
+
+    Returns:
+        [{"mid": int, "command": str, "content": str}]
+    """
+    try:
+        cid = get_cid_for_page(video_info, 0)
+        aid = video_info.get("aid", 0)
+        if not cid:
+            return []
+        raw = client.get_raw(DANMAKU_VIEW_URL, params={"type": 1, "oid": cid, "pid": aid}).content
+        items = []
+        pos = 0
+        while pos < len(raw):
+            tag, pos = _read_varint(raw, pos)
+            field_no, wire_type = tag >> 3, tag & 0x07
+            if field_no == 9 and wire_type == 2:  # commandDms
+                length, pos = _read_varint(raw, pos)
+                items.append(_parse_command_dm(raw[pos:pos + length]))
+                pos += length
+            else:
+                pos = _skip_field(raw, pos, wire_type)
+        if items:
+            print(f"[Danmaku] 互动弹幕: {len(items)} 条（含明文mid）")
+        return items
+    except Exception as e:
+        print(f"[Danmaku] 互动弹幕获取失败: {e}（降级跳过）")
+        return []
+
+
+def build_command_uid_map(command_dms: list[dict]) -> dict:
+    """互动弹幕明文 mid → crc32->UID 映射"""
+    uid_map = {}
+    for item in command_dms:
+        mid = item.get("mid")
+        if mid:
+            uid_map[calc_crc32(int(mid))] = int(mid)
+    return uid_map

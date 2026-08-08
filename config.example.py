@@ -20,6 +20,7 @@ VIDEO_INFO_URL = "https://api.bilibili.com/x/web-interface/view"
 DANMAKU_XML_URL = "https://api.bilibili.com/x/v1/dm/list.so"
 DANMAKU_HISTORY_INDEX_URL = "https://api.bilibili.com/x/v2/dm/history/index"
 DANMAKU_HISTORY_SEG_URL = "https://api.bilibili.com/x/v2/dm/web/history/seg.so"
+DANMAKU_VIEW_URL = "https://api.bilibili.com/x/v2/dm/web/view"  # 弹幕元数据（含互动弹幕明文mid，需SESSDATA）
 COMMENT_MAIN_WBI_URL = "https://api.bilibili.com/x/v2/reply/wbi/main"  # 主评论新接口（wbi签名+游标翻页）
 COMMENT_MAIN_URL = "https://api.bilibili.com/x/v2/reply/main"  # 旧版主评论接口（wbi/main 失败时降级用）
 COMMENT_REPLY_URL = "https://api.bilibili.com/x/v2/reply/reply"
