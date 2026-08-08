@@ -24,6 +24,7 @@ from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
 from report import save_report
+from exporter import export_csv, export_json
 
 
 def print_banner():
@@ -416,6 +417,22 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
     print("\n[Report] 生成HTML报告...")
     report_path = save_report(video_info, profiles)
     print(f"[Report] 报告已保存: {report_path}")
+
+    # 同步导出 CSV/JSON：与 HTML 报告同前缀（复用同一时间戳），
+    # 导出失败只打印警告降级，不影响已生成的 HTML 报告
+    export_base = os.path.splitext(report_path)[0]
+    try:
+        csv_path = export_base + ".csv"
+        export_csv(profiles, csv_path)
+        print(f"[Export] CSV 已导出: {csv_path}")
+    except Exception as e:
+        print(f"[Export] 警告: CSV 导出失败（不影响HTML报告）: {e}")
+    try:
+        json_path = export_base + ".json"
+        export_json(video_info, profiles, json_path)
+        print(f"[Export] JSON 已导出: {json_path}")
+    except Exception as e:
+        print(f"[Export] 警告: JSON 导出失败（不影响HTML报告）: {e}")
 
     print("\n" + "=" * 60)
     print("  分析完成!")
