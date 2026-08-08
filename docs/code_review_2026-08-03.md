@@ -106,3 +106,48 @@
 4. Important 批次，最后 Minor 清扫
 
 每个修复后按 AGENTS.md 约定跑一次 `python quick_test.py` 冒烟验证。
+
+---
+
+## 修复状态追踪（2026-08-08 更新，升级路线图阶段 1-7 完成后）
+
+> 路线图：`docs/superpowers/plans/2026-08-03-upgrade-roadmap.md`；各阶段均有独立实施计划与审查记录。
+
+### Critical 9/9 已全部修复（阶段 1-3）
+
+1. 报告 XSS → 全文转义 + 粗体正则修正
+2. `--force` 失效 → 清缓存强制重采已生效（argparse help 亦已修正为准确描述）
+3. 断点续采 → progress 表真实写入并参与跳过逻辑
+4. WBI 重签名死代码 → 密钥过期自动重取重签，-352 末次不再空转
+5. 纯数字 mid_hash 损毁 → 保留原值并单独处理
+6. CRC32 碰撞当真实用户 → 置信度压制为"中/低"，碰撞假阳性统一标记"CRC32碰撞"
+7. 并发击穿限速 → BiliAPIClient 线程安全限速（锁内原子化，docstring 已注明语义）
+8. LLM Key 硬编码 → src/config.py 移出 git 追踪 + 环境变量覆盖 + 新增 config.example.py 模板（Key 置空）
+9. login.py/login_bg.py 不保存 refresh_token → 已补充提取保存
+
+### Important 已全部处理（阶段 1-5、7）
+
+- `--max-users` 透传、spam 结果回写数据库（update_sender_spam）、失败 sender 重试、
+  progress 表实效化、JSONDecodeError 捕获、WBI 参数编码过滤、cookie 原子写入+600权限+容错、
+  cookie 刷新走 BiliAPIClient、失效时先试 refresh、danmaku get_raw 重试、
+  resolve_all_senders 逐人异常隔离、CRC32 彩虹表毫秒级反查（替代 75 秒暴力破解）、
+  子评论补采、网络异常不再吞成"用户不存在"、LLM max_tokens/批次降级/None 防御、
+  收藏夹采集 try/except、analyze_profile 异常隔离、account_age_days 口径、
+  弹幕 zip 截断、quick_test 与主流程对齐 —— 均已修复。
+
+### Minor 大部分已修复（阶段 6-7）
+
+- 已修复：seen_uids 去重、未使用导入（含 main.py 的 time/get_resolved_uids）、aid=0 跳过评论采集、
+  storage contextlib.closing、相似度按唯一内容去重降复杂度、video_times 死参数删除、
+  numeric_uids 死代码、XML 显式禁用实体（resolve_entities=False）、unique_contents 死代码、
+  level_info None 防御、CRC 碰撞告警、CSS/JS 细节、追番 URL 用 config 常量、
+  followers 类型一致、活跃时段固定东八区、up_analyzer 重复 import 与恒真条件、
+  LLM 弹幕截断 30 条/解析为空诊断/冗余 env 回退、api_client 线程安全 docstring、
+  quick_test argparse 化、报告与 README 明示弹幕池覆盖率上限。
+
+- **仍开放（已知限制，不影响正确性）**：
+  - `login.py` 按 Enter 后只轮询两次的体验问题（建议复用 `auth.login_by_qrcode()`）
+  - `up_analyzer.py` `last_post` 用 `time.localtime()` 依赖部署机时区（仅影响日期显示）
+  - `spam_detector` 规则4 的 `avg_interval` 整体平均对"集中爆发型"漏检（代码内已加注释说明，
+    彻底修复需滑动窗口统计）
+  - 相似度计算仍为先去重后 O(u²)（u=唯一内容数），极端刷屏用户可能偏慢，但不再卡死
