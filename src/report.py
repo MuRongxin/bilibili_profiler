@@ -85,7 +85,7 @@ def generate_user_card(profile: dict) -> str:
     vid_count = vid.get("count", 0)
     vid_titles = vid.get("recent_titles", [])[:3]
 
-    # 动态（过滤空内容）
+    # 动态
     dyn = profile.get("dynamic", {})
     dyn_count = dyn.get("count", 0)
 
