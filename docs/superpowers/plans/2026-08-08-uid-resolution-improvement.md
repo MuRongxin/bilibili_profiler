@@ -1155,3 +1155,19 @@ rm -f /tmp/profiler.db.bak
 - Spec 覆盖：P0→Task1-2，P1→Task3，P2→Task4-5，P3→Task6，验证方式→Task7；spec 3.2 的"本地 crc_table.bin 用户手动删除"已写入 Task1 commit message；spec 5.1"并入 up_analyzer"裁剪为存 video_info（Task5 已标注，用户可否决）。
 - 类型一致性：`resolve_sender` 6 元组返回在 Task2 定义，quick_test.py 同步；`candidates` 字段在 Task2 加入 result dict，Task3 的全局库过滤条件引用它；`method_map` 参数贯穿 Task2-5 签名一致；`plain_uid_map` 在 Task3 定义、Task4/5 复用同名变量。
 - 中间态说明：Task1 完成后 uid_resolver 暂时 import 失败，Task2 修复，两任务须连续执行（已在 Task1 Step3 注明）。
+
+---
+
+## 执行记录（2026-08-08 完成）
+
+| Task | 内容 | 主要 commit |
+|---|---|---|
+| 1 | MITM 反查引擎 | `00c514f` `f63b956` |
+| 2 | uid_resolver 消歧流水线 | `6b57aa2` |
+| 3 | 全局映射库 | `cc890fa` `8f2e44e` |
+| 4 | 充电名单 | `702dc34` `50c1ccb` |
+| 5 | 互动弹幕 commandDms | `b460a8f` `a3ef31f` |
+| 6 | 评论扩容 | `40fc569` |
+| 7 | 端到端验证 + 文档 + 合并 | 见分支末尾 |
+
+每个 Task 均经"实现 → 规格审查 → 质量审查"流程。两处计划勘误由实现者发现并最小修正：get_raw 返回 Response 需 `.content`（Task 5）、验证脚本场景1 解包应为 6 元组（Task 2）。

@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-**B站弹幕发送者用户画像分析系统**：输入视频 BV 号，采集该视频的全部弹幕，破解弹幕发送者的匿名 `mid_hash`（CRC32 反向搜索 + 评论区明文 UID 交叉验证），再对每个发送者做四维度深度画像（主页信息、互动足迹、社交关系、行为模式），可选调用 LLM 逐人生成 AI 分析，最终输出交互式 HTML 报告（Chart.js）。
+**B站弹幕发送者用户画像分析系统**：输入视频 BV 号，采集该视频的全部弹幕，破解弹幕发送者的匿名 `mid_hash`（MITM 中间相遇 CRC32 反查 + 评论/充电名单/互动弹幕明文 UID 交叉验证 + 全局映射库），再对每个发送者做四维度深度画像（主页信息、互动足迹、社交关系、行为模式），可选调用 LLM 逐人生成 AI 分析，最终输出交互式 HTML 报告（Chart.js）。
 
 - 纯 Python 3 项目，无构建系统（无 pyproject.toml / setup.py / package.json），依赖通过 `requirements.txt` 管理。
 - 主要依赖：`requests`（HTTP）、`lxml`（弹幕 XML 解析）、`qrcode` + `pillow`（扫码登录）、`openai`（LLM 客户端）、`pycryptodome`。
@@ -42,8 +42,8 @@ src/
 ├── danmaku.py           # 实时弹幕 XML 解析，按 mid_hash 聚合发送者
 ├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析）
 ├── comment.py           # 评论区采集（wbi/main 游标 + 子评论补采 + IP属地），建立 UID→CRC32 映射
-├── uid_resolver.py      # mid_hash 破解：评论区交叉验证（最可靠）+ CRC32 彩虹表反查（仅 UID<5000万）
-├── crc_rainbow.py       # CRC32 彩虹表构建与查询（纯标准库，mmap 毫秒级反查）
+├── uid_resolver.py      # mid_hash 破解：评论/充电名单/互动弹幕/全局库交叉验证 + MITM 反查碰撞消歧
+├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（10万条内存小表，覆盖全部 ≤10 位 UID，秒级）
 ├── spam_detector.py     # 刷屏检测：只标记风险等级（高/中/低），绝不删除弹幕数据
 ├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
@@ -54,14 +54,14 @@ src/
 └── storage.py           # SQLite 持久化（data/profiler.db），支撑断点续采
 ```
 
-数据流：`run.py` → `main.run_analysis(bvid, force, max_users)`，各阶段通过 SQLite 缓存中间结果（已解析的 sender、已采集的 user_data），阶段5采集成功立即落库，因此 Ctrl+C 中断后重跑可恢复；`--force` 会清除该视频的缓存并强制重采全部用户。
+数据流：`run.py` → `main.run_analysis(bvid, force, max_users)`，各阶段通过 SQLite 缓存中间结果（已解析的 sender、已采集的 user_data），阶段5采集成功立即落库，因此 Ctrl+C 中断后重跑可恢复；`--force` 会清除该视频的缓存并强制重采全部用户。全局映射库 `global_uid_map` 跨视频沉淀可靠 mid_hash→UID 映射（多候选碰撞条目不沉淀），解析率随使用次数累积提升。
 
 ## 开发约定
 
 - **限速是硬约束**：B站 API 有风控，`config.py` 中 `REQUEST_DELAY = 0.6` 秒、高风险 API `1.0` 秒，重试最多 3 次指数退避。新增 API 调用必须走 `BiliAPIClient`，不要绕过限速直接发请求。
 - **失败要降级而非中断**：例如评论采集失败时回退为仅用 CRC32 破解；LLM 分析失败只打印警告。单个用户采集异常不得中断整体流水线。
 - **不删除数据**：刷屏检测只标记 `spam_level`，不删除任何弹幕。
-- 采集规模由 `config.py` 中的 `MAX_*` 常量控制（评论 20 页、关注 50 页、默认最多深度分析 100 人等），调优时改这里而不是散落在代码里的数字。
+- 采集规模由 `config.py` 中的 `MAX_*` 常量控制（评论 100 页、子评论补采 25 页/条、默认最多深度分析 100 人等），调优时改这里而不是散落在代码里的数字。
 - 输出文件：`data/reports/report_{BV号}_{时间}.html`（报告）、`data/profiler.db`（数据库）、`data/cookie.json`（登录态）。
 
 ## 测试说明

@@ -193,6 +193,15 @@ protobuf 分段参数：`type=1`（视频弹幕）、`oid=cid`（必要）、`pi
 - `GET /x/polymer/web-dynamic/v1/feed/space?host_mid={uid}`
 - **登录只需 SESSDATA**；未登录需 buvid3 + wbi + `dm_img` 系列指纹且"存在运气成分"（文档原话，[issue #686](https://github.com/SocialSisterYi/bilibili-API-collect/issues/686)）。
 
+### 4.7 视频充电鸣谢名单 elec/show [已证实 + 2026-08-08 本项目实测]
+
+来源：[electric/charge_list.md](https://github.com/BACNext/bilibili-API-collect-backup/blob/master/docs/electric/charge_list.md)
+
+- `GET /x/web-interface/elec/show?mid={UP主mid}&aid={avid}`（也可 `bvid=` 代替 aid），普通登录 Cookie 可用。
+- 响应 `data.list[]` 含 **明文 `pay_mid`**（充电用户）、`uname`、`rank`、`message`——是弹幕发送者交叉验证的明文 UID 源（充电用户多为重度粉丝，与弹幕发送者重合率高）。
+- `data.list` 仅含**本月**充电用户；`code=62001` 表示不需要展示充电信息（无充电数据，正常降级），`-404` 无视频。
+- 本项目实测：文档示例视频 av967773538（mid=53456）返回 30 个本月充电 UID。
+
 ---
 
 ## 5. 搜索与批量接口
@@ -221,7 +230,7 @@ protobuf 分段参数：`type=1`（视频弹幕）、`oid=cid`（必要）、`pi
 - **[已证实]** 没有官方/半官方 hash 反查接口。反查只有两条路：CRC32 暴力/彩虹表、评论区等明文 UID 交叉验证。
 - **[未验证]** 新注册长 UID（16 位）无法暴力反推：[GetDanmuSender](https://github.com/cwuom/GetDanmuSender) README 声明"16 位 mid 以及超过 10 位以上的 mid 被加密后都无法正常反推，8、9 位 UID 基本正确"（2023 年）。数学上合理（搜索空间超 2^32 且碰撞增多），但无更多独立验证。
 - **CRC32 碰撞提醒（本项目实测）**：32 位 CRC 空间内碰撞必然存在，暴力破解按前缀升序返回第一个碰撞者而非真实 UID（例：`CRC32("1")` 的破解结果为 1146140827）。暴力路径结果必须标注歧义、压低置信度。
-- **彩虹表方案**：预生成 UID 0–5000 万的 `crc32 → uid` 映射落盘（定长二进制，约 400MB 内，numpy 向量化构建分钟级），查询 mmap O(1)。>10 位 UID 直接标记不可破跳过。
+- **MITM（中间相遇）反查方案（本项目 2026-08-08 已落地）**：利用 CRC32 在 GF(2) 上的仿射性质，把 UID 十进制串拆为"≤5 位前缀 + 5 位定长后缀"，预计算 10 万个后缀串的 CRC 建内存小表（约 40MB，惰性构建秒级），查询时枚举 99999 个前缀反查后缀表——**无需彩虹表大文件即可秒级反查全部 ≤10 位 UID**（2022 年 4 月前注册用户基本全覆盖）。参考：esterTion/BiliBili_crc2mid、Aruelius/crc32-crack。16 位随机长 UID 仍不可解。
 
 ---
 
@@ -237,6 +246,7 @@ protobuf 分段参数：`type=1`（视频弹幕）、`oid=cid`（必要）、`pi
 | -412 | 请求被拦截（IP 被风控） | 长冷却（≥10 分钟），轮换 buvid/会话 |
 | -101 | 未登录 / Cookie 失效 | 刷新或重扫码登录 |
 | 22115 | 用户隐私设置禁止查看 | 降级跳过 |
+| 62001 | 视频不需要展示充电信息（无充电数据） | 正常情况，静默降级 |
 | 86038 | 扫码登录二维码已过期 | 重新生成二维码 |
 
 ---

@@ -420,7 +420,6 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
 
     # 阶段2: 弹幕
     video_info, danmaku_list, sender_groups, command_dms = phase_danmaku(bvid, client)
-    aid = video_info.get("aid", 0)
 
     # 弹幕为空时提前终止：后续评论/解析/画像均无意义，避免白跑全流程产出空报告
     if not danmaku_list:
