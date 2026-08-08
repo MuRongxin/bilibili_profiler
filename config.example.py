@@ -59,13 +59,7 @@ RETRY_BACKOFF = 2.0          # 重试退避基数（秒）
 RISK_COOLDOWN = 600          # 触发-412风控后的长冷却秒数
 
 # ========== 破解配置 ==========
-CRC32_MAX_SEARCH = 50_000_000   # CRC32反向搜索上限
-CRC32_OLD_MAX = 10_000_000      # bilibili_api内置上限
-
-# ========== CRC32 彩虹表配置 ==========
-CRC_TABLE_PATH = os.path.join(DATA_DIR, "crc_table.bin")  # CRC32彩虹表（uid→crc32 反查）
-CRC_TABLE_MAX_UID = 50_000_000  # 彩虹表覆盖的UID上限（更长的16位新UID无法反推，不覆盖）
-CRC_BUILD_CHUNK = 1_000_000     # 彩虹表构建分片大小
+MITM_MAX_UID = 10_000_000_000   # MITM 反查覆盖上限：全部 ≤10 位 UID（16位随机长UID不可解）
 
 # ========== 采集配置 ==========
 MAX_COMMENT_PAGES = 20       # 评论最大翻页数

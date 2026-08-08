@@ -77,7 +77,7 @@ def main():
         group = sender_groups[mid_hash]
 
         # 解析 UID
-        uid, confidence, method, _, collision_risk = resolve_sender(
+        uid, confidence, method, _, collision_risk, _ = resolve_sender(
             mid_hash, group["contents"], comment_uid_map, client
         )
         if not uid:
