@@ -64,8 +64,8 @@ RISK_COOLDOWN = 600          # 触发-412风控后的长冷却秒数
 MITM_MAX_UID = 10_000_000_000   # MITM 反查覆盖上限：全部 ≤10 位 UID（16位随机长UID不可解）
 
 # ========== 采集配置 ==========
-MAX_COMMENT_PAGES = 20       # 评论最大翻页数
-COMMENT_REPLY_MAX_PAGES = 5   # 每条主评论的子评论最多补采页数（pn分页，每页20条）
+MAX_COMMENT_PAGES = 100      # 评论最大翻页数（约20条/页，上限~2000条主评论）
+COMMENT_REPLY_MAX_PAGES = 25  # 每条主评论的子评论最多补采页数（pn分页，每页20条，上限500条）
 HISTORY_DANMAKU_ENABLED = True   # 是否采集全量历史弹幕（需登录）
 HISTORY_MAX_MONTHS = 24          # 历史弹幕最多回溯月数
 HISTORY_MAX_DAYS = 400           # 历史弹幕最多采集天数（逐日接口，每日1次请求）

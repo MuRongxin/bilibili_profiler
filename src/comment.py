@@ -84,6 +84,10 @@ def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
         total = (page_data.get("page") or {}).get("count", 0)
         if not replies or pn * 20 >= total:
             break
+    else:
+        # 循环耗尽仍未翻完：子评论被补采上限截断
+        if total > COMMENT_REPLY_MAX_PAGES * 20:
+            print(f"[Comment] 子评论补采达上限 {COMMENT_REPLY_MAX_PAGES} 页 (root={root_rpid} rcount={total})，剩余截断")
 
     if len(fetched) <= len(preview):
         return preview
@@ -161,6 +165,9 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list
         if cursor.get("is_end", False) or not next_offset:
             break
         offset = next_offset
+    else:
+        # 循环耗尽（未提前终止）：评论区被采集上限截断
+        print(f"[Comment] 已达采集上限 {max_pages} 页，评论区可能未采完（可调大 MAX_COMMENT_PAGES）")
 
     return all_comments
 
@@ -195,6 +202,9 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int) -> l
         next_page = cursor.get("next", 0)
         if cursor.get("is_end", False) or not next_page:
             break
+    else:
+        # 循环耗尽（未提前终止）：评论区被采集上限截断
+        print(f"[Comment] 已达采集上限 {max_pages} 页，评论区可能未采完（可调大 MAX_COMMENT_PAGES）")
 
     return all_comments
 
