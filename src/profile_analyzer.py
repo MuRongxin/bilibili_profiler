@@ -264,7 +264,8 @@ def analyze_profile(user_data: dict, danmaku_stats: dict, spam_stats: dict) -> d
         "sign": user_data.get("sign", ""),
         "sex": user_data.get("sex", ""),
         "level": level,
-        # ip_location removed (B站已下线该字段)
+        # 来自评论区 IP 属地（阶段6由 comment_location_map 注入 user_data），无属地为 None
+        "ip_location": user_data.get("ip_location"),
         "vip_type": user_data.get("vip_type", 0),
         "vip_status": user_data.get("vip_status", 0),
         "official_type": user_data.get("official_type", -1),

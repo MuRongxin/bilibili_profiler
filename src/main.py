@@ -281,9 +281,15 @@ def phase_collect_users(resolved: dict, client, max_users: int = MAX_ANALYZE_USE
     return user_data_map
 
 
-def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict):
-    """阶段6: 画像分析"""
+def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict,
+                  comment_location_map: dict | None = None):
+    """阶段6: 画像分析
+
+    comment_location_map（uid→评论IP属地）在此处注入 user_data 而非依赖落库数据：
+    users 表缓存的旧 user_data 没有该字段，每次运行时注入才能保证缓存命中路径也带出属地。
+    """
     print("\n[Phase 6/6] 画像分析...")
+    comment_location_map = comment_location_map or {}
     profiles = []
 
     for mid_hash, info in resolved.items():
@@ -292,6 +298,10 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
             continue
 
         user_data = user_data_map[uid]
+
+        # 评论IP属地贯通：原样保留 API 返回格式（如 "IP属地：江苏"），无属地则不设该键
+        if uid in comment_location_map:
+            user_data["ip_location"] = comment_location_map[uid]
         spam = spam_results.get(mid_hash, {})
 
         # 构建弹幕统计
@@ -362,8 +372,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
         print("[Main] 弹幕为空，终止分析")
         return
 
-    # 阶段3: 评论
-    # comment_location_map（uid→IP属地）本阶段仅带出数据，画像贯通在后续任务集成
+    # 阶段3: 评论（comment_location_map 为 uid→IP属地，阶段6贯通进画像）
     comments, comment_uid_map, comment_location_map = phase_comment(aid, client)
 
     # 阶段4: UID解析
@@ -381,8 +390,8 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
     # 阶段5: 用户采集
     user_data_map = phase_collect_users(resolved, client, max_users=max_users, force=force)
 
-    # 阶段6: 画像分析
-    profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups)
+    # 阶段6: 画像分析（评论IP属地在此贯通进画像）
+    profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups, comment_location_map)
 
     # 阶段7: LLM AI 逐人画像分析
     ai_analysis = phase_ai_analysis(video_info, profiles)
