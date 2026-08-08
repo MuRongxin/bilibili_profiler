@@ -1,21 +1,143 @@
 """
 评论采集模块：提取评论区明文UID，用于mid_hash交叉验证
+
+主评论走新接口 /x/v2/reply/wbi/main（wbi签名 + pagination_str 游标翻页），
+失败时降级回旧接口 /x/v2/reply/main（next 游标）；子评论在主评论 rcount
+超过内嵌预览数时调 /x/v2/reply/reply 按 pn 补采。每条评论提取 IP 属地
+（reply_control.location）。
 """
+import json
+import zlib
+
 from api_client import BiliAPIClient
-from config import COMMENT_MAIN_URL, COMMENT_REPLY_URL, MAX_COMMENT_PAGES
+from config import COMMENT_MAIN_WBI_URL, COMMENT_MAIN_URL, COMMENT_REPLY_URL
+from config import MAX_COMMENT_PAGES, COMMENT_REPLY_MAX_PAGES
 
 
-def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT_PAGES) -> list[dict]:
+def _parse_comment(r: dict, is_sub: bool) -> dict | None:
+    """解析单条评论（主/子结构相同），无有效成员信息时返回 None"""
+    if not r or not r.get("member"):
+        return None
+
+    member = r["member"]
+    mid = member.get("mid", 0)
+    if mid == 0:
+        return None
+
+    return {
+        "uid": mid,
+        "uname": member.get("uname", ""),
+        "sign": member.get("sign", ""),
+        "level": (member.get("level_info") or {}).get("current_level", 0),
+        "avatar": member.get("avatar", ""),
+        "content": (r.get("content") or {}).get("message", ""),
+        "like": r.get("like", 0),
+        "reply_count": 0 if is_sub else r.get("rcount", 0),
+        "ctime": r.get("ctime", 0),
+        "is_sub": is_sub,
+        "location": (r.get("reply_control") or {}).get("location", ""),
+    }
+
+
+def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
+                       client: BiliAPIClient) -> list[dict]:
+    """补采子评论：rcount 超过内嵌预览数时按 pn 翻页拉取全量子评论。
+
+    补采成功（拿到比预览更多的子评论）时以补采结果替换预览（reply/reply 返回
+    全量含预览条目，直接替换避免重复）；补采失败/无新增时保留预览，降级不中断。
     """
-    获取视频评论列表（主评论+子评论）
-    
-    Args:
-        oid: 视频aid
-        max_pages: 最大翻页数
-    
-    Returns:
-        评论列表，每条包含uid、uname、level、content等
-    """
+    if rcount <= len(preview):
+        return preview
+
+    fetched = []
+    for pn in range(1, COMMENT_REPLY_MAX_PAGES + 1):
+        data = client.get(COMMENT_REPLY_URL, params={
+            "type": 1,
+            "oid": oid,
+            "root": root_rpid,
+            "pn": pn,
+            "ps": 20,
+        })
+        if data.get("code") != 0:
+            print(f"[Comment] 子评论补采失败 (root={root_rpid} pn={pn}): {data.get('message')}，保留预览")
+            break
+
+        # 防御 data["data"] 为 None（风控/空结果时 API 会返回 data: null）
+        page_data = data.get("data") or {}
+        replies = page_data.get("replies") or []
+        for sub in replies:
+            c = _parse_comment(sub, is_sub=True)
+            if c:
+                fetched.append(c)
+
+        # data.page.count 为子评论总数，翻够页数或本页为空即终止
+        total = (page_data.get("page") or {}).get("count", 0)
+        if not replies or pn * 20 >= total:
+            break
+
+    return fetched if len(fetched) > len(preview) else preview
+
+
+def _collect_page(replies: list, oid: int, client: BiliAPIClient) -> list[dict]:
+    """解析一页主评论及其子评论（含补采）"""
+    comments = []
+    for r in replies:
+        main = _parse_comment(r, is_sub=False)
+        if not main:
+            continue
+        comments.append(main)
+
+        # 内嵌预览子评论
+        preview = []
+        for sub in r.get("replies") or []:
+            c = _parse_comment(sub, is_sub=True)
+            if c:
+                preview.append(c)
+
+        comments.extend(_fetch_sub_replies(oid, r.get("rpid"), main["reply_count"], preview, client))
+    return comments
+
+
+def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list[dict] | None:
+    """wbi/main 游标翻页采集主评论。首页即失败返回 None（调用方降级旧接口）"""
+    all_comments = []
+    offset = ""
+
+    for page in range(1, max_pages + 1):
+        data = client.get(COMMENT_MAIN_WBI_URL, params={
+            "oid": oid,
+            "type": 1,
+            "mode": 3,       # 按热度排序
+            # pagination_str 为 JSON 字符串参数，client.get 的 params 会 urlencode
+            "pagination_str": json.dumps({"offset": offset}),
+        })
+
+        if data.get("code") != 0:
+            print(f"[Comment] wbi/main 获取评论失败 (第{page}页): {data.get('message')}")
+            if page == 1:
+                return None  # 首页即失败（签名/风控等），整体降级旧接口
+            break            # 中途失败保留已采部分
+
+        # 防御 data["data"] 为 None（风控/空结果时 API 会返回 data: null）
+        page_data = data.get("data") or {}
+        replies = page_data.get("replies") or []
+        if not replies:
+            break
+
+        all_comments.extend(_collect_page(replies, oid, client))
+
+        # 翻页：cursor.pagination_reply.next_offset 为不透明游标字符串，is_end 终止
+        cursor = page_data.get("cursor") or {}
+        next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
+        if cursor.get("is_end", False) or not next_offset:
+            break
+        offset = next_offset
+
+    return all_comments
+
+
+def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int) -> list[dict]:
+    """旧接口 /x/v2/reply/main（next 游标）采集，作为 wbi/main 失败时的降级路径"""
     all_comments = []
     next_page = 0
 
@@ -38,50 +160,7 @@ def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT
         if not replies:
             break
 
-        for r in replies:
-            if not r or not r.get("member"):
-                continue
-
-            member = r["member"]
-            mid = member.get("mid", 0)
-            if mid == 0:
-                continue
-
-            all_comments.append({
-                "uid": mid,
-                "uname": member.get("uname", ""),
-                "sign": member.get("sign", ""),
-                "level": (member.get("level_info") or {}).get("current_level", 0),
-                "avatar": member.get("avatar", ""),
-                "content": (r.get("content") or {}).get("message", ""),
-                "like": r.get("like", 0),
-                "reply_count": r.get("rcount", 0),
-                "ctime": r.get("ctime", 0),
-                "is_sub": False,
-            })
-
-            # 子评论
-            sub_replies = r.get("replies", []) or []
-            for sub in sub_replies:
-                if not sub or not sub.get("member"):
-                    continue
-                sub_member = sub["member"]
-                sub_mid = sub_member.get("mid", 0)
-                if sub_mid == 0:
-                    continue
-
-                all_comments.append({
-                    "uid": sub_mid,
-                    "uname": sub_member.get("uname", ""),
-                    "sign": sub_member.get("sign", ""),
-                    "level": (sub_member.get("level_info") or {}).get("current_level", 0),
-                    "avatar": sub_member.get("avatar", ""),
-                    "content": (sub.get("content") or {}).get("message", ""),
-                    "like": sub.get("like", 0),
-                    "reply_count": 0,
-                    "ctime": sub.get("ctime", 0),
-                    "is_sub": True,
-                })
+        all_comments.extend(_collect_page(replies, oid, client))
 
         cursor = page_data.get("cursor") or {}
         next_page = cursor.get("next", 0)
@@ -91,14 +170,33 @@ def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT
     return all_comments
 
 
+def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT_PAGES) -> list[dict]:
+    """
+    获取视频评论列表（主评论+子评论）
+
+    优先走 wbi/main 游标接口；首页即失败时降级回旧 /x/v2/reply/main 接口。
+
+    Args:
+        oid: 视频aid
+        max_pages: 最大翻页数
+
+    Returns:
+        评论列表，每条包含uid、uname、level、content、location等
+    """
+    comments = _fetch_comments_wbi(oid, client, max_pages)
+    if comments is None:
+        print("[Comment] wbi/main 接口不可用，降级为旧版 /x/v2/reply/main")
+        comments = _fetch_comments_legacy(oid, client, max_pages)
+    return comments
+
+
 def build_comment_uid_map(comments: list[dict]) -> dict[str, int]:
     """
     构建 CRC32(mid) -> mid 映射表，用于弹幕mid_hash交叉验证
-    
+
     Returns:
         {crc32_hash: uid} 映射字典
     """
-    import zlib
     uid_map = {}
     seen_uids = set()
 
@@ -119,15 +217,33 @@ def build_comment_uid_map(comments: list[dict]) -> dict[str, int]:
     return uid_map
 
 
-def collect_comment_data(aid: int, client: BiliAPIClient) -> tuple[list[dict], dict[str, int]]:
+def build_comment_location_map(comments: list[dict]) -> dict[int, str]:
     """
-    采集评论数据并构建UID映射
-    
+    构建 uid -> IP属地 映射表（如 "IP属地：江苏"），供画像地域维度使用
+
+    同一用户多条评论属地不一致时保留先见者（与 build_comment_uid_map 同策略）。
+    """
+    location_map = {}
+    for c in comments:
+        uid = c["uid"]
+        location = c.get("location", "")
+        if location and uid not in location_map:
+            location_map[uid] = location
+    return location_map
+
+
+def collect_comment_data(aid: int, client: BiliAPIClient) -> tuple[list[dict], dict[str, int], dict[int, str]]:
+    """
+    采集评论数据并构建UID映射与IP属地映射
+
     Returns:
-        (comments_list, crc32_to_uid_map)
+        (comments_list, crc32_to_uid_map, uid_to_location_map)
     """
     print(f"[Comment] 获取评论区 (AID:{aid})...")
     comments = fetch_comments(aid, client)
     uid_map = build_comment_uid_map(comments)
-    print(f"[Comment] 获取到 {len(comments)} 条评论，提取 {len(uid_map)} 个独立用户UID")
-    return comments, uid_map
+    location_map = build_comment_location_map(comments)
+    sub_count = sum(1 for c in comments if c.get("is_sub"))
+    print(f"[Comment] 获取到 {len(comments)} 条评论（含子评论 {sub_count} 条），"
+          f"提取 {len(uid_map)} 个独立用户UID，{len(location_map)} 个IP属地")
+    return comments, uid_map, location_map

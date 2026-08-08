@@ -59,7 +59,7 @@ def main():
     # 4. 收集评论
     print("[4/6] 收集评论...")
     try:
-        _, comment_uid_map = collect_comment_data(video_info.get("aid", 0), client)
+        _, comment_uid_map, _ = collect_comment_data(video_info.get("aid", 0), client)
     except Exception:
         comment_uid_map = {}
 

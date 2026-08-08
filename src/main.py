@@ -102,13 +102,13 @@ def phase_comment(aid: int, client):
     print("\n[Phase 3/6] 采集评论区数据...")
     if not aid:
         print("[Phase 3] 警告: 未获取到有效 aid，跳过评论采集（将仅用CRC32破解）")
-        return [], {}
+        return [], {}, {}
     try:
-        comments, comment_uid_map = collect_comment_data(aid, client)
-        return comments, comment_uid_map
+        comments, comment_uid_map, comment_location_map = collect_comment_data(aid, client)
+        return comments, comment_uid_map, comment_location_map
     except Exception as e:
         print(f"[Phase 3] 评论采集失败 (将仅用CRC32破解): {e}")
-        return [], {}
+        return [], {}, {}
 
 
 def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client, max_users: int = MAX_ANALYZE_USERS):
@@ -363,7 +363,8 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
         return
 
     # 阶段3: 评论
-    comments, comment_uid_map = phase_comment(aid, client)
+    # comment_location_map（uid→IP属地）本阶段仅带出数据，画像贯通在后续任务集成
+    comments, comment_uid_map, comment_location_map = phase_comment(aid, client)
 
     # 阶段4: UID解析
     resolved = phase_resolve(bvid, sender_groups, comment_uid_map, client, max_users=max_users)
