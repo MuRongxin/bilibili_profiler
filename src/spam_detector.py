@@ -158,6 +158,9 @@ def analyze_spam(danmaku_contents: list[str], timestamps: list[int]) -> dict:
         reasons.append(f"变种刷屏(相似度{avg_similarity:.0%})")
 
     # 规则4：短时间内爆发
+    # 已知局限：avg_interval 是该用户全部弹幕时间跨度的平均值，对"长期低频发言+
+    # 某一刻集中爆发"的用户，爆发段会被整体平均值稀释而漏检；若要识别局部爆发
+    # 需改为滑动窗口统计，当前按整体平均判定以保持简单。
     if count >= 10 and avg_interval < 2:
         spam_score = max(spam_score, 0.75)
         reasons.append(f"高频爆发(间隔{avg_interval:.1f}s)")

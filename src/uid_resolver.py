@@ -54,7 +54,8 @@ def crack_crc32(
                 与旧路径一致——验证交由调用方 resolve_sender 负责）
 
     Returns:
-        破解出的UID，或None
+        (uid 或 None, had_candidates)：had_candidates 表示彩虹表/搜索空间中是否存在
+        碰撞候选（用于调用方区分"未命中（未知）"与"候选全部不存在（碰撞假阳性）"）
     """
     global _table_build_attempted
 
@@ -72,18 +73,19 @@ def crack_crc32(
     if table_exists():
         candidates = lookup(crc32_hash)
         if not candidates:
-            return None  # 表内未命中（新 UID 或超出覆盖范围）
+            return None, False  # 表内未命中（新 UID 或超出覆盖范围）
         if len(candidates) > 1:
             print(f"[Resolver] 警告: hash {crc32_hash} 有 {len(candidates)} 个碰撞候选，取第一个存在的UID")
         for uid in candidates:
             if client is None:
-                return uid  # 无客户端无法验证，返回首个候选（验证交给调用方）
+                return uid, True  # 无客户端无法验证，返回首个候选（验证交给调用方）
             exists, _ = verify_uid_exists(uid, client)
             if exists:
-                return uid
-        return None  # 候选全部不存在（碰撞假阳性）
+                return uid, True
+        return None, True  # 候选全部不存在（碰撞假阳性）
 
-    return _crack_crc32_fallback(crc32_hash, max_search)
+    uid = _crack_crc32_fallback(crc32_hash, max_search)
+    return uid, uid is not None
 
 
 def _crack_crc32_fallback(crc32_hash: str, max_search: int = CRC32_MAX_SEARCH) -> Optional[int]:
@@ -250,7 +252,7 @@ def resolve_sender(
             uid = None  # 理论上不会发生，但做防御
 
     # === 方法2：CRC32反向破解（彩虹表查表，内部按需自动建表/降级） ===
-    cracked_uid = crack_crc32(mid_hash, max_search=max_search, client=client)
+    cracked_uid, had_candidates = crack_crc32(mid_hash, max_search=max_search, client=client)
     if cracked_uid:
         exists, user_info = verify_uid_exists(cracked_uid, client)
         if exists:
@@ -265,6 +267,10 @@ def resolve_sender(
             method = METHOD_CRC32_COLLISION
             confidence = "无"
             uid = None
+    elif had_candidates:
+        # 彩虹表内有碰撞候选但全部不存在 → 同样是碰撞假阳性（与降级搜索口径一致）
+        method = METHOD_CRC32_COLLISION
+        confidence = "无"
 
     return uid, confidence, method, user_info, False
 

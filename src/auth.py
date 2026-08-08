@@ -12,7 +12,6 @@ import re
 import tempfile
 import uuid
 import qrcode
-import requests
 from io import BytesIO
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_OAEP

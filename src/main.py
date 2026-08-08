@@ -500,7 +500,8 @@ def run_batch(batch_file: str, force: bool = False, max_users: int = MAX_ANALYZE
 def main():
     parser = argparse.ArgumentParser(description="B站弹幕发送者用户画像分析")
     parser.add_argument("bvid", nargs="?", help="视频BV号，如 BV1vu4y1b7Y9")
-    parser.add_argument("--force", action="store_true", help="强制重新分析")
+    parser.add_argument("--force", action="store_true",
+                        help="清除该视频的缓存并强制重采全部用户（忽略断点续采）")
     parser.add_argument("--max-users", type=int, default=MAX_ANALYZE_USERS,
                         help=f"最大分析用户数 (默认 {MAX_ANALYZE_USERS})")
     parser.add_argument("--batch", metavar="FILE",

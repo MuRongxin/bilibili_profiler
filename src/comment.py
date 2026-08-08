@@ -238,7 +238,7 @@ def build_comment_uid_map(comments: list[dict]) -> dict[str, int]:
         crc = format(zlib.crc32(str(uid).encode()) & 0xFFFFFFFF, "08x")
         # CRC32碰撞时保留先见者并告警，避免弹幕发送者被误归属到后到的用户
         if crc in uid_map and uid_map[crc] != uid:
-            print(f"[评论] 警告: CRC32碰撞 {crc}，已归属UID {uid_map[crc]}，忽略 {uid}")
+            print(f"[Comment] 警告: CRC32碰撞 {crc}，已归属UID {uid_map[crc]}，忽略 {uid}")
         else:
             uid_map.setdefault(crc, uid)
 

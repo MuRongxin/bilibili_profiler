@@ -88,7 +88,6 @@ def generate_user_card(profile: dict) -> str:
     # 动态（过滤空内容）
     dyn = profile.get("dynamic", {})
     dyn_count = dyn.get("count", 0)
-    dyn_contents = [c for c in dyn.get("recent_contents", [])[:3] if c.strip()]
 
     # 关注偏好
     fol_summary = profile.get("following_summary", {})

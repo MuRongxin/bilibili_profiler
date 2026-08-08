@@ -18,6 +18,7 @@ data/profiler.db
 
 # CRC32 彩虹表
 data/crc_table.bin
+data/crc_table.bin.partial
 data/crc_tmp_*.bin
 
 # 报告输出
