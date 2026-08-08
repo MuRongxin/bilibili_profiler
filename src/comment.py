@@ -20,7 +20,13 @@ def _parse_comment(r: dict, is_sub: bool) -> dict | None:
         return None
 
     member = r["member"]
-    mid = member.get("mid", 0)
+    # member.mid 实测为 str（如 '888465'），统一归一化为 int：SQLite 缓存路径的
+    # uid 是 int，str/int 混杂会导致属地注入（uid in location_map）与跨 run
+    # 去重（seen_uids）静默失效；转换失败的脏数据按无有效成员处理
+    try:
+        mid = int(member.get("mid") or 0)
+    except (TypeError, ValueError):
+        return None
     if mid == 0:
         return None
 
