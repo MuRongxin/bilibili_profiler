@@ -111,7 +111,7 @@ def phase_comment(video_info: dict, client):
     print("\n[Phase 3/6] 采集评论区数据...")
     aid = video_info.get("aid", 0)
     if not aid:
-        print("[Phase 3] 警告: 未获取到有效 aid，跳过评论采集（将仅用MITM破解）")
+        print("[Phase 3] 警告: 未获取到有效 aid，跳过评论采集（将仅用CRC32破解）")
         return [], {}, {}, {}
     comments, comment_uid_map, comment_location_map = [], {}, {}
     try:
