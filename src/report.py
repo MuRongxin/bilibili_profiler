@@ -105,21 +105,22 @@ def generate_user_card(profile: dict) -> str:
 
         cats_str = "、".join(f"{esc(c)}({n})" for c, n in fol_summary.get("top_categories", [])[:4])
         up_names = ""
-        for name in all_names:
-            if name in up_detail_map:
-                i, up = up_detail_map[name]
+        # 循环变量用 up_name/raw_sign，避免遮蔽卡片头部使用的外层 name/sign（用户名/签名）
+        for up_name in all_names:
+            if up_name in up_detail_map:
+                i, up = up_detail_map[up_name]
                 wf = up.get("word_freq", [])
                 tip = f"粉丝:{up.get('follower',0):,} | 投稿:{up.get('video_count',0)} | 分区:{up.get('top_category','?')}"
                 kw = ", ".join(w for w, _ in wf[:5]) if wf else ""
                 if kw:
                     tip += f" | 关键词: {kw}"
                 up_id = f"up_{uid}_{i}"
-                up_names += f'<span class="up-chip" data-upid="{esc(up_id)}" data-uid="{esc(uid)}" title="{esc(tip)}">{esc(name)}</span>'
+                up_names += f'<span class="up-chip" data-upid="{esc(up_id)}" data-uid="{esc(uid)}" title="{esc(tip)}">{esc(up_name)}</span>'
             else:
-                raw = raw_map.get(name, {})
-                sign = raw.get("sign", "")
-                tip = f"签名: {sign}" if sign else "未深度分析"
-                up_names += f'<span class="up-chip" title="{esc(tip)}">{esc(name)}</span>'
+                raw = raw_map.get(up_name, {})
+                raw_sign = raw.get("sign", "")
+                tip = f"签名: {raw_sign}" if raw_sign else "未深度分析"
+                up_names += f'<span class="up-chip" title="{esc(tip)}">{esc(up_name)}</span>'
 
         total = fol_summary.get("total", len(all_names))
         fol_section = f'''

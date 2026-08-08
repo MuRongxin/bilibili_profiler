@@ -40,6 +40,8 @@ class BiliAPIClient:
         self._wbi_key = None
         self._wbi_key_date = None  # WBI 密钥缓存日期，img_key/sub_key 全站统一、每日更替
         self._buvid3 = None
+        # spi 获取失败置 True，本进程内不再每次 get 重试（对齐 _bili_ticket_ok 每进程一次模式）
+        self._buvid3_failed = False
         self._risk_apis = {
             "relation/followings", "relation/followers",
             "space/wbi/arc/search", "polymer/web-dynamic",
@@ -86,9 +88,9 @@ class BiliAPIClient:
         return params
 
     def _ensure_buvid3(self):
-        """获取并缓存 buvid3/buvid4 设备指纹，减少风控"""
-        if self._buvid3:
-            return self._buvid3
+        """获取并缓存 buvid3/buvid4 设备指纹，减少风控；失败置标志，本进程不再重试"""
+        if self._buvid3 or self._buvid3_failed:
+            return self._buvid3 or ""
         try:
             resp = self._request_locked(
                 "GET",
@@ -105,6 +107,9 @@ class BiliAPIClient:
                 self.session.cookies.set("buvid4", buvid4, domain=".bilibili.com")
         except Exception:
             pass
+        if not self._buvid3:
+            # 异常或响应缺 b_3 均视为失败：本进程内后续 get 不再重复打 spi
+            self._buvid3_failed = True
         return self._buvid3 or ""
 
     def _ensure_bili_ticket(self):
@@ -177,12 +182,16 @@ class BiliAPIClient:
                     return {"code": -412, "message": "风控拦截"}
                 # 签名失效（一般接口 -352、评论 wbi 接口 -403，均伴随 v_voucher）：清缓存强制刷新密钥并重签
                 if data.get("code") in (-352, -403):
-                    self._wbi_key = None
-                    self._wbi_key_date = None
-                    # 退避后再重发，避免连续重发同一无效请求加重风控
-                    time.sleep(RETRY_BACKOFF)
-                    params = self._sign_wbi(dict(params))
-                    continue
+                    # 末次 attempt 不再清缓存+退避+重签（重签也是白做），
+                    # 直接返回降级 dict 且保留 -352/-403 语义供调用方判断签名失效
+                    if attempt < MAX_RETRY - 1:
+                        self._wbi_key = None
+                        self._wbi_key_date = None
+                        # 退避后再重发，避免连续重发同一无效请求加重风控
+                        time.sleep(RETRY_BACKOFF)
+                        params = self._sign_wbi(dict(params))
+                        continue
+                    return {"code": data["code"], "message": "WBI签名失效，重试已耗尽"}
                 return data
             except (requests.Timeout, requests.ConnectionError, ValueError) as e:
                 # ValueError 含 resp.json() 解析失败（风控 HTML 错误页等非 JSON 响应）

@@ -5,7 +5,6 @@
 """
 from datetime import datetime
 from collections import Counter
-from config import SPAM_HIGH_THRESHOLD, SPAM_MEDIUM_THRESHOLD
 
 
 # ========== 标签生成器 ==========

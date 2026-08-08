@@ -19,7 +19,11 @@ def main():
     # 检查已有cookie
     cookie_dict = load_cookie()
     if cookie_dict:
+        # _refresh_token 是本地保存的伪 cookie，需先弹出，避免注入 session 发给B站
+        refresh_token = cookie_dict.pop("_refresh_token", None)
         client.update_cookies(cookie_dict)
+        if refresh_token:
+            client._refresh_token = refresh_token
         if verify_cookie(client):
             print("[Login] 已有有效Cookie")
             return

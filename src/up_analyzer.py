@@ -5,6 +5,7 @@ UP主分析器 — 分析用户关注列表中UP主的投稿特征
 支持并行分析（ThreadPoolExecutor）加速：BiliAPIClient 已线程安全，
 限速为全局共享（多线程不会突破 config.REQUEST_DELAY 的请求频率）。
 """
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import USER_VIDEOS_LEGACY_URL, USER_CARD_URL, COLLECT_WORKERS
@@ -12,7 +13,6 @@ from config import USER_VIDEOS_LEGACY_URL, USER_CARD_URL, COLLECT_WORKERS
 
 def _tokenize(text: str) -> list[str]:
     """简单中文分词：提取2字及以上连续中文字符"""
-    import re
     words = re.findall(r'[\u4e00-\u9fff]{2,}', text)
     # 过滤常见停用词
     stop = {'一个','一下','可以','什么','没有','不是','这个','那个','还是','不要','已经','知道','觉得','真的','就是'}
@@ -87,7 +87,6 @@ def analyze_up(uid: int, client) -> dict:
         pass
 
     # 获取投稿列表（第一页就够了，分析分区分布和最近活跃度）
-    import time
     now = time.time()
     threshold_30d = now - 30 * 24 * 3600
 
@@ -113,7 +112,8 @@ def analyze_up(uid: int, client) -> dict:
                 for w in _tokenize(title):
                     word_freq[w] = word_freq.get(w, 0) + 1
 
-                if not result["last_post"] and v.get("created", 0) > threshold_30d:
+                # 近30天投稿计数（last_post 在循环结束后才赋值，原 not result["last_post"] 条件恒真，已删除）
+                if v.get("created", 0) > threshold_30d:
                     result["active_30d"] += 1
 
             result["category_dist"] = cats

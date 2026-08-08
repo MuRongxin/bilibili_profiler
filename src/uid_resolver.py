@@ -74,7 +74,7 @@ def crack_crc32(
         if not candidates:
             return None  # 表内未命中（新 UID 或超出覆盖范围）
         if len(candidates) > 1:
-            print(f"[Resolver] 警告: hash {crc32_hash} 有 {len(candidates)} 个碰撞候选，取第一个")
+            print(f"[Resolver] 警告: hash {crc32_hash} 有 {len(candidates)} 个碰撞候选，取第一个存在的UID")
         for uid in candidates:
             if client is None:
                 return uid  # 无客户端无法验证，返回首个候选（验证交给调用方）

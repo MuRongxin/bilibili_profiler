@@ -7,7 +7,7 @@
 维度4: 行为模式分析
 """
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from api_client import BiliAPIClient
 from config import (
     USER_CARD_URL, USER_CARDS_BATCH_URL, USER_SPACE_URL, USER_VIDEOS_URL,
@@ -384,8 +384,7 @@ def get_bangumi_list(uid: int, client: BiliAPIClient, btype: int = 1) -> list[di
     btype: 1=番剧, 2=追剧
     """
     try:
-        # 新版API endpoint
-        data = client.get("https://api.bilibili.com/x/space/bangumi/follow/list", params={
+        data = client.get(USER_BANGUMI_URL, params={
             "vmid": uid, "type": btype, "pn": 1, "ps": 15
         })
     except Exception:
@@ -418,7 +417,8 @@ def analyze_activity_pattern(timestamps: list[int]) -> dict:
     for ts in timestamps:
         try:
             ts_int = int(ts)
-            dt = datetime.fromtimestamp(ts_int)
+            # 显式按东八区解读时间戳，活跃时段统计不依赖部署机器时区
+            dt = datetime.fromtimestamp(ts_int, tz=timezone(timedelta(hours=8)))
             h = dt.hour
             d = day_names[dt.weekday()]
             hours[h] = hours.get(h, 0) + 1
@@ -526,7 +526,7 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
     all_timestamps = dynamic_timestamps + video_timestamps
     user_data["activity_pattern"] = analyze_activity_pattern(all_timestamps)
 
-    # 注册时间推断（从UID位数和第一个动态时间推断）
+    # 最早活跃时间：采样范围内最早一条动态的发布时间（仅采样范围，非注册时间）
     if dynamic_timestamps:
         user_data["first_seen"] = min(dynamic_timestamps)
 

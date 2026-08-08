@@ -84,17 +84,22 @@ def load_cookie() -> dict | None:
         return None
     try:
         with open(COOKIE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        # cookie 文件损坏（如上次写入被中断），降级为重新登录而非崩溃
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # cookie 文件损坏（如上次写入被中断或编码异常），降级为重新登录而非崩溃
         print(f"[Auth] 警告: Cookie文件损坏（{COOKIE_PATH}），请重新登录")
         return None
+    if not isinstance(data, dict):
+        # 合法 JSON 但不是 cookie dict（如被误写成数组/字符串），同样按损坏处理
+        print(f"[Auth] 警告: Cookie文件格式异常（{COOKIE_PATH}），请重新登录")
+        return None
+    return data
 
 
 def verify_cookie(client: BiliAPIClient) -> bool:
     try:
         data = client.get(NAV_URL)
-        if data.get("code") == 0 and data.get("data", {}).get("isLogin"):
+        if data.get("code") == 0 and (data.get("data") or {}).get("isLogin"):
             uname = data["data"].get("uname", "未知")
             print(f"[Auth] Cookie有效，当前用户: {uname}")
             return True
@@ -229,11 +234,12 @@ def login_by_qrcode() -> BiliAPIClient:
 
     while time.time() - start_time < max_wait:
         result = poll_qrcode(qrcode_key, client)
-        code = result.get("data", {}).get("code", -1)
+        # get() 降级返回 {"code": -1} 时 data 字段缺失或为 None，用 or {} 防御
+        code = (result.get("data") or {}).get("code", -1)
 
         if code == 0:
             # 从扫码响应中提取 refresh_token
-            refresh_token = result.get("data", {}).get("refresh_token", "")
+            refresh_token = (result.get("data") or {}).get("refresh_token", "")
             if refresh_token:
                 client._refresh_token = refresh_token
             print("\n[Auth] 登录成功!")
@@ -249,7 +255,7 @@ def login_by_qrcode() -> BiliAPIClient:
             print("\n[Auth] 二维码已过期，请重新运行程序")
             raise Exception("二维码过期")
         else:
-            msg = result.get("data", {}).get("message", "未知状态")
+            msg = (result.get("data") or {}).get("message", "未知状态")
             if last_status != code:
                 print(f"\n[Auth] 登录状态: {msg} (code={code})")
                 last_status = code
