@@ -19,6 +19,7 @@ pip install -r requirements.txt
 python run.py BV1vu4y1b7Y9                # 分析视频
 python run.py BV1vu4y1b7Y9 --force        # 忽略缓存强制重新分析
 python run.py BV1vu4y1b7Y9 --max-users 50 # 限制最大深度分析用户数
+python run.py --batch videos.txt          # 批量分析（逐行读取BV号，忽略空行与 # 注释行）
 
 # 辅助脚本
 python login.py        # 交互式扫码登录（单独登录用）
@@ -34,19 +35,22 @@ python quick_test.py [BV号] [--top N]  # 快速分析：只分析刷屏得分�
 
 ```
 src/
-├── main.py              # 主控流程：登录→弹幕→评论→UID解析→刷屏检测→用户采集→画像分析→LLM分析→报告
+├── main.py              # 主控流程：登录→弹幕(实时+历史)→评论→UID解析→刷屏检测→用户采集→画像分析→LLM分析→报告
 ├── config.py            # 全部配置常量：API 端点、限速/重试、采集翻页上限、LLM 配置（含 API Key，已被 .gitignore 排除）
-├── api_client.py        # BiliAPIClient：HTTP 封装（限速 0.6–1.0s、重试退避、Cookie）
-├── auth.py              # 扫码登录、Cookie 保存/加载/校验
-├── danmaku.py           # 弹幕 XML 解析，按 mid_hash 聚合发送者
-├── comment.py           # 评论区采集，建立 UID→CRC32 映射
-├── uid_resolver.py      # mid_hash 破解：评论区交叉验证（最可靠）+ CRC32 反向暴力搜索（仅 UID<5000万 老用户）
+├── api_client.py        # BiliAPIClient：HTTP 封装（线程安全限速 0.6–1.0s、重试退避、-412全局冷却、Cookie、WBI签名、bili_ticket）
+├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新
+├── danmaku.py           # 实时弹幕 XML 解析，按 mid_hash 聚合发送者
+├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析）
+├── comment.py           # 评论区采集（wbi/main 游标 + 子评论补采 + IP属地），建立 UID→CRC32 映射
+├── uid_resolver.py      # mid_hash 破解：评论区交叉验证（最可靠）+ CRC32 彩虹表反查（仅 UID<5000万）
+├── crc_rainbow.py       # CRC32 彩虹表构建与查询（纯标准库，mmap 毫秒级反查）
 ├── spam_detector.py     # 刷屏检测：只标记风险等级（高/中/低），绝不删除弹幕数据
 ├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
 ├── llm_analyzer.py      # LLMAnalyzer：调 OpenAI 兼容接口逐人生成 AI 画像（未配置 LLM_API_KEY 时自动跳过）
 ├── up_analyzer.py       # UP 主相关分析
 ├── report.py            # HTML 报告生成（内嵌 Chart.js，输出到 data/reports/）
+├── exporter.py          # CSV/JSON 数据导出（与 HTML 报告同名前缀）
 └── storage.py           # SQLite 持久化（data/profiler.db），支撑断点续采
 ```
 
