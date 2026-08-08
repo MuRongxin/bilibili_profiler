@@ -10,7 +10,8 @@ import time
 from datetime import datetime
 from api_client import BiliAPIClient
 from config import (
-    USER_CARD_URL, USER_SPACE_URL, USER_VIDEOS_URL,
+    USER_CARD_URL, USER_CARDS_BATCH_URL, USER_SPACE_URL, USER_VIDEOS_URL,
+    USER_VIDEOS_LEGACY_URL,
     USER_DYNAMICS_URL, USER_FOLLOWINGS_URL, USER_FOLLOWERS_URL,
     USER_FAV_FOLDERS_URL, USER_FAV_CONTENTS_URL, USER_BANGUMI_URL,
     MAX_VIDEO_PAGES, MAX_DYNAMIC_PAGES, MAX_FOLLOWING_PAGES,
@@ -59,8 +60,50 @@ def get_user_card(uid: int, client: BiliAPIClient) -> dict:
     }
 
 
+def get_user_cards_batch(uids: list[int], client: BiliAPIClient) -> dict[int, dict]:
+    """批量获取用户名片（昵称/头像/认证/大会员），≤50 人/请求自动分批
+
+    仅需登录态、无需 wbi 签名。返回 {uid: 名片信息}，失败批次跳过（降级不中断）。
+    备用接口：当前主采集流程未调用，供后续批量预取使用。
+    """
+    result = {}
+    uids = list(dict.fromkeys(uids))  # 去重保持顺序
+    for i in range(0, len(uids), 50):
+        batch = uids[i:i + 50]
+        data = client.get(USER_CARDS_BATCH_URL, params={
+            "uids": ",".join(str(u) for u in batch)
+        })
+        if data.get("code") != 0:
+            continue
+        for uid_str, card in (data.get("data") or {}).items():
+            vip = card.get("vip") or {}
+            official = card.get("official") or {}
+            result[_safe_int(uid_str)] = {
+                "name": card.get("name", ""),
+                "face": card.get("face", ""),
+                "official_type": _safe_int(official.get("type", -1), -1),
+                "official_title": official.get("title") or official.get("desc", ""),
+                "vip_type": _safe_int(vip.get("type", 0)),
+                "vip_status": _safe_int(vip.get("status", 0)),
+            }
+    return result
+
+
+_space_cookie_warned = False
+
+
 def get_user_space_info(uid: int, client: BiliAPIClient) -> dict:
-    """获取用户空间详细信息（含硬币数、直播等）"""
+    """获取用户空间详细信息（含硬币数、直播等）
+
+    使用 wbi 版 acc/info（client 对 /wbi/ 路径自动签名），要求 Cookie ≥3 项。
+    """
+    global _space_cookie_warned
+    if not _space_cookie_warned:
+        _space_cookie_warned = True
+        cookie_count = len(client.get_cookies_dict())
+        if cookie_count < 3:
+            print(f"  [Collect] 警告：Cookie 仅 {cookie_count} 项（wbi/acc/info 需 ≥3 项），空间信息可能获取失败")
+
     data = client.get(USER_SPACE_URL, params={"mid": uid})
     if data.get("code") != 0:
         return {}
@@ -77,17 +120,67 @@ def get_user_space_info(uid: int, client: BiliAPIClient) -> dict:
         "live_url": live.get("url", ""),
         "school": (info.get("school") or {}).get("name", ""),
         "profession": (info.get("profession") or {}).get("name", ""),
-        "tags": info.get("tags", []),
+        "tags": info.get("tags") or [],
     }
 
 
 # ========== 维度2：互动内容足迹 ==========
 
 def get_user_videos(uid: int, client: BiliAPIClient, max_pages: int = MAX_VIDEO_PAGES) -> list[dict]:
-    """获取用户投稿视频列表"""
+    """获取用户投稿视频列表
+
+    优先用 recArchivesByKeywords（文档注明暂无风控校验，无需 wbi 签名）；
+    首页失败时降级旧 wbi/arc/search（需 dm_img 指纹参数，易触发 -352）。
+    两条路径输出契约一致：bvid/title/description/play/comment/created/length/typeid/tag。
+    """
+    videos = _get_videos_rec(uid, client, max_pages)
+    if videos is None:
+        print(f"  [Collect] UID:{uid} 投稿新接口失败，降级旧 arc/search")
+        videos = _get_videos_arc(uid, client, max_pages)
+    return videos
+
+
+def _get_videos_rec(uid: int, client: BiliAPIClient, max_pages: int) -> list[dict] | None:
+    """recArchivesByKeywords 路径；首页 code != 0 返回 None 触发降级，空列表视为成功"""
     all_videos = []
     for page in range(1, max_pages + 1):
         data = client.get(USER_VIDEOS_URL, params={
+            "mid": uid, "keywords": "", "ps": 30, "pn": page
+        })
+        if data.get("code") != 0:
+            return None if page == 1 else all_videos
+
+        d = data.get("data") or {}
+        archives = d.get("archives") or []
+        if not archives:
+            break
+
+        for v in archives:
+            duration = _safe_int(v.get("duration", 0))
+            all_videos.append({
+                "bvid": v.get("bvid", ""),
+                "title": v.get("title", ""),
+                "description": v.get("desc", ""),
+                "play": _safe_int((v.get("stat") or {}).get("view", 0)),
+                "comment": 0,   # 该接口不返回评论数
+                "created": _safe_int(v.get("pubdate", 0)),
+                "length": f"{duration // 60}:{duration % 60:02d}" if duration else "",
+                "typeid": 0,    # 该接口不返回分区ID
+                "tag": "",
+            })
+
+        total = _safe_int((d.get("page") or {}).get("total", 0))
+        if total and len(all_videos) >= total:
+            break
+
+    return all_videos
+
+
+def _get_videos_arc(uid: int, client: BiliAPIClient, max_pages: int) -> list[dict]:
+    """旧 wbi/arc/search 路径（降级用；返回 typeid 分区信息，但需指纹参数易 -352）"""
+    all_videos = []
+    for page in range(1, max_pages + 1):
+        data = client.get(USER_VIDEOS_LEGACY_URL, params={
             "mid": uid, "ps": 30, "pn": page, "order": "pubdate"
         })
         if data.get("code") != 0:
@@ -107,7 +200,7 @@ def get_user_videos(uid: int, client: BiliAPIClient, max_pages: int = MAX_VIDEO_
                 "created": _safe_int(v.get("created", 0)),
                 "length": v.get("length", ""),
                 "typeid": v.get("typeid", 0),
-                "tag": v.get("tag", ""),
+                "tag": v.get("tag") or "",
             })
 
         total = data.get("data", {}).get("page", {}).get("count", 0)

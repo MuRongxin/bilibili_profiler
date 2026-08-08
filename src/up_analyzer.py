@@ -7,7 +7,7 @@ UP主分析器 — 分析用户关注列表中UP主的投稿特征
 """
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from config import USER_VIDEOS_URL, USER_CARD_URL, COLLECT_WORKERS
+from config import USER_VIDEOS_LEGACY_URL, USER_CARD_URL, COLLECT_WORKERS
 
 
 def _tokenize(text: str) -> list[str]:
@@ -92,7 +92,8 @@ def analyze_up(uid: int, client) -> dict:
     threshold_30d = now - 30 * 24 * 3600
 
     try:
-        data = client.get(USER_VIDEOS_URL, params={
+        # 分区分析依赖 typeid，新接口 recArchivesByKeywords 不返回分区，固定用旧 arc/search
+        data = client.get(USER_VIDEOS_LEGACY_URL, params={
             "mid": uid, "ps": 50, "pn": 1,
             "order": "pubdate", "order_avoided": "true",
         })
