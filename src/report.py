@@ -77,6 +77,9 @@ def generate_user_card(profile: dict) -> str:
     fav = profile.get("favorite", {})
     fav_names = fav.get("names", [])[:5]
 
+    # IP属地（格式 "IP属地：江苏"，可能为空）
+    ip_location = profile.get("ip_location", "")
+
     # 视频
     vid = profile.get("video", {})
     vid_count = vid.get("count", 0)
@@ -188,6 +191,7 @@ def generate_user_card(profile: dict) -> str:
                 <h4>👤 基础信息</h4>
                 <div class="info-grid">
                     <span>性别: {esc(sex) or "未知"}</span>
+                    {f'<span>{esc(ip_location)}</span>' if ip_location else ''}
                     <span>活跃模式: {esc(act_type)}</span>
                     {f'<span>高峰时段: {esc(peak_hour)}:00</span>' if peak_hour is not None else ''}
                     {f'<span>活跃星期: {esc(peak_day)}</span>' if peak_day else ''}
@@ -254,6 +258,40 @@ def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
     # 统计AI画像覆盖
     ai_count = sum(1 for p in profiles if p.get("ai_analysis"))
 
+    # 地域分布：从 ip_location（格式 "IP属地：江苏"）提取省份，Top10 + 其他
+    region_counts = Counter()
+    for p in profiles:
+        loc = p.get("ip_location", "")
+        if loc.startswith("IP属地："):
+            province = loc[len("IP属地："):].strip()
+            if province:
+                region_counts[province] += 1
+    region_top = region_counts.most_common(10)
+    region_labels = [k for k, _ in region_top]
+    region_data = [v for _, v in region_top]
+    other_count = sum(region_counts.values()) - sum(region_data)
+    if other_count > 0:
+        region_labels.append("其他")
+        region_data.append(other_count)
+    # 无任何属地数据时不渲染该图
+    region_chart_html = '<div class="chart-card"><h3>地域分布 Top10</h3><canvas id="regionChart"></canvas></div>' if region_labels else ''
+    region_chart_js = f'''
+new Chart(document.getElementById('regionChart'),{{
+    type:'bar',
+    data:{{labels:{js_json(region_labels)},datasets:[{{label:'人数',data:{js_json(region_data)},backgroundColor:'#fb7299',borderRadius:6}}]}},
+    options:{{responsive:true,indexAxis:'y',plugins:{{legend:{{display:false}}}}}}
+}});''' if region_labels else ''
+
+    # 历史弹幕覆盖率（阶段2合并历史快照时由 main.py 写入；数字均为 int）
+    coverage = video_info.get("danmaku_coverage")
+    coverage_line = ""
+    if coverage:
+        coverage_line = (
+            f"<br>弹幕覆盖: 实时池 {coverage['realtime']:,} 条 + "
+            f"历史快照去重后新增 {coverage['history_new']:,} 条 = 合并共 {coverage['merged']:,} 条"
+            f"（历史快照原始 {coverage['history']:,} 条，每日上限1000条，可能不完整）"
+        )
+
     # 收集所有UP主词云数据 (per-upid word freq)
     up_wc_entries = []
     for p in profiles:
@@ -279,21 +317,21 @@ def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
 body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#e8ecf1; color:#333; line-height:1.7; font-size:17px; }}
 .container {{ max-width:1400px; margin:0 auto; padding:24px; }}
 
-.header {{ background:linear-gradient(135deg,#00a1d6,#fb7299); color:white; padding:40px; border-radius:16px; margin-bottom:30px; box-shadow:0 10px40px rgba(0,161,214,0.2); }}
+.header {{ background:linear-gradient(135deg,#00a1d6,#fb7299); color:white; padding:40px; border-radius:16px; margin-bottom:30px; box-shadow:0 10px 40px rgba(0,161,214,0.2); }}
 .header h1 {{ font-size:30px; margin-bottom:10px; }}
 .header .meta {{ opacity:0.9; font-size:15px; }}
 
 .stats-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:15px; margin-bottom:30px; }}
-.stat-card {{ background:white; padding:20px; border-radius:12px; box-shadow:0 2px8px rgba(0,0,0,0.04); text-align:center; }}
+.stat-card {{ background:white; padding:20px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); text-align:center; }}
 .stat-card .num {{ font-size:36px; font-weight:700; color:#00a1d6; }}
 .stat-card .label {{ font-size:13px; color:#999; margin-top:5px; }}
 
 .charts-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px; margin-bottom:30px; }}
-.chart-card {{ background:white; padding:25px; border-radius:12px; box-shadow:0 2px8px rgba(0,0,0,0.04); }}
+.chart-card {{ background:white; padding:25px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); }}
 .chart-card h3 {{ font-size:17px; margin-bottom:15px; color:#555; }}
 
 .filter-bar {{ display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }}
-.filter-btn {{ padding:8px20px; border:2px solid #e0e0e0; border-radius:25px; background:white; cursor:pointer; font-size:14px; transition:all 0.2s; }}
+.filter-btn {{ padding:8px 20px; border:2px solid #e0e0e0; border-radius:25px; background:white; cursor:pointer; font-size:14px; transition:all 0.2s; }}
 .filter-btn:hover {{ border-color:#00a1d6; color:#00a1d6; }}
 .filter-btn.active {{ background:#00a1d6; color:white; border-color:#00a1d6; }}
 
@@ -310,24 +348,24 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
 .username {{ font-size:20px; font-weight:600; }}
 .username-link {{ text-decoration:none; color:inherit; }}
 .username-link:hover {{ color:#00a1d6; }}
-.uid {{ font-size:12px; color:#999; background:#f0f0f0; padding:2px8px; border-radius:10px; }}
-.level-badge {{ font-size:12px; background:#00a1d6; color:white; padding:2px8px; border-radius:10px; }}
-.vip-badge {{ font-size:12px; background:#fb7299; color:white; padding:2px8px; border-radius:10px; }}
-.risk-badge {{ font-size:12px; background:#ff9800; color:white; padding:2px8px; border-radius:10px; }}
+.uid {{ font-size:12px; color:#999; background:#f0f0f0; padding:2px 8px; border-radius:10px; }}
+.level-badge {{ font-size:12px; background:#00a1d6; color:white; padding:2px 8px; border-radius:10px; }}
+.vip-badge {{ font-size:12px; background:#fb7299; color:white; padding:2px 8px; border-radius:10px; }}
+.risk-badge {{ font-size:12px; background:#ff9800; color:white; padding:2px 8px; border-radius:10px; }}
 .sign {{ font-size:13px; color:#666; margin-top:4px; }}
 .tags {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }}
-.tag {{ font-size:12px; background:#e3f2fd; color:#1976d2; padding:3px10px; border-radius:12px; }}
+.tag {{ font-size:12px; background:#e3f2fd; color:#1976d2; padding:3px 10px; border-radius:12px; }}
 
-.stats-bar {{ display:grid; grid-template-columns:repeat(5,1fr); gap:10px; padding:15px20px; border-bottom:1px solid #f0f0f0; }}
+.stats-bar {{ display:grid; grid-template-columns:repeat(5,1fr); gap:10px; padding:15px 20px; border-bottom:1px solid #f0f0f0; }}
 .stats-bar .stat {{ text-align:center; }}
 .stats-bar .num {{ font-size:18px; font-weight:700; color:#00a1d6; }}
 .stats-bar .label {{ font-size:12px; color:#999; }}
 
-.card-body {{ padding:15px20px; }}
+.card-body {{ padding:15px 20px; }}
 .section {{ margin-bottom:15px; padding-bottom:15px; border-bottom:1px solid #f5f5f5; }}
 .section:last-child {{ border-bottom:none; margin-bottom:0; }}
 .section h4 {{ font-size:15px; color:#555; margin-bottom:10px; display:flex; align-items:center; gap:8px; }}
-.spam-badge {{ font-size:12px; padding:2px8px; border-radius:10px; margin-left:auto; }}
+.spam-badge {{ font-size:12px; padding:2px 8px; border-radius:10px; margin-left:auto; }}
 .spam-低 {{ background:#e8f5e9; color:#388e3c; }}
 .spam-中 {{ background:#fff3e0; color:#f57c00; }}
 .spam-高 {{ background:#ffebee; color:#d32f2f; }}
@@ -335,7 +373,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
 .reason {{ font-size:12px; color:#d32f2f; margin-top:6px; }}
 .info-grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; font-size:18px; color:#555; }}
 .list {{ list-style:none; font-size:13px; color:#555; }}
-.list li {{ padding:4px0; border-bottom:1px dotted #eee; }}
+.list li {{ padding:4px 0; border-bottom:1px dotted #eee; }}
 .list li:last-child {{ border-bottom:none; }}
 
 /* 弹幕编号列表 */
@@ -346,7 +384,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
 .dm-time {{ font-size:12px; color:#999; margin-left:6px; font-family:monospace; background:#f0f0f0; padding:1px 6px; border-radius:4px; }}
 
 .samples {{ display:flex; flex-wrap:wrap; gap:6px; }}
-.sample {{ font-size:13px; background:#f5f5f5; color:#555; padding:4px10px; border-radius:8px; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.sample {{ font-size:13px; background:#f5f5f5; color:#555; padding:4px 10px; border-radius:8px; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
 .sample.following {{ background:#e8f5e9; color:#2e7d32; }}
 
 .ai-section {{ background:#f8f9ff; border-radius:8px; padding:12px 15px; }}
@@ -387,7 +425,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
             评论: {video_info.get('stat',{}).get('reply',0):,}<br>
             分析用户数: {stats['total']} | 大会员: {stats['vip_count']} | 
             刷屏用户: {stats['spam_levels'].get('高',0)+stats['spam_levels'].get('中',0)} |
-            AI画像: {ai_count}
+            AI画像: {ai_count}{coverage_line}
         </div>
     </div>
 
@@ -404,15 +442,16 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
         <div class="chart-card"><h3>用户等级分布</h3><canvas id="levelChart"></canvas></div>
         <div class="chart-card"><h3>刷屏风险分布</h3><canvas id="spamChart"></canvas></div>
         <div class="chart-card"><h3>用户标签 Top10</h3><canvas id="tagChart"></canvas></div>
+        {region_chart_html}
     </div>
 
     <div class="filter-bar">
-        <button class="filter-btn active" onclick="filter('all')">全部</button>
-        <button class="filter-btn" onclick="filter('high-level')">Lv.5+</button>
-        <button class="filter-btn" onclick="filter('vip')">大会员</button>
-        <button class="filter-btn" onclick="filter('official')">认证用户</button>
-        <button class="filter-btn" onclick="filter('spam')">刷屏用户</button>
-        <button class="filter-btn" onclick="filter('creator')">UP主</button>
+        <button class="filter-btn active" onclick="filter('all', this)">全部</button>
+        <button class="filter-btn" onclick="filter('high-level', this)">Lv.5+</button>
+        <button class="filter-btn" onclick="filter('vip', this)">大会员</button>
+        <button class="filter-btn" onclick="filter('official', this)">认证用户</button>
+        <button class="filter-btn" onclick="filter('spam', this)">刷屏用户</button>
+        <button class="filter-btn" onclick="filter('creator', this)">UP主</button>
     </div>
 
     <div class="user-grid" id="userGrid">
@@ -474,9 +513,9 @@ document.querySelectorAll('.up-chip').forEach(chip => {{
 }});
 
 // 筛选
-function filter(type) {{
+function filter(type, el) {{
     document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
-    event.target.classList.add('active');
+    el.classList.add('active');
     document.querySelectorAll('.user-card').forEach(card=>{{
         let show=true;
         const level=parseInt(card.dataset.level)||0;
@@ -513,6 +552,7 @@ new Chart(document.getElementById('tagChart'),{{
     data:{{labels:{js_json(tag_labels)},datasets:[{{label:'出现次数',data:{js_json(tag_data)},backgroundColor:'#ff9f43',borderRadius:6}}]}},
     options:{{responsive:true,indexAxis:'y',plugins:{{legend:{{display:false}}}}}}
 }});
+{region_chart_js}
 </script>
 </body>
 </html>'''

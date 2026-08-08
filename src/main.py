@@ -94,6 +94,14 @@ def _merge_history_danmaku(video_info: dict, danmaku_list: list[dict], client):
           f"（去重后 {history_new} 条），合并后共 {len(merged)} 条弹幕")
     print("[Main] 提示：历史弹幕为每日弹幕池快照（每日上限1000条），热门期弹幕滚动快，可能不完整")
 
+    # 覆盖率统计写入 video_info，供报告头部展示（降级/未启用历史弹幕时不设置）
+    video_info["danmaku_coverage"] = {
+        "realtime": len(danmaku_list),
+        "history": len(history_list),
+        "history_new": history_new,
+        "merged": len(merged),
+    }
+
     return merged, group_by_sender(merged)
 
 
