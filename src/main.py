@@ -3,6 +3,7 @@ B站弹幕发送者用户画像分析系统 — 主控流程
 
 用法:
     python src/main.py BVxxxxxxxx [--force]
+    python src/main.py --batch videos.txt   # 批量模式：逐行读取BV号（忽略空行与 # 注释行）
     --force: 清除该视频的全部缓存（senders/孤立 users/videos），强制重新采集全部用户
 """
 import sys
@@ -442,13 +443,79 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
     print("=" * 60)
 
 
+def load_batch_bvids(path: str) -> list[str]:
+    """读取批量 BV 号清单：逐行读取，忽略空行与 # 注释行"""
+    bvids = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            bvids.append(line)
+    return bvids
+
+
+def run_batch(batch_file: str, force: bool = False, max_users: int = MAX_ANALYZE_USERS):
+    """批量分析：逐个视频调用 run_analysis，单个失败只警告不中断，最后打印汇总"""
+    bvids = load_batch_bvids(batch_file)
+    if not bvids:
+        print(f"[Batch] 清单为空（无有效BV号）: {batch_file}")
+        return
+
+    total = len(bvids)
+    print(f"[Batch] 共 {total} 个视频待分析（清单: {batch_file}）")
+
+    succeeded = []
+    failed = []
+    for idx, bvid in enumerate(bvids, 1):
+        print(f"\n{'=' * 60}")
+        print(f"  [Batch {idx}/{total}] {bvid}")
+        print(f"{'=' * 60}")
+        if not bvid.startswith("BV"):
+            print(f"[Batch] 警告: {bvid} 格式不正确（应以 BV 开头），跳过")
+            failed.append(bvid)
+            continue
+        try:
+            run_analysis(bvid, force=force, max_users=max_users)
+            succeeded.append(bvid)
+        except KeyboardInterrupt:
+            # Ctrl+C 不再继续后续视频，但仍打印已完成的汇总
+            print(f"\n[Batch] 用户中断，跳过后续 {total - idx} 个视频")
+            failed.append(bvid)
+            break
+        except Exception as e:
+            print(f"\n[Batch] 警告: {bvid} 分析失败，继续下一个: {e}")
+            failed.append(bvid)
+
+    # 汇总
+    print(f"\n{'=' * 60}")
+    print(f"  批量分析汇总: 成功 {len(succeeded)} / 失败 {len(failed)} / 共 {total}")
+    if failed:
+        print(f"  失败列表: {', '.join(failed)}")
+    print(f"{'=' * 60}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="B站弹幕发送者用户画像分析")
-    parser.add_argument("bvid", help="视频BV号，如 BV1vu4y1b7Y9")
+    parser.add_argument("bvid", nargs="?", help="视频BV号，如 BV1vu4y1b7Y9")
     parser.add_argument("--force", action="store_true", help="强制重新分析")
     parser.add_argument("--max-users", type=int, default=MAX_ANALYZE_USERS,
                         help=f"最大分析用户数 (默认 {MAX_ANALYZE_USERS})")
+    parser.add_argument("--batch", metavar="FILE",
+                        help="批量模式：从文件逐行读取BV号（忽略空行与 # 注释行）")
     args = parser.parse_args()
+
+    if args.batch:
+        try:
+            run_batch(args.batch, force=args.force, max_users=args.max_users)
+        except FileNotFoundError:
+            print(f"错误: 批量清单文件不存在: {args.batch}")
+            sys.exit(1)
+        return
+
+    if not args.bvid:
+        print("错误: 需提供 BV号 或 --batch 清单文件")
+        sys.exit(1)
 
     bvid = args.bvid.strip()
     if not bvid.startswith("BV"):

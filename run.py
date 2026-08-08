@@ -4,6 +4,7 @@ B站弹幕发送者用户画像分析系统 — 入口脚本
 
 用法:
     python run.py BVxxxxxxxx [--force]
+    python run.py --batch videos.txt   # 批量模式：逐行读取BV号（忽略空行与 # 注释行）
     --force: 强制重新分析
 """
 import sys
