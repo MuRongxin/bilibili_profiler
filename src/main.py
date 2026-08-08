@@ -41,7 +41,7 @@ def phase_login():
 
 
 def phase_danmaku(bvid: str, client):
-    """阶段2: 采集弹幕（实时弹幕池 + 可选历史弹幕快照合并）"""
+    """阶段2: 采集弹幕（实时弹幕池 + 可选历史弹幕快照合并 + 互动弹幕明文mid）"""
     print("\n[Phase 2/6] 采集弹幕数据...")
     video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, client)
     save_video_info(bvid, video_info)
