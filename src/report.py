@@ -261,7 +261,9 @@ def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
     # 地域分布：从 ip_location（格式 "IP属地：江苏"）提取省份，Top10 + 其他
     region_counts = Counter()
     for p in profiles:
-        loc = p.get("ip_location", "")
+        # 注意：无评论属地的用户该键存在但值为 None（profile_analyzer 用 .get 透传），
+        # 不能用 p.get("ip_location", "")——默认值只在缺键时生效
+        loc = p.get("ip_location") or ""
         if loc.startswith("IP属地："):
             province = loc[len("IP属地："):].strip()
             if province:
