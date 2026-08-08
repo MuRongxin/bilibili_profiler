@@ -165,7 +165,7 @@ def generate_user_card(profile: dict) -> str:
                     <span class="uid">UID:{esc(uid)}</span>
                     <span class="level-badge">Lv.{esc(level)}</span>
                     { '<span class="vip-badge">大会员</span>' if profile.get('vip_status')==1 else '' }
-                    { '<span class="risk-badge" title="该UID由CRC32暴力破解得出，存在碰撞误识别风险">可能误识别</span>' if profile.get('collision_risk') else '' }
+                    { '<span class="risk-badge" title="该UID由CRC32反查（MITM）得出，存在碰撞误识别风险">可能误识别</span>' if profile.get('collision_risk') else '' }
                 </div>
                 <div class="tags">{tag_html}</div>
                 {f'<div class="sign">{esc(sign)}</div>' if sign else ''}

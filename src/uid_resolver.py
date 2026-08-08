@@ -86,6 +86,20 @@ def cross_verify_with_comments(mid_hash: str, comment_uid_map: dict[str, int]) -
     return comment_uid_map.get(mid_hash)
 
 
+def _plaintext_result(method_map: dict | None, source_crc: str, danmaku_count: int):
+    """
+    明文交叉验证命中时的 (method, confidence, collision_risk) 判定
+
+    全局库中 source="CRC32破解" 的条目复用时保留碰撞风险标记与置信度压制
+    （跨视频口径一致，避免复用后风险角标消失、置信度膨胀）；其余明文源
+    （评论/充电名单/互动弹幕）置信度按弹幕数规则。
+    """
+    method = (method_map or {}).get(source_crc, METHOD_COMMENT_VERIFY)
+    if method == METHOD_CRC32_CRACK:
+        return method, ("中" if danmaku_count >= 2 else "低"), True
+    return method, ("高" if danmaku_count >= 2 else "中"), False
+
+
 def resolve_sender(
     mid_hash: str,
     danmaku_contents: list[str],
@@ -126,9 +140,9 @@ def resolve_sender(
     if uid:
         exists, user_info = verify_uid_exists(uid, client)
         if exists:
-            method = (method_map or {}).get(mid_hash, METHOD_COMMENT_VERIFY)
-            confidence = "高" if len(danmaku_contents) >= 2 else "中"
-            return uid, confidence, method, user_info, False, candidates
+            method, confidence, risk = _plaintext_result(
+                method_map, mid_hash, len(danmaku_contents))
+            return uid, confidence, method, user_info, risk, candidates
         uid = None  # 理论上不会发生，但做防御
 
     # === 方法2：MITM 反查 + 碰撞消歧 ===
@@ -143,9 +157,11 @@ def resolve_sender(
         for u in inter:
             exists, user_info = verify_uid_exists(u, client)
             if exists:
-                method = (method_map or {}).get(mid_hash, METHOD_COMMENT_VERIFY)
-                confidence = "高" if len(danmaku_contents) >= 2 else "中"
-                return u, confidence, method, user_info, False, candidates
+                # 反查该候选对应的明文源条目，method 标注真实来源（充电名单/互动弹幕等）
+                source_crc = next((h for h, v in comment_uid_map.items() if v == u), mid_hash)
+                method, confidence, risk = _plaintext_result(
+                    method_map, source_crc, len(danmaku_contents))
+                return u, confidence, method, user_info, risk, candidates
         # 交集候选全部注销 → 继续走 2b 对剩余候选验证
         candidates = [u for u in candidates if u not in inter]
 
