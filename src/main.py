@@ -324,7 +324,7 @@ def phase_collect_users(resolved: dict, client, force: bool = False):
         if uid and confidence in ("高", "中"):
             uids_to_collect.append((mid_hash, uid))
 
-    # 按弹幕数量降序，限制最大分析数
+    # 按弹幕数量降序（名单已由阶段4兴趣定员，此处不再截断）
     # 这里我们没法直接排序，因为resolved没有原始count，但我们可以 trust danmaku_count
     uids_to_collect.sort(key=lambda x: resolved[x[0]]["danmaku_count"], reverse=True)
 
@@ -379,14 +379,16 @@ def phase_collect_users(resolved: dict, client, force: bool = False):
 
 
 def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict,
-                  comment_location_map: dict | None = None):
+                  comment_location_map: dict | None = None, uid_comments: dict | None = None):
     """阶段6: 画像分析
 
-    comment_location_map（uid→评论IP属地）在此处注入 user_data 而非依赖落库数据：
-    users 表缓存的旧 user_data 没有该字段，每次运行时注入才能保证缓存命中路径也带出属地。
+    comment_location_map（uid→评论IP属地）与 uid_comments（uid→本视频评论）在此处
+    注入而非依赖落库数据：users 表缓存的旧 user_data 没有这两个字段，
+    每次运行时注入才能保证缓存命中路径也带出属地与评论。
     """
     print("\n[Phase 6/6] 画像分析...")
     comment_location_map = comment_location_map or {}
+    uid_comments = uid_comments or {}
     profiles = []
 
     for mid_hash, info in resolved.items():
@@ -413,6 +415,9 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
             profile = analyze_profile(user_data, danmaku_stats, spam)
             # 碰撞风险标记传入报告，供"可能误识别"徽标展示
             profile["collision_risk"] = info.get("collision_risk", False)
+            # 本视频评论（按点赞降序，至多10条）与尬语聚合，供报告展示与 LLM 深掘证据包
+            profile["comments"] = uid_comments.get(uid, [])[:10]
+            profile["cringe"] = info.get("cringe", {})
             profiles.append(profile)
 
             # 保存到数据库
@@ -501,7 +506,8 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
     user_data_map = phase_collect_users(resolved, client, force=force)
 
     # 阶段6: 画像分析（评论IP属地在此贯通进画像）
-    profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups, comment_location_map)
+    profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups,
+                             comment_location_map, uid_comments)
 
     # 阶段7: LLM AI 逐人画像分析
     ai_analysis = phase_ai_analysis(video_info, profiles)
