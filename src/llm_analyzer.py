@@ -8,6 +8,7 @@
 """
 import re
 import json
+import time
 from datetime import datetime
 from openai import OpenAI
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_DEEP_TOP_K
@@ -220,11 +221,18 @@ class LLMAnalyzer:
                   f"（LLM请求中，可能需要数十秒）...")
             try:
                 text = self._analyze_one_deep(p, video_info)
-                if text.strip():
-                    results[p["uid"]] = text
-                else:
-                    print(f"  警告: UID:{p.get('uid')} 深掘响应为空，跳过")
             except Exception as e:
-                # 失败降级：单用户失败不中断整体深掘
-                print(f"  警告: UID:{p.get('uid')} 深掘失败（{e}），跳过")
+                # 超时等多为瞬态 API 波动（实测曾整批连续超时后自行恢复），
+                # 退避后重试一次；仍失败才降级跳过，不中断整体深掘
+                print(f"  警告: UID:{p.get('uid')} 深掘失败（{e}），20 秒后重试一次...")
+                time.sleep(20)
+                try:
+                    text = self._analyze_one_deep(p, video_info)
+                except Exception as e2:
+                    print(f"  警告: UID:{p.get('uid')} 重试仍失败（{e2}），跳过")
+                    continue
+            if text.strip():
+                results[p["uid"]] = text
+            else:
+                print(f"  警告: UID:{p.get('uid')} 深掘响应为空，跳过")
         return results
