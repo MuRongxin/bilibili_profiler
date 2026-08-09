@@ -29,6 +29,7 @@ class LLMAnalyzer:
         cringe = p.get("cringe", {})
         return {
             "uid": p.get("uid"),
+            "video_title": video_info.get("title", "未知视频"),  # 进 hash：改标题后缓存正确失效
             "name": p.get("name", "未知"),
             "level": p.get("level", 0),
             "sign": p.get("sign", ""),
