@@ -19,6 +19,28 @@ def esc(s):
     return _html.escape(str(s) if s is not None else "", quote=True)
 
 
+# 问题弹幕类别分色（问题弹幕榜标签底色；七类与 cringe_detector.PROBLEM_CATEGORIES 对齐）
+PROBLEM_CATEGORY_COLORS = {
+    "中二抒情": "#9c6ade",
+    "尬夸捧杀": "#f06292",
+    "引战阴阳": "#e53935",
+    "人身攻击": "#b71c1c",
+    "恶意剧透": "#fb8c00",
+    "广告引流": "#8d6e63",
+    "键政敏感": "#546e7a",
+}
+
+
+def _category_chips(categories: list) -> str:
+    """类别列表 → 分色标签 HTML（未知类别用灰色兜底）"""
+    chips = []
+    for cat in categories:
+        color = PROBLEM_CATEGORY_COLORS.get(cat, "#999999")
+        chips.append(f'<span style="display:inline-block;background:{color};color:#fff;'
+                     f'font-size:12px;border-radius:4px;padding:1px 8px;margin:1px 2px;">{esc(cat)}</span>')
+    return "".join(chips)
+
+
 def safe_url(url):
     """URL 白名单校验：仅允许 http/https，其余返回空串"""
     url = str(url) if url else ""
@@ -136,10 +158,10 @@ def generate_user_card(profile: dict) -> str:
     bangumi = profile.get("bangumi_titles", [])[:3]
     dramas = profile.get("drama_titles", [])[:3]
 
-    # AI画像分析（深掘优先，粗筛兜底，兼容旧字段）
+    # AI画像分析（仅深掘；ai_analysis 为兼容旧报告数据保留）
     ai_deep = profile.get("ai_deep", "")
-    ai_text = ai_deep or profile.get("ai_brief", "") or profile.get("ai_analysis", "")
-    ai_heading = "🤖 AI 深度画像" if ai_deep else "🤖 AI 粗筛画像"
+    ai_text = ai_deep or profile.get("ai_analysis", "")
+    ai_heading = "🤖 AI 深度画像"
     ai_section = ""
     if ai_text:
         # 简单渲染：先转义，再用正则把成对的 **粗体** 渲染为 <strong>
@@ -153,9 +175,9 @@ def generate_user_card(profile: dict) -> str:
                 <div class="ai-text">{ai_html}</div>
             </div>'''
 
-    # 尬语内联标记（弹幕行为行尾）
+    # 问题弹幕内联标记（弹幕行为行尾）
     cringe = profile.get("cringe", {})
-    cringe_note = (f'，其中尬语 {cringe["count"]} 条（{"、".join(cringe.get("categories", []))}）'
+    cringe_note = (f'，其中问题弹幕 {cringe["count"]} 条（{"、".join(cringe.get("categories", []))}）'
                    if cringe.get("count") else "")
 
     # 本视频评论小节（按点赞降序，至多10条，来自阶段6注入；is_sub 子评论加前缀标注）
@@ -268,7 +290,7 @@ def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
     bvid = video_info.get("bvid", "")
 
     # 用户卡片
-    # 用户卡片按风险等级排序展示：高→中→低；同级按兴趣分（刷屏分/尬语严重度/弹幕数）降序
+    # 用户卡片按风险等级排序展示：高→中→低；同级按兴趣分（刷屏分/问题弹幕严重度/弹幕数）降序
     risk_rank = {"高": 0, "中": 1, "低": 2}
     profiles = sorted(profiles, key=lambda p: (
         risk_rank.get(p.get("danmaku", {}).get("spam_level", "低"), 2),
@@ -288,8 +310,8 @@ def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
     tag_labels = list(stats["top_tags"].keys())[:10]
     tag_data = list(stats["top_tags"].values())[:10]
 
-    # 统计AI画像覆盖（深掘/粗筛/旧字段任一存在即计数）
-    ai_count = sum(1 for p in profiles if p.get("ai_deep") or p.get("ai_brief") or p.get("ai_analysis"))
+    # 统计AI画像覆盖（深掘/旧字段任一存在即计数）
+    ai_count = sum(1 for p in profiles if p.get("ai_deep") or p.get("ai_analysis"))
 
     # 地域分布：从 ip_location（格式 "IP属地：江苏"）提取省份，Top10 + 其他
     region_counts = Counter()
@@ -339,7 +361,7 @@ new Chart(document.getElementById('regionChart'),{{
                 up_wc_entries.append(f'{js_json(up_id)}:{js_json(wf)}')
     up_wc_js = "{" + ",".join(up_wc_entries) + "}"
 
-    # 尬语榜：按发送者聚合（最高严重度、条数降序），无命中时不渲染
+    # 问题弹幕榜：按发送者聚合（最高严重度、条数降序），无命中时不渲染
     cringe_entries = [p for p in profiles if p.get("cringe", {}).get("count", 0) >= 1]
     cringe_entries.sort(key=lambda p: (p["cringe"].get("max_severity", 0), p["cringe"]["count"]),
                         reverse=True)
@@ -352,16 +374,16 @@ new Chart(document.getElementById('regionChart'),{{
             rows.append(
                 f'<tr><td><a href="https://space.bilibili.com/{esc(p.get("uid", 0))}" target="_blank" rel="noopener">{esc(p.get("name", "未知"))}</a></td>'
                 f'<td>{esc(cr["count"])}</td>'
-                f'<td>{esc("、".join(cr.get("categories", [])))}</td>'
+                f'<td>{_category_chips(cr.get("categories", []))}</td>'
                 f'<td>{esc(cr.get("max_severity", 0))}</td>'
                 f'<td>{esc(example.get("content", ""))}<br>'
                 f'<span class="cringe-reason">{esc(example.get("category", ""))}: {esc(example.get("reason", ""))}</span></td></tr>'
             )
         cringe_board_html = f'''
     <div class="cringe-board">
-        <h3>🤡 弹幕尬语榜（{len(cringe_entries)} 人命中）</h3>
+        <h3>🚨 问题弹幕榜（{len(cringe_entries)} 人命中）</h3>
         <table>
-            <thead><tr><th>用户</th><th>尬语条数</th><th>类别</th><th>最高严重度</th><th>代表原文</th></tr></thead>
+            <thead><tr><th>用户</th><th>命中条数</th><th>类别</th><th>最高严重度</th><th>代表原文</th></tr></thead>
             <tbody>{"".join(rows)}</tbody>
         </table>
     </div>'''
@@ -456,7 +478,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
 .ai-text strong {{ color:#333; }}
 .ai-text br {{ display:block; content:''; margin:2px 0; }}
 
-/* 尬语榜 */
+/* 问题弹幕榜 */
 .cringe-board {{ background:white; padding:25px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); margin-bottom:30px; }}
 .cringe-board h3 {{ font-size:17px; margin-bottom:15px; color:#555; }}
 .cringe-board table {{ width:100%; border-collapse:collapse; font-size:14px; }}
