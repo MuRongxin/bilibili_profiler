@@ -10,7 +10,7 @@ import sys
 import os
 import argparse
 
-from config import MAX_ANALYZE_USERS, LLM_API_KEY, HISTORY_DANMAKU_ENABLED
+from config import MAX_ANALYZE_USERS_HARD_CAP, LLM_API_KEY, HISTORY_DANMAKU_ENABLED
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
@@ -548,8 +548,8 @@ def main():
     parser.add_argument("bvid", nargs="?", help="视频BV号，如 BV1vu4y1b7Y9")
     parser.add_argument("--force", action="store_true",
                         help="清除该视频的缓存并强制重采全部用户（忽略断点续采）")
-    parser.add_argument("--max-users", type=int, default=MAX_ANALYZE_USERS,
-                        help=f"最大分析用户数 (默认 {MAX_ANALYZE_USERS})")
+    parser.add_argument("--max-users", type=int, default=None,
+                        help="手动硬上限覆盖阈值制动态定员 (默认不限制，阈值命中者全进)")
     parser.add_argument("--batch", metavar="FILE",
                         help="批量模式：从文件逐行读取BV号（忽略空行与 # 注释行）")
     args = parser.parse_args()

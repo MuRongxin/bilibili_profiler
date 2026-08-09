@@ -81,7 +81,9 @@ MAX_UP_SAMPLE = 20        # summarize_followings 深度分析的UP主采样上�
 # ========== 画像配置 ==========
 SPAM_HIGH_THRESHOLD = (10, 0.7)    # (弹幕数, 重复率)
 SPAM_MEDIUM_THRESHOLD = (5, 0.5)   # (弹幕数, 重复率)
-MAX_ANALYZE_USERS = 100            # 最大深度分析用户数
+MAX_ANALYZE_USERS_HARD_CAP = 300   # 动态定员安全上限（兴趣命中者超过时按兴趣分截断）
+LLM_DEEP_TOP_K = 20                # LLM 重点深掘人数（兴趣分 top K 单人单调用）
+CRINGE_BATCH_SIZE = 200            # 尬语检测每批弹幕条数
 
 # ========== LLM 配置 ==========
 # DeepSeek 官方 OpenAI 兼容端点（https://api-docs.deepseek.com）
