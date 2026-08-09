@@ -429,22 +429,33 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
     return profiles
 
 
-def phase_ai_analysis(video_info: dict, profiles: list[dict]) -> dict | None:
-    """阶段7: LLM 深度画像分析"""
+def phase_ai_analysis(video_info: dict, profiles: list[dict]):
+    """阶段7: LLM 分层画像分析（7a 批量粗筛全员 + 7b 重点深掘 top K，结果直接注入 profile）"""
     if not LLM_API_KEY:
-        print("\n[Phase 7/7] 跳过 (未在 config.py 或环境变量中设置 LLM_API_KEY)")
-        return None
+        print("\n[Phase 7] 跳过 (未在 config.py 或环境变量中设置 LLM_API_KEY)")
+        return
 
-    print("\n[Phase 7/7] LLM 逐人画像分析...")
     try:
         analyzer = LLMAnalyzer()
-        result = analyzer.analyze(profiles, video_info)
-        per_user_count = len(result.get("per_user", {}))
-        print(f"[Phase 7] 完成: {per_user_count}/{len(profiles)} 人生成AI画像")
-        return result
+
+        print("\n[Phase 7a] LLM 批量粗筛（全员标签+定性）...")
+        brief = analyzer.analyze(profiles, video_info)
+        per_user = brief.get("per_user", {})
+        for p in profiles:
+            uid = p.get("uid")
+            if uid in per_user:
+                p["ai_brief"] = per_user[uid]
+        print(f"[Phase 7a] 完成: {len(per_user)}/{len(profiles)} 人生成粗筛画像")
+
+        print("\n[Phase 7b] LLM 重点深掘（兴趣分 top K 单人单调用）...")
+        deep = analyzer.analyze_deep(profiles, video_info)
+        for p in profiles:
+            uid = p.get("uid")
+            if uid in deep:
+                p["ai_deep"] = deep[uid]
+        print(f"[Phase 7b] 完成: {len(deep)} 人生成深度画像")
     except Exception as e:
         print(f"[Phase 7] LLM 分析失败: {e}")
-        return None
 
 
 def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
@@ -505,20 +516,12 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
     # 阶段5: 用户采集
     user_data_map = phase_collect_users(resolved, client, force=force)
 
-    # 阶段6: 画像分析（评论IP属地在此贯通进画像）
+    # 阶段6: 画像分析（评论IP属地/本视频评论/尬语在此贯通进画像）
     profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups,
                              comment_location_map, uid_comments)
 
-    # 阶段7: LLM AI 逐人画像分析
-    ai_analysis = phase_ai_analysis(video_info, profiles)
-
-    # 将逐人AI分析注入profiles
-    if ai_analysis:
-        per_user = ai_analysis.get("per_user", {})
-        for p in profiles:
-            uid = p.get("uid")
-            if uid in per_user:
-                p["ai_analysis"] = per_user[uid]
+    # 阶段7: LLM 分层画像分析（粗筛/深掘结果在 phase 内直接注入 profile）
+    phase_ai_analysis(video_info, profiles)
 
     # 生成报告
     print("\n[Report] 生成HTML报告...")

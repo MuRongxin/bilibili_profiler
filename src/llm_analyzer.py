@@ -10,7 +10,7 @@ import re
 import json
 from datetime import datetime
 from openai import OpenAI
-from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS
+from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_DEEP_TOP_K
 
 
 class LLMAnalyzer:
@@ -23,7 +23,7 @@ class LLMAnalyzer:
         self.max_tokens = LLM_MAX_TOKENS
 
     def _build_prompt(self, profiles: list[dict], video_info: dict) -> str:
-        """为每个用户单独构建画像分析 prompt"""
+        """构建批量粗筛 prompt（全员标签+一句话定性，重点人员由 analyze_deep 单独深掘）"""
         title = video_info.get("title", "未知视频")
 
         # 提取用户摘要数据
@@ -49,40 +49,32 @@ class LLMAnalyzer:
                 "danmaku_count": dm.get("count", 0),
                 "danmaku_contents": dm.get("contents", [])[:30],  # 只取前30条，防止刷屏用户prompt超长
                 "spam_level": dm.get("spam_level", "低"),
+                "comments": [c.get("content", "")[:50] for c in p.get("comments", [])[:5]],
+                "cringe_categories": p.get("cringe", {}).get("categories", []),
                 "tags": p.get("tags", []),
             })
 
-        prompt = f"""你是一位专业的网络行为分析师和人格心理学家。请对以下每位B站用户进行**个体深度画像分析**。
+        prompt = f"""你是一位网络行为分析师。请对以下每位B站用户做**快速粗筛**（重点人员后续会单独深度分析，这里只需勾画轮廓）。
 
 这些用户都曾在视频《{title}》中发送弹幕。
-
-## 分析维度（每个用户单独分析）
-
-1. **人格类型**：基于MBTI或Big Five框架，结合其弹幕内容、签名、收藏夹命名、关注偏好推断
-2. **心理动机**：他/她为什么在这个视频发这些弹幕？想表达什么？
-3. **社交需求**：在B站社区中扮演什么角色、寻求什么？
-4. **消费偏好**：内容品味、付费意愿、使用习惯
-5. **异常评估**：如果刷屏等级为"高"或"中"，分析其心理状态
 
 ## 数据说明
 - B站Lv.6代表硬核老用户；大会员表示有持续付费意愿
 - 关注列表中的UP主类型反映信息食谱和价值观
 - following_summary 是该用户关注UP主的分析：分区分布(top_categories)、大UP/小UP比例(big_creators/small_creators)、活跃UP占比(active_ratio)
 - 收藏夹命名反映性格特征；标签是系统辅助判断
+- comments 是该用户在本视频评论区发表的评论；cringe_categories 是其弹幕被判定为尬语的类别
 
 ## 用户数据（共{len(users_data)}人）
 {json.dumps(users_data, ensure_ascii=False, indent=2)}
 
 ## 输出要求
 
-请严格按以下格式输出，每个用户一个section，**每个用户不超过200字**：
+请严格按以下格式输出，每个用户一个section：
 
 ### [uid] 用户名
-人格类型: （1-2句）
-心理动机: （1-2句）
-社交需求: （1-2句）
-消费偏好: （1-2句）
-异常评估: （1句）
+标签: （3-5个短标签，如 二次元核心/饭圈化表达/理性讨论者/机器人嫌疑）
+定性: （一句话行为定性，不超过40字）
 
 每个用户之间用 `---` 分隔。不要输出群体总结。务必覆盖所有用户，不要遗漏。"""
         return prompt
@@ -157,3 +149,82 @@ class LLMAnalyzer:
             "full_text": "\n\n".join(all_texts),
             "per_user": all_per_user,
         }
+
+    def _build_deep_prompt(self, p: dict, video_info: dict) -> str:
+        """重点人员单人深掘 prompt：证据包（弹幕原文/评论/尬语判定/刷屏分析/四维度数据）"""
+        title = video_info.get("title", "未知视频")
+        dm = p.get("danmaku", {})
+        cringe = p.get("cringe", {})
+        evidence = {
+            "uid": p.get("uid"),
+            "name": p.get("name", "未知"),
+            "level": p.get("level", 0),
+            "sign": p.get("sign", ""),
+            "vip": p.get("vip_status", 0) == 1,
+            "follower": p.get("follower", 0),
+            "archive_count": p.get("archive_count", 0),
+            "tags": p.get("tags", []),
+            "following_summary": p.get("following_summary", {}),
+            "favorite_folders": p.get("favorite", {}).get("names", []),
+            "danmaku_count": dm.get("count", 0),
+            "danmaku_contents": dm.get("contents", [])[:50],  # 刷屏用户截断防超长
+            "spam": {"level": dm.get("spam_level", "低"), "score": dm.get("spam_score", 0.0),
+                     "reason": dm.get("spam_reason", "")},
+            "cringe": {"count": cringe.get("count", 0),
+                       "categories": cringe.get("categories", []),
+                       "examples": cringe.get("examples", [])},
+            "comments_in_video": [{"content": c.get("content", ""), "like": c.get("like", 0)}
+                                  for c in p.get("comments", [])[:10]],
+        }
+        return f"""你是一位资深网络行为分析师。请对以下这位B站用户做**单人深度行为画像**。
+他/她曾在视频《{title}》中发送弹幕，是本视频中值得重点关注的人物（刷屏得分高或存在尬语）。
+
+## 证据包（JSON）
+{json.dumps(evidence, ensure_ascii=False, indent=2)}
+
+## 输出要求（严格按以下四节输出，结论必须引用证据包原文作为论据）
+
+**行为定性**: （2-3句：这是个什么样的人，在本视频中扮演什么角色）
+**动机分析**: （2-3句：他/她为什么发这些弹幕/评论，想获得什么）
+**证据引用**: （列出2-4条最能支撑结论的弹幕或评论原文，并各配一句解读）
+**风险等级**: （高/中/低 + 一句理由：对社区氛围的潜在影响）"""
+
+    def _analyze_one_deep(self, p: dict, video_info: dict) -> str:
+        """单人深掘调用，返回分析文本"""
+        client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": self._build_deep_prompt(p, video_info)}],
+            max_tokens=self.max_tokens,
+            temperature=1.0,
+            top_p=0.95,
+            stream=False,
+        )
+        return response.choices[0].message.content or ""
+
+    def analyze_deep(self, profiles: list[dict], video_info: dict,
+                     top_k: int = LLM_DEEP_TOP_K) -> dict[int, str]:
+        """重点深掘：兴趣分 top K 单人单调用。兴趣分 = (spam_score, 尬语最高严重度, 弹幕数)"""
+        def interest(p: dict):
+            dm = p.get("danmaku", {})
+            return (dm.get("spam_score", 0.0), p.get("cringe", {}).get("max_severity", 0),
+                    dm.get("count", 0))
+
+        targets = sorted(profiles, key=interest, reverse=True)[:top_k]
+        results = {}
+        for i, p in enumerate(targets, 1):
+            print(f"  深掘 {i}/{len(targets)}: UID:{p.get('uid')} {p.get('name', '')}"
+                  f"（LLM请求中，可能需要数十秒）...")
+            try:
+                text = self._analyze_one_deep(p, video_info)
+                if text.strip():
+                    results[p["uid"]] = text
+                else:
+                    print(f"  警告: UID:{p.get('uid')} 深掘响应为空，跳过")
+            except Exception as e:
+                # 失败降级：单用户失败不中断整体深掘
+                print(f"  警告: UID:{p.get('uid')} 深掘失败（{e}），跳过")
+        return results
