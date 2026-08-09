@@ -83,6 +83,15 @@ def init_db():
             )
         ''')
 
+        # LLM 结果缓存表（问题弹幕判定 + 重点深掘，跨运行复用省 token）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS llm_cache (
+                cache_key   TEXT PRIMARY KEY,
+                result_json TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            )
+        ''')
+
         conn.commit()
 
         # 清理旧版本的 progress 表（断点续采已改为纯 senders/users 缓存机制）
@@ -221,6 +230,7 @@ def clear_video_cache(bvid: str):
     - users 表无 bvid 列，按 uid 关联：仅删除"该 bvid 的 senders 引用、
       且不再被其他 bvid 的 senders 引用"的用户数据，避免误删共享缓存
     - 删除 videos 表中该 bvid 的视频信息记录
+    - 删除 llm_cache 中该 bvid 的问题弹幕判定缓存（cringe:{bvid}:*），深掘缓存（deep:*）保留
     """
     with closing(get_db()) as conn:
         cursor = conn.cursor()
@@ -230,6 +240,9 @@ def clear_video_cache(bvid: str):
 
         cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,))
+        # 该视频的问题弹幕判定缓存一并清除（key 前缀 cringe:{bvid}:）；
+        # 深掘缓存 key 为 deep:{uid}:...，按用户跨视频复用，不清
+        cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cringe:{bvid}:%",))
 
         for uid in uids:
             cursor.execute("SELECT 1 FROM senders WHERE uid = ? LIMIT 1", (uid,))
@@ -267,3 +280,31 @@ def load_global_uid_map() -> dict:
         rows = cursor.fetchall()
     return {r["mid_hash"]: {"uid": r["uid"], "source": r["source"], "hit_count": r["hit_count"]}
             for r in rows}
+
+
+# ========== LLM 结果缓存（省 token：重跑同视频/同证据包零调用） ==========
+
+def load_llm_cache(cache_key: str) -> str | None:
+    """读取 LLM 缓存；不存在或读取异常均返回 None（视为未命中，不中断流水线）"""
+    try:
+        with closing(get_db()) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT result_json FROM llm_cache WHERE cache_key = ?", (cache_key,))
+            row = cursor.fetchone()
+        return row["result_json"] if row else None
+    except Exception:
+        return None
+
+
+def save_llm_cache(cache_key: str, result_json: str):
+    """写入 LLM 缓存；异常只打印警告（缓存失败不影响主流程）"""
+    try:
+        with closing(get_db()) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO llm_cache (cache_key, result_json, created_at)
+                VALUES (?, ?, ?)
+            ''', (cache_key, result_json, datetime.now().isoformat()))
+            conn.commit()
+    except Exception as e:
+        print(f"[Storage] 警告: LLM 缓存写入失败（{e}），忽略")
