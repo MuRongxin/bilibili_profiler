@@ -1,0 +1,143 @@
+"""
+尬语检测（LLM 判定）
+
+对合并去重后的全部弹幕按批喂给 LLM，判定三类尬语：
+中二抒情 / 尬夸捧杀 / 引战阴阳（spec 决策，不含"无关自我表演"）。
+按发送者聚合输出，驱动兴趣分选人与报告尬语榜。
+未配置 LLM_API_KEY 或全部批次失败时返回空 dict（降级不中断）。
+"""
+import json
+
+from openai import OpenAI
+
+from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, CRINGE_BATCH_SIZE
+
+# 尬语类别（与 spec 一致；prompt 与聚合均引用，勿散落硬编码字符串）
+CRINGE_CATEGORIES = ["中二抒情", "尬夸捧杀", "引战阴阳"]
+
+
+def _dedup_contents(danmaku_list: list[dict]) -> list[dict]:
+    """按内容去重弹幕，附出现次数（降低 token 消耗）。返回 [{content, count}]，按次数降序"""
+    counts = {}
+    for dm in danmaku_list:
+        c = (dm.get("content") or "").strip()
+        if c:
+            counts[c] = counts.get(c, 0) + 1
+    items = [{"content": c, "count": n} for c, n in counts.items()]
+    items.sort(key=lambda x: x["count"], reverse=True)
+    return items
+
+
+def _build_prompt(batch: list[dict], start_idx: int, video_title: str) -> str:
+    """构建单批尬语判定 prompt（编号为全局下标，便于跨批映射）"""
+    lines = [f'{start_idx + i}. {it["content"]}（出现{it["count"]}次）' for i, it in enumerate(batch)]
+    return f"""你是中文互联网内容审核专家。以下是B站视频《{video_title}》的弹幕列表（已按内容去重）。
+请逐条判定是否属于以下三类"尬语"之一：
+- 中二抒情：咯噔文学、疼痛文学、过度深情、自我感动式抒情
+- 尬夸捧杀：无脑吹、饭圈式夸张应援、明显违心的吹捧
+- 引战阴阳：拉踩、对线、反串、阴阳怪气等攻击性内容
+正常玩梗、合理讨论、普通应援不算尬语，宁漏勿冤。
+
+弹幕列表：
+{chr(10).join(lines)}
+
+请严格只输出一个 JSON 数组，每个元素对应一条判定（只输出判为尬语的条目）：
+[{{"i": 编号, "category": "中二抒情|尬夸捧杀|引战阴阳", "severity": 1到3的整数, "reason": "10字内理由"}}]
+没有尬语就输出 []。不要输出任何 JSON 之外的内容。"""
+
+
+def _parse_verdicts(raw_text: str) -> list[dict]:
+    """从 LLM 响应提取 JSON 数组（容错：截取首个 [ 到末个 ]）"""
+    left, right = raw_text.find("["), raw_text.rfind("]")
+    if left == -1 or right <= left:
+        return []
+    try:
+        data = json.loads(raw_text[left:right + 1])
+    except json.JSONDecodeError:
+        return []
+    return [v for v in data if isinstance(v, dict) and "i" in v]
+
+
+def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dict],
+                          video_info: dict) -> dict[str, dict]:
+    """
+    尬语检测主入口
+
+    Returns:
+        {mid_hash: {
+            "count": int,            # 该发送者被判尬语的去重内容条数
+            "max_severity": int,     # 最高严重度 1-3
+            "categories": [str],     # 涉及的尬语类别
+            "examples": [{content, category, severity, reason}],  # 至多5条代表原文
+        }}
+        未配置 Key / 全部批次失败 / 无尬语时为相应子集或空 dict
+    """
+    if not LLM_API_KEY:
+        print("[尬语] 未配置 LLM_API_KEY，跳过尬语检测")
+        return {}
+
+    items = _dedup_contents(danmaku_list)
+    if not items:
+        return {}
+
+    # 内容 -> 发送者集合（同一内容可能被多人发送，各自归属）
+    content_senders: dict[str, set] = {}
+    for mid_hash, group in sender_groups.items():
+        for c in group.get("contents", []):
+            content_senders.setdefault((c or "").strip(), set()).add(mid_hash)
+
+    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    title = video_info.get("title", "未知视频")
+    verdicts = []
+    batches = [items[i:i + CRINGE_BATCH_SIZE] for i in range(0, len(items), CRINGE_BATCH_SIZE)]
+    failed = 0
+    for bi, batch in enumerate(batches, 1):
+        start_idx = (bi - 1) * CRINGE_BATCH_SIZE
+        print(f"[尬语] 判定 {bi}/{len(batches)} 批（{len(batch)} 条，LLM请求中）...")
+        try:
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": _build_prompt(batch, start_idx, title)}],
+                max_tokens=LLM_MAX_TOKENS,
+                temperature=0.3,  # 判定类任务低温，减少格式漂移
+            )
+            raw = resp.choices[0].message.content or ""
+        except Exception as e:
+            print(f"[尬语] 警告: 批次 {bi} 请求失败（{e}），跳过该批")
+            failed += 1
+            continue
+        batch_verdicts = _parse_verdicts(raw)
+        if not batch_verdicts and raw.strip() not in ("", "[]"):
+            print(f"[尬语] 警告: 批次 {bi} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
+        for v in batch_verdicts:
+            idx = v.get("i")
+            if isinstance(idx, int) and 0 <= idx < len(items) and v.get("category") in CRINGE_CATEGORIES:
+                v["_content"] = items[idx]["content"]
+                verdicts.append(v)
+        print(f"[尬语] 批次 {bi}: 判出 {len(batch_verdicts)} 条尬语")
+
+    if failed == len(batches):
+        print("[尬语] 警告: 全部批次失败，尬语检测降级为空")
+        return {}
+
+    # 按发送者聚合
+    results: dict[str, dict] = {}
+    for v in verdicts:
+        content = v["_content"]
+        for mid_hash in content_senders.get(content, ()):
+            ent = results.setdefault(mid_hash, {"count": 0, "max_severity": 0,
+                                                "categories": [], "examples": []})
+            ent["count"] += 1
+            sev = v.get("severity", 1)
+            ent["max_severity"] = max(ent["max_severity"], sev if isinstance(sev, int) else 1)
+            cat = v["category"]
+            if cat not in ent["categories"]:
+                ent["categories"].append(cat)
+            if len(ent["examples"]) < 5:
+                ent["examples"].append({
+                    "content": content, "category": cat,
+                    "severity": sev, "reason": v.get("reason", ""),
+                })
+
+    print(f"[尬语] 检测完成: {len(verdicts)} 条尬语，涉及 {len(results)} 个发送者")
+    return results
