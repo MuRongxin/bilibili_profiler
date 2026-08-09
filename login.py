@@ -18,6 +18,9 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
+# 强制行缓冲：输出被重定向/管道时也能实时看到进度（默认块缓冲会长时间无输出）
+sys.stdout.reconfigure(line_buffering=True)
+
 from auth import get_qrcode, poll_qrcode, save_cookie, verify_cookie, load_cookie, COOKIE_PATH
 from api_client import BiliAPIClient
 

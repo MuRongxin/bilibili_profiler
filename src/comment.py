@@ -59,6 +59,7 @@ def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
     if rcount <= len(preview):
         return preview
 
+    print(f"[Comment] 补采子评论 (root={root_rpid} 共{rcount}条)...")
     fetched = []
     for pn in range(1, COMMENT_REPLY_MAX_PAGES + 1):
         data = client.get(COMMENT_REPLY_URL, params={
@@ -161,6 +162,7 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list
         next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
 
         all_comments.extend(_collect_page(new_replies, oid, client))
+        print(f"[Comment] 第 {page}/{max_pages} 页: +{len(new_replies)} 条主评论（累计 {len(all_comments)} 条含子评论）")
 
         if cursor.get("is_end", False) or not next_offset:
             break
@@ -197,6 +199,7 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int) -> l
             break
 
         all_comments.extend(_collect_page(replies, oid, client))
+        print(f"[Comment] 旧接口第 {page}/{max_pages} 页: +{len(replies)} 条主评论（累计 {len(all_comments)} 条含子评论）")
 
         cursor = page_data.get("cursor") or {}
         next_page = cursor.get("next", 0)

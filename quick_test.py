@@ -6,6 +6,9 @@ import sys, os
 import argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
+# 强制行缓冲：输出被重定向/管道时也能实时看到进度（默认块缓冲会长时间无输出）
+sys.stdout.reconfigure(line_buffering=True)
+
 from config import LLM_API_KEY, HISTORY_DANMAKU_ENABLED
 from auth import get_auth_client
 from danmaku import collect_danmaku_data

@@ -45,6 +45,7 @@ class BiliAPIClient:
         self._risk_apis = {
             "relation/followings", "relation/followers",
             "space/wbi/arc/search", "polymer/web-dynamic",
+            "space/wbi/acc/info",
         }
 
     def _is_risk_api(self, url: str) -> bool:
@@ -187,11 +188,20 @@ class BiliAPIClient:
                     if attempt < MAX_RETRY - 1:
                         self._wbi_key = None
                         self._wbi_key_date = None
-                        # 退避后再重发，避免连续重发同一无效请求加重风控
-                        time.sleep(RETRY_BACKOFF)
+                        if attempt == 0:
+                            # 首次：按真签名失效处理，短退避后重签重发
+                            time.sleep(RETRY_BACKOFF)
+                        else:
+                            # 重签后仍 -352/-403：实为风控拦截（与签名无关，实测重签无效），
+                            # 与 -412 同等处理：全局冷却后再做最后一次尝试
+                            wait = RISK_COOLDOWN + random.uniform(0, 60)
+                            # 记录全局冷却截止时刻，其他线程在 _sleep_if_needed 中一起等待
+                            self._risk_cooldown_until = time.time() + wait
+                            print(f"[API] 重签后仍 {data.get('code')}，判定为风控，冷却 {wait:.0f} 秒后重试...")
+                            time.sleep(wait)
                         params = self._sign_wbi(dict(params))
                         continue
-                    return {"code": data["code"], "message": "WBI签名失效，重试已耗尽"}
+                    return {"code": data["code"], "message": "WBI签名失效/风控拦截，重试已耗尽"}
                 return data
             except (requests.Timeout, requests.ConnectionError, ValueError) as e:
                 # ValueError 含 resp.json() 解析失败（风控 HTML 错误页等非 JSON 响应）

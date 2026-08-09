@@ -217,6 +217,7 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             fetched_days += 1
             month_count += len(dms)
             all_danmaku.extend(dms)
+            print(f"[历史弹幕] {date}: {len(dms)} 条（第 {fetched_days} 天，累计 {len(all_danmaku)} 条）")
         print(f"[历史弹幕] {month}: {len(dates)} 天有弹幕，累计 {len(all_danmaku)} 条")
 
     print(f"[历史弹幕] 共采集 {fetched_days} 天，{len(all_danmaku)} 条历史弹幕")

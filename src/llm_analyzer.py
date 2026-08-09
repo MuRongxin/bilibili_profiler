@@ -138,7 +138,7 @@ class LLMAnalyzer:
             batch = profiles[i:i + batch_size]
             batch_num = i // batch_size + 1
             total_batches = (len(profiles) + batch_size - 1) // batch_size
-            print(f"  批次 {batch_num}/{total_batches}: 分析 {len(batch)} 人...")
+            print(f"  批次 {batch_num}/{total_batches}: 分析 {len(batch)} 人（LLM请求中，可能需要数十秒）...")
 
             try:
                 per_user = self._analyze_batch(batch, video_info)

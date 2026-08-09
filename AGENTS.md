@@ -37,7 +37,7 @@ python quick_test.py [BV号] [--top N]  # 快速分析：只分析刷屏得分�
 src/
 ├── main.py              # 主控流程：登录→弹幕(实时+历史)→评论→UID解析→刷屏检测→用户采集→画像分析→LLM分析→报告
 ├── config.py            # 全部配置常量：API 端点、限速/重试、采集翻页上限、LLM 配置（含 API Key，已被 .gitignore 排除）
-├── api_client.py        # BiliAPIClient：HTTP 封装（线程安全限速 0.6–1.0s、重试退避、-412全局冷却、Cookie、WBI签名、bili_ticket）
+├── api_client.py        # BiliAPIClient：HTTP 封装（线程安全限速 0.6–1.0s、重试退避、-412及重签无效的-352/-403风控全局冷却、Cookie、WBI签名、bili_ticket）
 ├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新
 ├── danmaku.py           # 实时弹幕 XML 解析，按 mid_hash 聚合发送者
 ├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析）

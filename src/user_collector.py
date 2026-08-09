@@ -491,6 +491,8 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
     else:
         user_data["favorite_contents"] = []
 
+    print(f"  [Collect] UID:{uid} 维度1(主页/收藏)完成，采集互动足迹...")
+
     # 维度2：互动足迹
     try:
         user_data["videos"] = get_user_videos(uid, client)
@@ -501,6 +503,8 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
     except Exception:
         user_data["dynamics"] = []
 
+    print(f"  [Collect] UID:{uid} 维度2(互动足迹)完成，采集社交关系...")
+
     # 维度3：社交网络
     try:
         user_data["followings"] = get_followings(uid, client)
@@ -510,6 +514,8 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
         user_data["followers"] = get_followers(uid, client)
     except Exception:
         user_data["followers"] = []
+
+    print(f"  [Collect] UID:{uid} 维度3(社交关系)完成，分析关注偏好/行为模式...")
 
     # UP主关注偏好分析
     try:
