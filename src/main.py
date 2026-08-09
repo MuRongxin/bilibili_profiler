@@ -303,7 +303,7 @@ def phase_spam(bvid: str, sender_groups: dict) -> dict:
 
 def phase_cringe(danmaku_list: list, sender_groups: dict, video_info: dict) -> dict:
     """阶段2.6: 问题弹幕检测（LLM，未配置 Key 或失败时返回空 dict 降级）"""
-    print("\n[Phase 2.6] 弹幕问题内容检测（LLM）...")
+    print("\n[Phase 2.6] 问题弹幕检测（LLM）...")
     try:
         return detect_cringe_danmaku(danmaku_list, sender_groups, video_info)
     except Exception as e:
@@ -439,7 +439,7 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]):
     try:
         analyzer = LLMAnalyzer()
     except Exception as e:
-        print(f"[Phase 7] LLM 分析失败: {e}")
+        print(f"[Phase 7] LLM 初始化失败: {e}")
         return
 
     print("\n[Phase 7] LLM 重点深掘（兴趣分 top K 单人单调用）...")

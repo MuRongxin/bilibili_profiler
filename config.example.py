@@ -83,7 +83,7 @@ SPAM_HIGH_THRESHOLD = (10, 0.7)    # (弹幕数, 重复率)
 SPAM_MEDIUM_THRESHOLD = (5, 0.5)   # (弹幕数, 重复率)
 MAX_ANALYZE_USERS_HARD_CAP = 300   # 动态定员安全上限（兴趣命中者超过时按兴趣分截断）
 LLM_DEEP_TOP_K = 20                # LLM 重点深掘人数（兴趣分 top K 单人单调用）
-CRINGE_BATCH_SIZE = 200            # 尬语检测每批弹幕条数
+CRINGE_BATCH_SIZE = 200            # 问题弹幕检测每批弹幕条数
 
 # ========== LLM 配置 ==========
 # DeepSeek 官方 OpenAI 兼容端点（https://api-docs.deepseek.com）
