@@ -268,6 +268,14 @@ def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
     bvid = video_info.get("bvid", "")
 
     # 用户卡片
+    # 用户卡片按风险等级排序展示：高→中→低；同级按兴趣分（刷屏分/尬语严重度/弹幕数）降序
+    risk_rank = {"高": 0, "中": 1, "低": 2}
+    profiles = sorted(profiles, key=lambda p: (
+        risk_rank.get(p.get("danmaku", {}).get("spam_level", "低"), 2),
+        -p.get("danmaku", {}).get("spam_score", 0.0),
+        -p.get("cringe", {}).get("max_severity", 0),
+        -p.get("danmaku", {}).get("count", 0),
+    ))
     cards_html = "".join(generate_user_card(p) for p in profiles)
 
     # 图表数据
