@@ -89,6 +89,23 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
     if not items:
         return {}
 
+    # 判定结果缓存：同一视频去重内容集合未变 → 直接复用（重跑零 LLM 调用）
+    bvid = video_info.get("bvid", "")
+    cache_key = ""
+    if bvid:
+        digest = hashlib.sha256(
+            json.dumps(items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        cache_key = f"cringe:{bvid}:{digest}"
+        cached = load_llm_cache(cache_key)
+        if cached is not None:
+            try:
+                results = json.loads(cached)
+                print(f"[问题弹幕] 缓存命中（{len(results)} 个发送者），跳过 LLM 判定")
+                return results
+            except json.JSONDecodeError:
+                print("[问题弹幕] 警告: 缓存内容损坏，重新判定")
+
     # 内容 -> 发送者集合（同一内容可能被多人发送，各自归属）
     content_senders: dict[str, set] = {}
     for mid_hash, group in sender_groups.items():
@@ -151,6 +168,9 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
                     "content": content, "category": cat,
                     "severity": sev, "reason": v.get("reason", ""),
                 })
+
+    if cache_key:
+        save_llm_cache(cache_key, json.dumps(results, ensure_ascii=False))
 
     print(f"[问题弹幕] 检测完成: {len(verdicts)} 条问题弹幕，涉及 {len(results)} 个发送者")
     return results
