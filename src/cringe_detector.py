@@ -109,12 +109,14 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
         batch_verdicts = _parse_verdicts(raw)
         if not batch_verdicts and raw.strip() not in ("", "[]"):
             print(f"[尬语] 警告: 批次 {bi} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
+        accepted = 0
         for v in batch_verdicts:
             idx = v.get("i")
             if isinstance(idx, int) and 0 <= idx < len(items) and v.get("category") in CRINGE_CATEGORIES:
                 v["_content"] = items[idx]["content"]
                 verdicts.append(v)
-        print(f"[尬语] 批次 {bi}: 判出 {len(batch_verdicts)} 条尬语")
+                accepted += 1
+        print(f"[尬语] 批次 {bi}: 采纳 {accepted} 条（解析 {len(batch_verdicts)} 条）")
 
     if failed == len(batches):
         print("[尬语] 警告: 全部批次失败，尬语检测降级为空")
@@ -129,7 +131,9 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
                                                 "categories": [], "examples": []})
             ent["count"] += 1
             sev = v.get("severity", 1)
-            ent["max_severity"] = max(ent["max_severity"], sev if isinstance(sev, int) else 1)
+            # 归一化一次、两处复用：挡 bool/字符串/超界值，钳制到 1-3 的 int
+            sev = sev if isinstance(sev, int) and not isinstance(sev, bool) and 1 <= sev <= 3 else 1
+            ent["max_severity"] = max(ent["max_severity"], sev)
             cat = v["category"]
             if cat not in ent["categories"]:
                 ent["categories"].append(cat)
