@@ -13,6 +13,7 @@ from config import LLM_API_KEY, HISTORY_DANMAKU_ENABLED
 from auth import get_auth_client
 from danmaku import collect_danmaku_data
 from spam_detector import batch_detect_spam
+from cringe_detector import detect_cringe_danmaku
 from comment import collect_comment_data
 from uid_resolver import resolve_sender
 from user_collector import collect_user_data
@@ -50,14 +51,16 @@ def main():
 
     print(f"   弹幕: {len(danmaku_list)} 条, 发送者: {len(sender_groups)} 人")
 
-    # 3. 刷屏检测 → 取 Top N
-    print("[3/6] 刷屏检测...")
+    # 3. 刷屏检测 + 尬语检测 → 兴趣分 Top N（对齐主流程兴趣口径）
+    print("[3/6] 刷屏检测 + 尬语检测...")
     spam_results = batch_detect_spam(sender_groups)
+    cringe_results = detect_cringe_danmaku(danmaku_list, sender_groups, video_info) if LLM_API_KEY else {}
     scored = [
         (mid_hash, r["spam_score"], r["spam_level"])
         for mid_hash, r in spam_results.items()
     ]
-    scored.sort(key=lambda x: x[1], reverse=True)
+    scored.sort(key=lambda x: (x[1], cringe_results.get(x[0], {}).get("max_severity", 0)),
+                reverse=True)
     targets = scored[:top_n]
     for i, (mid, score, level) in enumerate(targets, 1):
         grp = sender_groups[mid]
@@ -65,12 +68,18 @@ def main():
 
     # 4. 收集评论
     print("[4/6] 收集评论...")
+    comments = []
     try:
-        _, comment_uid_map, _ = collect_comment_data(video_info.get("aid", 0), client)
+        comments, comment_uid_map, _ = collect_comment_data(video_info.get("aid", 0), client)
     except Exception as e:
         # 对齐主流程 phase_comment：评论采集失败降级为仅用CRC32破解，只警告不中断
         print(f"   评论采集失败 (将仅用CRC32破解): {e}")
         comment_uid_map = {}
+    uid_comments: dict[int, list] = {}
+    for c in comments:
+        uid_comments.setdefault(c["uid"], []).append(c)
+    for lst in uid_comments.values():
+        lst.sort(key=lambda x: x.get("like", 0), reverse=True)
 
     # 5. 逐个解析 + 采集 + 画像 + AI
     profiles = []
@@ -98,9 +107,11 @@ def main():
         spam = spam_results.get(mid_hash, {})
         profile = analyze_profile(user_data, dm_stats, spam)
         profile["collision_risk"] = collision_risk
+        profile["comments"] = uid_comments.get(uid, [])[:10]
+        profile["cringe"] = cringe_results.get(mid_hash, {})
         profiles.append(profile)
 
-    # 6. AI 分析（批量；Key 判断对齐主流程，走 config 含环境变量读取）
+    # 6. AI 分析（粗筛+深掘；Key 判断对齐主流程，走 config 含环境变量读取）
     if profiles and LLM_API_KEY:
         print(f"\n[6/6] AI 画像分析 ({len(profiles)}人)...")
         try:
@@ -110,7 +121,12 @@ def main():
             for p in profiles:
                 uid = p.get("uid")
                 if uid in per_user:
-                    p["ai_analysis"] = per_user[uid]
+                    p["ai_brief"] = per_user[uid]
+            deep = analyzer.analyze_deep(profiles, video_info, top_k=top_n)
+            for p in profiles:
+                uid = p.get("uid")
+                if uid in deep:
+                    p["ai_deep"] = deep[uid]
         except Exception as e:
             print(f"   AI 分析失败: {e}")
 
