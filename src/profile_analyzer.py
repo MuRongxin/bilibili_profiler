@@ -228,13 +228,14 @@ def analyze_profile(user_data: dict, danmaku_stats: dict, spam_stats: dict) -> d
         "top_names": [f.get("name", "") for f in followings[:10]],
     }
 
-    # 视频分析
+    # 视频分析（recent 带 bvid，报告渲染为新标签页超链接）
     videos = user_data.get("videos", [])
     video_analysis = {
         "count": len(videos),
         "total_play": sum(v.get("play", 0) for v in videos),
         "avg_play": sum(v.get("play", 0) for v in videos) / len(videos) if videos else 0,
         "recent_titles": [v.get("title", "") for v in videos],
+        "recent": [{"title": v.get("title", ""), "bvid": v.get("bvid", "")} for v in videos[:3]],
     }
 
     # 动态分析
@@ -294,6 +295,7 @@ def analyze_profile(user_data: dict, danmaku_stats: dict, spam_stats: dict) -> d
             "video_times": danmaku_stats.get("video_times", []),
             "repeat_rate": spam_stats.get("repeat_rate", 0),
             "spam_level": spam_stats.get("spam_level", "低"),
+            "spam_score": spam_stats.get("spam_score", 0.0),
             "spam_reason": spam_stats.get("reason", ""),
         },
     }
