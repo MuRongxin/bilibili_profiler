@@ -54,7 +54,12 @@ def main():
     # 3. 刷屏检测 + 尬语检测 → 兴趣分 Top N（对齐主流程兴趣口径）
     print("[3/6] 刷屏检测 + 尬语检测...")
     spam_results = batch_detect_spam(sender_groups)
-    cringe_results = detect_cringe_danmaku(danmaku_list, sender_groups, video_info) if LLM_API_KEY else {}
+    try:
+        cringe_results = detect_cringe_danmaku(danmaku_list, sender_groups, video_info) if LLM_API_KEY else {}
+    except Exception as e:
+        # 对齐主流程 phase_cringe：尬语检测失败只警告不中断，降级为空结果
+        print(f"   尬语检测失败（{e}），降级跳过")
+        cringe_results = {}
     scored = [
         (mid_hash, r["spam_score"], r["spam_level"])
         for mid_hash, r in spam_results.items()

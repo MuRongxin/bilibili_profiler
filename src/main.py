@@ -311,9 +311,9 @@ def phase_cringe(danmaku_list: list, sender_groups: dict, video_info: dict) -> d
         return {}
 
 
-def phase_collect_users(resolved: dict, client, force: bool = False):
-    """阶段5: 深度采集用户数据（名单已由阶段4兴趣定员，此处不再设限；
-    成功立即落库可断点续采；force=True 跳过缓存强制重采）"""
+def phase_collect_users(resolved: dict, client, max_users: int | None = None, force: bool = False):
+    """阶段5: 深度采集用户数据（名单已由阶段4兴趣定员；max_users 为手动硬上限
+    （--max-users 传入时），None 不截断；成功立即落库可断点续采；force=True 跳过缓存强制重采）"""
     print("\n[Phase 5/6] 深度采集用户信息...")
 
     # 筛选需要采集的用户（有UID且置信度 acceptable）
@@ -324,7 +324,7 @@ def phase_collect_users(resolved: dict, client, force: bool = False):
         if uid and confidence in ("高", "中"):
             uids_to_collect.append((mid_hash, uid))
 
-    # 按弹幕数量降序（名单已由阶段4兴趣定员，此处不再截断）
+    # 按弹幕数量降序（名单已由阶段4兴趣定员；仅在显式传入 max_users 时按上限截断）
     # 这里我们没法直接排序，因为resolved没有原始count，但我们可以 trust danmaku_count
     uids_to_collect.sort(key=lambda x: resolved[x[0]]["danmaku_count"], reverse=True)
 
@@ -340,10 +340,10 @@ def phase_collect_users(resolved: dict, client, force: bool = False):
     skipped_dup = len(uids_to_collect) - len(deduped)
     if skipped_dup > 0:
         print(f"[Phase 5] 去重: {skipped_dup} 个 mid_hash 指向重复 UID，合并采集")
-    uids_to_collect = deduped
+    uids_to_collect = deduped[:max_users] if max_users is not None else deduped
 
     total = len(uids_to_collect)
-    print(f"[Phase 5] 需采集用户: {total} 人")
+    print(f"[Phase 5] 需采集用户: {total} 人" + (f" (上限 {max_users})" if max_users is not None else ""))
 
     user_data_map = {}
     processed = set()
@@ -437,8 +437,12 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]):
 
     try:
         analyzer = LLMAnalyzer()
+    except Exception as e:
+        print(f"[Phase 7] LLM 分析失败: {e}")
+        return
 
-        print("\n[Phase 7a] LLM 批量粗筛（全员标签+定性）...")
+    print("\n[Phase 7a] LLM 批量粗筛（全员标签+定性）...")
+    try:
         brief = analyzer.analyze(profiles, video_info)
         per_user = brief.get("per_user", {})
         for p in profiles:
@@ -446,8 +450,11 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]):
             if uid in per_user:
                 p["ai_brief"] = per_user[uid]
         print(f"[Phase 7a] 完成: {len(per_user)}/{len(profiles)} 人生成粗筛画像")
+    except Exception as e:
+        print(f"[Phase 7a] LLM 分析失败: {e}")
 
-        print("\n[Phase 7b] LLM 重点深掘（兴趣分 top K 单人单调用）...")
+    print("\n[Phase 7b] LLM 重点深掘（兴趣分 top K 单人单调用）...")
+    try:
         deep = analyzer.analyze_deep(profiles, video_info)
         for p in profiles:
             uid = p.get("uid")
@@ -455,7 +462,7 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]):
                 p["ai_deep"] = deep[uid]
         print(f"[Phase 7b] 完成: {len(deep)} 人生成深度画像")
     except Exception as e:
-        print(f"[Phase 7] LLM 分析失败: {e}")
+        print(f"[Phase 7b] LLM 分析失败: {e}")
 
 
 def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
@@ -514,7 +521,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
             resolved[mid_hash]["cringe"] = cringe_results[mid_hash]
 
     # 阶段5: 用户采集
-    user_data_map = phase_collect_users(resolved, client, force=force)
+    user_data_map = phase_collect_users(resolved, client, max_users=max_users, force=force)
 
     # 阶段6: 画像分析（评论IP属地/本视频评论/尬语在此贯通进画像）
     profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups,
