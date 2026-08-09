@@ -1,19 +1,24 @@
 """
-尬语检测（LLM 判定）
+问题弹幕检测（LLM 判定）
 
-对合并去重后的全部弹幕按批喂给 LLM，判定三类尬语：
-中二抒情 / 尬夸捧杀 / 引战阴阳（spec 决策，不含"无关自我表演"）。
-按发送者聚合输出，驱动兴趣分选人与报告尬语榜。
+对合并去重后的全部弹幕按批喂给 LLM，判定七类问题弹幕：
+中二抒情 / 尬夸捧杀 / 引战阴阳 / 人身攻击 / 恶意剧透 / 广告引流 / 键政敏感。
+按发送者聚合输出，驱动兴趣分选人与报告问题弹幕榜。
 未配置 LLM_API_KEY 或全部批次失败时返回空 dict（降级不中断）。
+
+历史说明：模块与函数名沿用 cringe（尬语）命名是兼容旧调用方的最小改动，
+实际判定范围已扩展为"问题弹幕"。
 """
+import hashlib
 import json
 
 from openai import OpenAI
 
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, CRINGE_BATCH_SIZE
+from storage import load_llm_cache, save_llm_cache
 
-# 尬语类别（与 spec 一致；prompt 与聚合均引用，勿散落硬编码字符串）
-CRINGE_CATEGORIES = ["中二抒情", "尬夸捧杀", "引战阴阳"]
+# 问题弹幕类别（与 spec 一致；prompt 与聚合均引用，勿散落硬编码字符串）
+PROBLEM_CATEGORIES = ["中二抒情", "尬夸捧杀", "引战阴阳", "人身攻击", "恶意剧透", "广告引流", "键政敏感"]
 
 
 def _dedup_contents(danmaku_list: list[dict]) -> list[dict]:
@@ -29,21 +34,25 @@ def _dedup_contents(danmaku_list: list[dict]) -> list[dict]:
 
 
 def _build_prompt(batch: list[dict], start_idx: int, video_title: str) -> str:
-    """构建单批尬语判定 prompt（编号为全局下标，便于跨批映射）"""
+    """构建单批问题弹幕判定 prompt（编号为全局下标，便于跨批映射）"""
     lines = [f'{start_idx + i}. {it["content"]}（出现{it["count"]}次）' for i, it in enumerate(batch)]
     return f"""你是中文互联网内容审核专家。以下是B站视频《{video_title}》的弹幕列表（已按内容去重）。
-请逐条判定是否属于以下三类"尬语"之一：
+请逐条判定是否属于以下七类"问题弹幕"之一：
 - 中二抒情：咯噔文学、疼痛文学、过度深情、自我感动式抒情
 - 尬夸捧杀：无脑吹、饭圈式夸张应援、明显违心的吹捧
 - 引战阴阳：拉踩、对线、反串、阴阳怪气等攻击性内容
-正常玩梗、合理讨论、普通应援不算尬语，宁漏勿冤。
+- 人身攻击：辱骂、诅咒、攻击其他观众/UP主/视频角色
+- 恶意剧透：泄露剧情关键信息、结局、反转
+- 广告引流：打广告、推广、引流到其他平台或商品
+- 键政敏感：借题发挥的政治隐喻、键政引战
+正常玩梗、合理讨论、普通应援不算问题弹幕，宁漏勿冤。
 
 弹幕列表：
 {chr(10).join(lines)}
 
-请严格只输出一个 JSON 数组，每个元素对应一条判定（只输出判为尬语的条目）：
-[{{"i": 编号, "category": "中二抒情|尬夸捧杀|引战阴阳", "severity": 1到3的整数, "reason": "10字内理由"}}]
-没有尬语就输出 []。不要输出任何 JSON 之外的内容。"""
+请严格只输出一个 JSON 数组，每个元素对应一条判定（只输出判为问题弹幕的条目）：
+[{{"i": 编号, "category": "中二抒情|尬夸捧杀|引战阴阳|人身攻击|恶意剧透|广告引流|键政敏感", "severity": 1到3的整数, "reason": "10字内理由"}}]
+没有问题弹幕就输出 []。不要输出任何 JSON 之外的内容。"""
 
 
 def _parse_verdicts(raw_text: str) -> list[dict]:
@@ -61,19 +70,19 @@ def _parse_verdicts(raw_text: str) -> list[dict]:
 def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dict],
                           video_info: dict) -> dict[str, dict]:
     """
-    尬语检测主入口
+    问题弹幕检测主入口
 
     Returns:
         {mid_hash: {
-            "count": int,            # 该发送者被判尬语的去重内容条数
+            "count": int,            # 该发送者被判问题弹幕的去重内容条数
             "max_severity": int,     # 最高严重度 1-3
-            "categories": [str],     # 涉及的尬语类别
+            "categories": [str],     # 涉及的问题弹幕类别
             "examples": [{content, category, severity, reason}],  # 至多5条代表原文
         }}
-        未配置 Key / 全部批次失败 / 无尬语时为相应子集或空 dict
+        未配置 Key / 全部批次失败 / 无问题弹幕时为相应子集或空 dict
     """
     if not LLM_API_KEY:
-        print("[尬语] 未配置 LLM_API_KEY，跳过尬语检测")
+        print("[问题弹幕] 未配置 LLM_API_KEY，跳过问题弹幕检测")
         return {}
 
     items = _dedup_contents(danmaku_list)
@@ -93,7 +102,7 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
     failed = 0
     for bi, batch in enumerate(batches, 1):
         start_idx = (bi - 1) * CRINGE_BATCH_SIZE
-        print(f"[尬语] 判定 {bi}/{len(batches)} 批（{len(batch)} 条，LLM请求中）...")
+        print(f"[问题弹幕] 判定 {bi}/{len(batches)} 批（{len(batch)} 条，LLM请求中）...")
         try:
             resp = client.chat.completions.create(
                 model=LLM_MODEL,
@@ -103,23 +112,23 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
             )
             raw = resp.choices[0].message.content or ""
         except Exception as e:
-            print(f"[尬语] 警告: 批次 {bi} 请求失败（{e}），跳过该批")
+            print(f"[问题弹幕] 警告: 批次 {bi} 请求失败（{e}），跳过该批")
             failed += 1
             continue
         batch_verdicts = _parse_verdicts(raw)
         if not batch_verdicts and raw.strip() not in ("", "[]"):
-            print(f"[尬语] 警告: 批次 {bi} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
+            print(f"[问题弹幕] 警告: 批次 {bi} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
         accepted = 0
         for v in batch_verdicts:
             idx = v.get("i")
-            if isinstance(idx, int) and 0 <= idx < len(items) and v.get("category") in CRINGE_CATEGORIES:
+            if isinstance(idx, int) and 0 <= idx < len(items) and v.get("category") in PROBLEM_CATEGORIES:
                 v["_content"] = items[idx]["content"]
                 verdicts.append(v)
                 accepted += 1
-        print(f"[尬语] 批次 {bi}: 采纳 {accepted} 条（解析 {len(batch_verdicts)} 条）")
+        print(f"[问题弹幕] 批次 {bi}: 采纳 {accepted} 条（解析 {len(batch_verdicts)} 条）")
 
     if failed == len(batches):
-        print("[尬语] 警告: 全部批次失败，尬语检测降级为空")
+        print("[问题弹幕] 警告: 全部批次失败，问题弹幕检测降级为空")
         return {}
 
     # 按发送者聚合
@@ -143,5 +152,5 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
                     "severity": sev, "reason": v.get("reason", ""),
                 })
 
-    print(f"[尬语] 检测完成: {len(verdicts)} 条尬语，涉及 {len(results)} 个发送者")
+    print(f"[问题弹幕] 检测完成: {len(verdicts)} 条问题弹幕，涉及 {len(results)} 个发送者")
     return results
