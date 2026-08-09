@@ -144,7 +144,7 @@ def save_sender(bvid: str, mid_hash: str, uid: int | None, confidence: str,
 
 
 def update_sender_spam(bvid: str, mid_hash: str, spam_level: str, spam_score: float):
-    """回写发送者的刷屏检测结果（刷屏检测在 save_sender 之后运行，需单独 UPDATE）"""
+    """回写发送者的刷屏检测结果（仅 UPDATE 已存在的行；未落库的行不受影响）"""
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         cursor.execute('''

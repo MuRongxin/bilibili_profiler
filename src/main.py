@@ -214,9 +214,12 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     print(f"[Phase 4] 兴趣命中 {len(must)} 人（中/高刷屏或尬语），"
           f"截取 {len(to_resolve_hashes)} 人解析（上限 {cap}）")
 
-    skipped = len(unresolved) - len(to_resolve_hashes)
-    if skipped > 0:
-        print(f"[Phase 4] 跳过 {skipped} 个低兴趣发送者（未命中刷屏/尬语阈值）")
+    truncated = len(must) - len(to_resolve_hashes)
+    if truncated > 0:
+        print(f"[Phase 4] 上限截断: {truncated} 个兴趣命中者超出上限 {cap}，按兴趣分靠后跳过")
+    not_hit = len(unresolved) - len(must)
+    if not_hit > 0:
+        print(f"[Phase 4] 跳过 {not_hit} 个低兴趣发送者（未命中刷屏/尬语阈值）")
 
     to_resolve = [(h, unresolved[h]) for h in to_resolve_hashes]
 
@@ -237,8 +240,8 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                 method=info["method"],
                 danmaku_count=info["danmaku_count"],
                 contents=info["contents"],
-                spam_level=info.get("spam_level", "低"),
-                spam_score=0.0
+                spam_level=spam_results.get(mid_hash, {}).get("spam_level", "低"),
+                spam_score=spam_results.get(mid_hash, {}).get("spam_score", 0.0)
             )
             # 沉淀到全局映射库：多候选取最小的碰撞风险条目不入库（spec 4.2）
             if info["uid"] is not None and not (
@@ -284,14 +287,14 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
 
 def phase_spam(bvid: str, sender_groups: dict) -> dict:
     """阶段2.5: 刷屏检测（提前到解析前，以 spam_score 驱动兴趣分选人；
-    检测完成后将真实结果回写数据库，修正阶段4落库时的占位值）"""
+    检测完成后回写库中已存在行的真实结果；本轮新解析行由阶段4 save_sender 直接写入真实值）"""
     print("\n[Phase 2.5] 刷屏行为检测...")
     spam_results = batch_detect_spam(sender_groups)
     high_spam = sum(1 for v in spam_results.values() if v["spam_level"] == "高")
     med_spam = sum(1 for v in spam_results.values() if v["spam_level"] == "中")
     print(f"[Phase 2.5] 检测完成: 高风险 {high_spam} | 中风险 {med_spam}")
 
-    # 回写所有 sender 的真实检测结果（阶段4 save_sender 时检测尚未运行，库中是 "低"/0.0 占位值）
+    # 回写库中已存在行的真实检测结果（缓存行；本轮新解析行由阶段4 save_sender 直接写入真实值，此处 UPDATE 对其命中 0 行无影响）
     for mid_hash, result in spam_results.items():
         update_sender_spam(bvid, mid_hash, result["spam_level"], result["spam_score"])
     print(f"[Phase 2.5] 已回写 {len(spam_results)} 个发送者的刷屏检测结果")
