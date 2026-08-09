@@ -234,7 +234,6 @@ def analyze_profile(user_data: dict, danmaku_stats: dict, spam_stats: dict) -> d
         "count": len(videos),
         "total_play": sum(v.get("play", 0) for v in videos),
         "avg_play": sum(v.get("play", 0) for v in videos) / len(videos) if videos else 0,
-        "recent_titles": [v.get("title", "") for v in videos],
         "recent": [{"title": v.get("title", ""), "bvid": v.get("bvid", "")} for v in videos[:3]],
     }
 

@@ -80,10 +80,10 @@ def generate_user_card(profile: dict) -> str:
     # IP属地（格式 "IP属地：江苏"，可能为空）
     ip_location = profile.get("ip_location", "")
 
-    # 视频
+    # 视频（recent 带 bvid，渲染为新标签页超链接；过滤空 bvid 防死链）
     vid = profile.get("video", {})
     vid_count = vid.get("count", 0)
-    vid_titles = vid.get("recent_titles", [])[:3]
+    vid_recent = [v for v in vid.get("recent", [])[:3] if v.get("bvid")]
 
     # 动态
     dyn = profile.get("dynamic", {})
@@ -136,8 +136,10 @@ def generate_user_card(profile: dict) -> str:
     bangumi = profile.get("bangumi_titles", [])[:3]
     dramas = profile.get("drama_titles", [])[:3]
 
-    # AI画像分析
-    ai_text = profile.get("ai_analysis", "")
+    # AI画像分析（深掘优先，粗筛兜底，兼容旧字段）
+    ai_deep = profile.get("ai_deep", "")
+    ai_text = ai_deep or profile.get("ai_brief", "") or profile.get("ai_analysis", "")
+    ai_heading = "🤖 AI 深度画像" if ai_deep else "🤖 AI 粗筛画像"
     ai_section = ""
     if ai_text:
         # 简单渲染：先转义，再用正则把成对的 **粗体** 渲染为 <strong>
@@ -147,8 +149,30 @@ def generate_user_card(profile: dict) -> str:
         ai_html = "".join(f"<p>{p}</p>" if p.strip() else "<br>" for p in paragraphs)
         ai_section = f'''
             <div class="section ai-section">
-                <h4>🤖 AI 深度画像</h4>
+                <h4>{ai_heading}</h4>
                 <div class="ai-text">{ai_html}</div>
+            </div>'''
+
+    # 尬语内联标记（弹幕行为行尾）
+    cringe = profile.get("cringe", {})
+    cringe_note = (f'，其中尬语 {cringe["count"]} 条（{"、".join(cringe.get("categories", []))}）'
+                   if cringe.get("count") else "")
+
+    # 本视频评论小节（按点赞降序，至多10条，来自阶段6注入；is_sub 子评论加前缀标注）
+    comments = profile.get("comments", [])
+    cmt_section = ""
+    if comments:
+        items = []
+        for c in comments:
+            ts = c.get("ctime", 0)
+            date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
+            sub_mark = '<span class="dm-time">回复</span> ' if c.get("is_sub") else ""
+            items.append(f"<li>{sub_mark}{esc(c.get('content',''))} "
+                         f"<span class=\"dm-time\">👍{c.get('like',0)} {date}</span></li>")
+        cmt_section = f'''
+            <div class="section">
+                <h4>💬 TA 在本视频的评论</h4>
+                <ol class="dm-list">{"".join(items)}</ol>
             </div>'''
 
     # 头像 (可点击跳转B站主页)
@@ -183,10 +207,11 @@ def generate_user_card(profile: dict) -> str:
         <div class="card-body">
             <div class="section">
                 <h4>🎤 弹幕行为 <span class="spam-badge {spam_class}">{esc(spam_level)}风险</span></h4>
-                <div class="detail">共发送 {esc(dm_count)} 条弹幕</div>
+                <div class="detail">共发送 {esc(dm_count)} 条弹幕{cringe_note}</div>
                 <ol class="dm-list">{dm_list}</ol>
                 {f'<div class="reason">判定: {esc(spam_reason)}</div>' if spam_reason else ''}
             </div>
+            {cmt_section}
             <div class="section">
                 <h4>👤 基础信息</h4>
                 <div class="info-grid">
@@ -200,7 +225,7 @@ def generate_user_card(profile: dict) -> str:
 
             {f'''<div class="section"><h4>📁 收藏夹 ({esc(fav.get("folder_count",0))}个)</h4><div class="samples">{''.join(f'<span class="sample">{esc(n)}</span>' for n in fav_names)}</div></div>''' if fav_names else ''}
 
-            {f'''<div class="section"><h4>🎬 最近投稿</h4><ul class="list">{''.join(f'<li>{esc(t)}</li>' for t in vid_titles)}</ul></div>''' if vid_titles else ''}
+            {f'''<div class="section"><h4>🎬 最近投稿</h4><ul class="list">{''.join(f'<li><a href="https://www.bilibili.com/video/{esc(v.get("bvid",""))}" target="_blank" rel="noopener">{esc(v.get("title",""))}</a></li>' for v in vid_recent)}</ul></div>''' if vid_recent else ''}
 
             {fol_section}
 
@@ -255,8 +280,8 @@ def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
     tag_labels = list(stats["top_tags"].keys())[:10]
     tag_data = list(stats["top_tags"].values())[:10]
 
-    # 统计AI画像覆盖
-    ai_count = sum(1 for p in profiles if p.get("ai_analysis"))
+    # 统计AI画像覆盖（深掘/粗筛/旧字段任一存在即计数）
+    ai_count = sum(1 for p in profiles if p.get("ai_deep") or p.get("ai_brief") or p.get("ai_analysis"))
 
     # 地域分布：从 ip_location（格式 "IP属地：江苏"）提取省份，Top10 + 其他
     region_counts = Counter()
@@ -305,6 +330,33 @@ new Chart(document.getElementById('regionChart'),{{
                 up_id = f"up_{uid}_{i}"
                 up_wc_entries.append(f'{js_json(up_id)}:{js_json(wf)}')
     up_wc_js = "{" + ",".join(up_wc_entries) + "}"
+
+    # 尬语榜：按发送者聚合（最高严重度、条数降序），无命中时不渲染
+    cringe_entries = [p for p in profiles if p.get("cringe", {}).get("count", 0) >= 1]
+    cringe_entries.sort(key=lambda p: (p["cringe"].get("max_severity", 0), p["cringe"]["count"]),
+                        reverse=True)
+    cringe_board_html = ""
+    if cringe_entries:
+        rows = []
+        for p in cringe_entries:
+            cr = p["cringe"]
+            example = (cr.get("examples") or [{}])[0]
+            rows.append(
+                f'<tr><td><a href="https://space.bilibili.com/{esc(p.get("uid", 0))}" target="_blank" rel="noopener">{esc(p.get("name", "未知"))}</a></td>'
+                f'<td>{esc(cr["count"])}</td>'
+                f'<td>{esc("、".join(cr.get("categories", [])))}</td>'
+                f'<td>{esc(cr.get("max_severity", 0))}</td>'
+                f'<td>{esc(example.get("content", ""))}<br>'
+                f'<span class="cringe-reason">{esc(example.get("category", ""))}: {esc(example.get("reason", ""))}</span></td></tr>'
+            )
+        cringe_board_html = f'''
+    <div class="cringe-board">
+        <h3>🤡 弹幕尬语榜（{len(cringe_entries)} 人命中）</h3>
+        <table>
+            <thead><tr><th>用户</th><th>尬语条数</th><th>类别</th><th>最高严重度</th><th>代表原文</th></tr></thead>
+            <tbody>{"".join(rows)}</tbody>
+        </table>
+    </div>'''
 
     html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -396,6 +448,15 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
 .ai-text strong {{ color:#333; }}
 .ai-text br {{ display:block; content:''; margin:2px 0; }}
 
+/* 尬语榜 */
+.cringe-board {{ background:white; padding:25px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); margin-bottom:30px; }}
+.cringe-board h3 {{ font-size:17px; margin-bottom:15px; color:#555; }}
+.cringe-board table {{ width:100%; border-collapse:collapse; font-size:14px; }}
+.cringe-board th, .cringe-board td {{ text-align:left; padding:8px 10px; border-bottom:1px solid #f0f0f0; vertical-align:top; }}
+.cringe-board th {{ color:#999; font-weight:500; }}
+.cringe-board a {{ color:#00a1d6; text-decoration:none; }}
+.cringe-reason {{ font-size:12px; color:#999; }}
+
 /* 关注偏好 */
 .fol-section {{ background:#f0f4ff; border-radius:8px; padding:14px 16px; }}
 .fol-stats {{ display:flex; gap:16px; flex-wrap:wrap; font-size:14px; color:#555; margin-bottom:10px; }}
@@ -446,6 +507,8 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
         <div class="chart-card"><h3>用户标签 Top10</h3><canvas id="tagChart"></canvas></div>
         {region_chart_html}
     </div>
+
+    {cringe_board_html}
 
     <div class="filter-bar">
         <button class="filter-btn active" onclick="filter('all', this)">全部</button>
