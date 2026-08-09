@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-**B站弹幕发送者用户画像分析系统**：输入视频 BV 号，采集该视频的全部弹幕，破解弹幕发送者的匿名 `mid_hash`（MITM 中间相遇 CRC32 反查 + 评论/充电名单/互动弹幕明文 UID 交叉验证 + 全局映射库），再对每个发送者做四维度深度画像（主页信息、互动足迹、社交关系、行为模式），可选调用 LLM 逐人生成 AI 分析，最终输出交互式 HTML 报告（Chart.js）。
+**B站弹幕发送者用户画像分析系统**：输入视频 BV 号，采集该视频的全部弹幕（实时弹幕池 + 历史快照），先做本地刷屏检测 + LLM 尬语检测（中二抒情/尬夸捧杀/引战阴阳），按兴趣分（中/高刷屏或尬语命中）阈值制动态定员，再破解入选发送者的匿名 `mid_hash`（MITM 中间相遇 CRC32 反查 + 评论/充电名单/互动弹幕明文 UID 交叉验证 + 全局映射库），对每个发送者做四维度深度画像（主页信息、互动足迹、社交关系、行为模式），可选调用 LLM 分层生成 AI 分析（全员粗筛 + 兴趣分 top K 单人深掘），最终输出交互式 HTML 报告（Chart.js）。
 
 - 纯 Python 3 项目，无构建系统（无 pyproject.toml / setup.py / package.json），依赖通过 `requirements.txt` 管理。
 - 主要依赖：`requests`（HTTP）、`lxml`（弹幕 XML 解析）、`qrcode` + `pillow`（扫码登录）、`openai`（LLM 客户端）、`pycryptodome`。
@@ -15,10 +15,10 @@ python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 主流程（登录→弹幕→评论→UID解析→刷屏检测→用户采集→画像分析→LLM分析→报告）
+# 主流程（登录→弹幕→刷屏检测→尬语检测→评论→兴趣分UID解析→用户采集→画像分析→LLM分层分析→报告）
 python run.py BV1vu4y1b7Y9                # 分析视频
 python run.py BV1vu4y1b7Y9 --force        # 忽略缓存强制重新分析
-python run.py BV1vu4y1b7Y9 --max-users 50 # 限制最大深度分析用户数
+python run.py BV1vu4y1b7Y9 --max-users 50 # 手动覆盖动态定员（默认阈值命中者全进，安全上限300）
 python run.py --batch videos.txt          # 批量分析（逐行读取BV号，忽略空行与 # 注释行）
 
 # 辅助脚本
@@ -35,7 +35,7 @@ python quick_test.py [BV号] [--top N]  # 快速分析：只分析刷屏得分�
 
 ```
 src/
-├── main.py              # 主控流程：登录→弹幕(实时+历史)→评论→UID解析→刷屏检测→用户采集→画像分析→LLM分析→报告
+├── main.py              # 主控流程：登录→弹幕(实时+历史)→刷屏检测→尬语检测→评论→兴趣分UID解析→用户采集→画像分析→LLM分层分析→报告
 ├── config.py            # 全部配置常量：API 端点、限速/重试、采集翻页上限、LLM 配置（含 API Key，已被 .gitignore 排除）
 ├── api_client.py        # BiliAPIClient：HTTP 封装（线程安全限速 0.6–1.0s、重试退避、-412及重签无效的-352/-403风控全局冷却、Cookie、WBI签名、bili_ticket）
 ├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新
@@ -45,9 +45,10 @@ src/
 ├── uid_resolver.py      # mid_hash 破解：评论/充电名单/互动弹幕/全局库交叉验证 + MITM 反查碰撞消歧
 ├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（10万条内存小表，覆盖全部 ≤10 位 UID，秒级）
 ├── spam_detector.py     # 刷屏检测：只标记风险等级（高/中/低），绝不删除弹幕数据
+├── cringe_detector.py   # LLM 尬语检测（三类判定+发送者聚合，未配置 LLM_API_KEY 自动跳过）
 ├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
-├── llm_analyzer.py      # LLMAnalyzer：调 OpenAI 兼容接口逐人生成 AI 画像（未配置 LLM_API_KEY 时自动跳过）
+├── llm_analyzer.py      # LLMAnalyzer：批量粗筛（全员标签+定性）+ 重点深掘（top K 单人单调用带证据包，未配置 Key 自动跳过）
 ├── up_analyzer.py       # UP 主相关分析
 ├── report.py            # HTML 报告生成（内嵌 Chart.js，输出到 data/reports/）
 ├── exporter.py          # CSV/JSON 数据导出（与 HTML 报告同名前缀）
@@ -61,7 +62,7 @@ src/
 - **限速是硬约束**：B站 API 有风控，`config.py` 中 `REQUEST_DELAY = 0.6` 秒、高风险 API `1.0` 秒，重试最多 3 次指数退避。新增 API 调用必须走 `BiliAPIClient`，不要绕过限速直接发请求。
 - **失败要降级而非中断**：例如评论采集失败时回退为仅用 CRC32 破解；LLM 分析失败只打印警告。单个用户采集异常不得中断整体流水线。
 - **不删除数据**：刷屏检测只标记 `spam_level`，不删除任何弹幕。
-- 采集规模由 `config.py` 中的 `MAX_*` 常量控制（评论 100 页、子评论补采 25 页/条、默认最多深度分析 100 人等），调优时改这里而不是散落在代码里的数字。
+- 采集规模由 `config.py` 中的 `MAX_*` 常量控制（评论 100 页、子评论补采 25 页/条、动态定员安全上限 MAX_ANALYZE_USERS_HARD_CAP=300、深掘 LLM_DEEP_TOP_K=20、尬语批大小 CRINGE_BATCH_SIZE=200 等），调优时改这里而不是散落在代码里的数字。
 - 输出文件：`data/reports/report_{BV号}_{时间}.html`（报告）、`data/profiler.db`（数据库）、`data/cookie.json`（登录态）。
 
 ## 测试说明
