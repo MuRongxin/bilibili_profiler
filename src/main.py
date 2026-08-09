@@ -137,7 +137,7 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                   spam_results: dict | None = None, cringe_results: dict | None = None):
     """阶段4: 解析发送者UID（数据库缓存 + 兴趣分驱动选人）
 
-    选人规则（阈值制动态定员，spec 3）：spam_level∈{高,中} 或 尬语条数≥1 的发送者
+    选人规则（阈值制动态定员，spec 3）：spam_level∈{高,中} 或 问题弹幕≥1 条的发送者
     全部进入解析名单；max_users 为 None 时用 MAX_ANALYZE_USERS_HARD_CAP 兜底截断，
     显式传入 max_users（--max-users）时作为手动硬上限优先。
     """
@@ -194,7 +194,7 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     if retry_failed > 0:
         print(f"[Phase 4] {retry_failed} 个历史解析失败的发送者将重试")
 
-    # 3. 兴趣分驱动选人（阈值制：中/高刷屏 或 有尬语 全进；上限兜底/手动覆盖）
+    # 3. 兴趣分驱动选人（阈值制：中/高刷屏 或 有问题弹幕 全进；上限兜底/手动覆盖）
     spam_results = spam_results or {}
     cringe_results = cringe_results or {}
 
@@ -211,7 +211,7 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
 
     cap = max_users if max_users is not None else MAX_ANALYZE_USERS_HARD_CAP
     to_resolve_hashes = must[:cap]
-    print(f"[Phase 4] 兴趣命中 {len(must)} 人（中/高刷屏或尬语），"
+    print(f"[Phase 4] 兴趣命中 {len(must)} 人（中/高刷屏或问题弹幕），"
           f"截取 {len(to_resolve_hashes)} 人解析（上限 {cap}）")
 
     truncated = len(must) - len(to_resolve_hashes)
@@ -219,7 +219,7 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
         print(f"[Phase 4] 上限截断: {truncated} 个兴趣命中者超出上限 {cap}，按兴趣分靠后跳过")
     not_hit = len(unresolved) - len(must)
     if not_hit > 0:
-        print(f"[Phase 4] 跳过 {not_hit} 个低兴趣发送者（未命中刷屏/尬语阈值）")
+        print(f"[Phase 4] 跳过 {not_hit} 个低兴趣发送者（未命中刷屏/问题弹幕阈值）")
 
     to_resolve = [(h, unresolved[h]) for h in to_resolve_hashes]
 
@@ -302,12 +302,12 @@ def phase_spam(bvid: str, sender_groups: dict) -> dict:
 
 
 def phase_cringe(danmaku_list: list, sender_groups: dict, video_info: dict) -> dict:
-    """阶段2.6: 尬语检测（LLM，未配置 Key 或失败时返回空 dict 降级）"""
-    print("\n[Phase 2.6] 弹幕尬语检测...")
+    """阶段2.6: 问题弹幕检测（LLM，未配置 Key 或失败时返回空 dict 降级）"""
+    print("\n[Phase 2.6] 弹幕问题内容检测（LLM）...")
     try:
         return detect_cringe_danmaku(danmaku_list, sender_groups, video_info)
     except Exception as e:
-        print(f"[Phase 2.6] 警告: 尬语检测失败（{e}），降级跳过")
+        print(f"[Phase 2.6] 警告: 问题弹幕检测失败（{e}），降级跳过")
         return {}
 
 
@@ -415,7 +415,7 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
             profile = analyze_profile(user_data, danmaku_stats, spam)
             # 碰撞风险标记传入报告，供"可能误识别"徽标展示
             profile["collision_risk"] = info.get("collision_risk", False)
-            # 本视频评论（按点赞降序，至多10条）与尬语聚合，供报告展示与 LLM 深掘证据包
+            # 本视频评论（按点赞降序，至多10条）与问题弹幕聚合，供报告展示与 LLM 深掘证据包
             profile["comments"] = uid_comments.get(uid, [])[:10]
             profile["cringe"] = info.get("cringe", {})
             profiles.append(profile)
@@ -430,7 +430,8 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
 
 
 def phase_ai_analysis(video_info: dict, profiles: list[dict]):
-    """阶段7: LLM 分层画像分析（7a 批量粗筛全员 + 7b 重点深掘 top K，结果直接注入 profile）"""
+    """阶段7: LLM 重点深掘（兴趣分 top K 单人单调用，结果直接注入 profile；
+    全员粗筛已砍——命中人数扩大后粗筛是 token 大头，普通用户由规则标签勾画轮廓）"""
     if not LLM_API_KEY:
         print("\n[Phase 7] 跳过 (未在 config.py 或环境变量中设置 LLM_API_KEY)")
         return
@@ -441,28 +442,16 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]):
         print(f"[Phase 7] LLM 分析失败: {e}")
         return
 
-    print("\n[Phase 7a] LLM 批量粗筛（全员标签+定性）...")
-    try:
-        brief = analyzer.analyze(profiles, video_info)
-        per_user = brief.get("per_user", {})
-        for p in profiles:
-            uid = p.get("uid")
-            if uid in per_user:
-                p["ai_brief"] = per_user[uid]
-        print(f"[Phase 7a] 完成: {len(per_user)}/{len(profiles)} 人生成粗筛画像")
-    except Exception as e:
-        print(f"[Phase 7a] LLM 分析失败: {e}")
-
-    print("\n[Phase 7b] LLM 重点深掘（兴趣分 top K 单人单调用）...")
+    print("\n[Phase 7] LLM 重点深掘（兴趣分 top K 单人单调用）...")
     try:
         deep = analyzer.analyze_deep(profiles, video_info)
         for p in profiles:
             uid = p.get("uid")
             if uid in deep:
                 p["ai_deep"] = deep[uid]
-        print(f"[Phase 7b] 完成: {len(deep)} 人生成深度画像")
+        print(f"[Phase 7] 完成: {len(deep)} 人生成深度画像")
     except Exception as e:
-        print(f"[Phase 7b] LLM 分析失败: {e}")
+        print(f"[Phase 7] LLM 分析失败: {e}")
 
 
 def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
@@ -494,7 +483,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
     # 阶段2.5: 刷屏检测（本地，提前到解析前驱动选人）
     spam_results = phase_spam(bvid, sender_groups)
 
-    # 阶段2.6: 尬语检测（LLM，可降级）
+    # 阶段2.6: 问题弹幕检测（LLM，可降级）
     cringe_results = phase_cringe(danmaku_list, sender_groups, video_info)
 
     # 阶段3: 评论 + 充电名单（comment_location_map 为 uid→IP属地，uid_comments 阶段6贯通进画像）
@@ -512,7 +501,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
                              command_uid_map=build_command_uid_map(command_dms),
                              spam_results=spam_results, cringe_results=cringe_results)
 
-    # 合并刷屏/尬语数据到resolved（阶段5置信度过滤与阶段6画像注入均从此处取）
+    # 合并刷屏/问题弹幕数据到resolved（阶段5置信度过滤与阶段6画像注入均从此处取）
     for mid_hash in resolved:
         if mid_hash in spam_results:
             resolved[mid_hash]["spam_level"] = spam_results[mid_hash]["spam_level"]
@@ -523,11 +512,11 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
     # 阶段5: 用户采集
     user_data_map = phase_collect_users(resolved, client, max_users=max_users, force=force)
 
-    # 阶段6: 画像分析（评论IP属地/本视频评论/尬语在此贯通进画像）
+    # 阶段6: 画像分析（评论IP属地/本视频评论/问题弹幕在此贯通进画像）
     profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups,
                              comment_location_map, uid_comments)
 
-    # 阶段7: LLM 分层画像分析（粗筛/深掘结果在 phase 内直接注入 profile）
+    # 阶段7: LLM 重点深掘（结果在 phase 内直接注入 profile）
     phase_ai_analysis(video_info, profiles)
 
     # 生成报告

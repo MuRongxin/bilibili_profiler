@@ -51,14 +51,14 @@ def main():
 
     print(f"   弹幕: {len(danmaku_list)} 条, 发送者: {len(sender_groups)} 人")
 
-    # 3. 刷屏检测 + 尬语检测 → 兴趣分 Top N（对齐主流程兴趣口径）
-    print("[3/6] 刷屏检测 + 尬语检测...")
+    # 3. 刷屏检测 + 问题弹幕检测 → 兴趣分 Top N（对齐主流程兴趣口径）
+    print("[3/6] 刷屏检测 + 问题弹幕检测...")
     spam_results = batch_detect_spam(sender_groups)
     try:
         cringe_results = detect_cringe_danmaku(danmaku_list, sender_groups, video_info) if LLM_API_KEY else {}
     except Exception as e:
-        # 对齐主流程 phase_cringe：尬语检测失败只警告不中断，降级为空结果
-        print(f"   尬语检测失败（{e}），降级跳过")
+        # 对齐主流程 phase_cringe：问题弹幕检测失败只警告不中断，降级为空结果
+        print(f"   问题弹幕检测失败（{e}），降级跳过")
         cringe_results = {}
     scored = [
         (mid_hash, r["spam_score"], r["spam_level"])
@@ -116,17 +116,11 @@ def main():
         profile["cringe"] = cringe_results.get(mid_hash, {})
         profiles.append(profile)
 
-    # 6. AI 分析（粗筛+深掘；Key 判断对齐主流程，走 config 含环境变量读取）
+    # 6. AI 重点深掘（对齐主流程：7a 粗筛已砍，只保留 top K 深掘）
     if profiles and LLM_API_KEY:
-        print(f"\n[6/6] AI 画像分析 ({len(profiles)}人)...")
+        print(f"\n[6/6] AI 重点深掘 ({len(profiles)}人)...")
         try:
             analyzer = LLMAnalyzer()
-            result = analyzer.analyze(profiles, video_info, batch_size=10)
-            per_user = result.get("per_user", {})
-            for p in profiles:
-                uid = p.get("uid")
-                if uid in per_user:
-                    p["ai_brief"] = per_user[uid]
             deep = analyzer.analyze_deep(profiles, video_info, top_k=top_n)
             for p in profiles:
                 uid = p.get("uid")
