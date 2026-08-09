@@ -170,7 +170,11 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
                 })
 
     if cache_key:
-        save_llm_cache(cache_key, json.dumps(results, ensure_ascii=False))
+        if failed > 0:
+            # 部分批次失败时聚合结果不完整，不写缓存避免瞬态波动被冻结复用
+            print(f"[问题弹幕] {failed} 个批次失败，本次结果不写入缓存")
+        else:
+            save_llm_cache(cache_key, json.dumps(results, ensure_ascii=False))
 
     print(f"[问题弹幕] 检测完成: {len(verdicts)} 条问题弹幕，涉及 {len(results)} 个发送者")
     return results
