@@ -20,6 +20,7 @@ from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map
 from uid_resolver import resolve_all_senders, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
 from spam_detector import batch_detect_spam
+from cringe_detector import detect_cringe_danmaku
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
@@ -130,8 +131,16 @@ def phase_comment(video_info: dict, client):
     return comments, comment_uid_map, comment_location_map, charge_uid_map
 
 
-def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client, max_users: int = MAX_ANALYZE_USERS, charge_uid_map: dict | None = None, command_uid_map: dict | None = None):
-    """阶段4: 解析发送者UID（支持数据库缓存 + 按弹幕数取top N）"""
+def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
+                  max_users: int | None = None, charge_uid_map: dict | None = None,
+                  command_uid_map: dict | None = None,
+                  spam_results: dict | None = None, cringe_results: dict | None = None):
+    """阶段4: 解析发送者UID（数据库缓存 + 兴趣分驱动选人）
+
+    选人规则（阈值制动态定员，spec 3）：spam_level∈{高,中} 或 尬语条数≥1 的发送者
+    全部进入解析名单；max_users 为 None 时用 MAX_ANALYZE_USERS_HARD_CAP 兜底截断，
+    显式传入 max_users（--max-users）时作为手动硬上限优先。
+    """
     print("\n[Phase 4/6] 解析发送者UID...")
 
     # 1. 从数据库加载已缓存的解析结果
@@ -185,13 +194,31 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     if retry_failed > 0:
         print(f"[Phase 4] {retry_failed} 个历史解析失败的发送者将重试")
 
-    # 3. 按弹幕数降序排序，只取 top max_users 个
-    sorted_unresolved = sorted(unresolved.items(), key=lambda x: x[1]["count"], reverse=True)
-    to_resolve = sorted_unresolved[:max_users]
+    # 3. 兴趣分驱动选人（阈值制：中/高刷屏 或 有尬语 全进；上限兜底/手动覆盖）
+    spam_results = spam_results or {}
+    cringe_results = cringe_results or {}
 
-    skipped = len(sorted_unresolved) - len(to_resolve)
+    def interest_key(mid_hash: str):
+        spam = spam_results.get(mid_hash, {})
+        cringe = cringe_results.get(mid_hash, {})
+        return (spam.get("spam_score", 0.0), cringe.get("max_severity", 0),
+                unresolved[mid_hash]["count"])
+
+    must = [h for h in unresolved
+            if spam_results.get(h, {}).get("spam_level") in ("高", "中")
+            or cringe_results.get(h, {}).get("count", 0) >= 1]
+    must.sort(key=interest_key, reverse=True)
+
+    cap = max_users if max_users is not None else MAX_ANALYZE_USERS_HARD_CAP
+    to_resolve_hashes = must[:cap]
+    print(f"[Phase 4] 兴趣命中 {len(must)} 人（中/高刷屏或尬语），"
+          f"截取 {len(to_resolve_hashes)} 人解析（上限 {cap}）")
+
+    skipped = len(unresolved) - len(to_resolve_hashes)
     if skipped > 0:
-        print(f"[Phase 4] 跳过 {skipped} 个低弹幕发送者（超出 --max-users 限制）")
+        print(f"[Phase 4] 跳过 {skipped} 个低兴趣发送者（未命中刷屏/尬语阈值）")
+
+    to_resolve = [(h, unresolved[h]) for h in to_resolve_hashes]
 
     # 4. 只解析 top N 未缓存的发送者
     if to_resolve:
@@ -256,22 +283,34 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
 
 
 def phase_spam(bvid: str, sender_groups: dict) -> dict:
-    """阶段4.5: 刷屏检测（检测完成后将真实结果回写数据库，修正阶段4落库时的占位值）"""
-    print("\n[Phase 4.5/6] 刷屏行为检测...")
+    """阶段2.5: 刷屏检测（提前到解析前，以 spam_score 驱动兴趣分选人；
+    检测完成后将真实结果回写数据库，修正阶段4落库时的占位值）"""
+    print("\n[Phase 2.5] 刷屏行为检测...")
     spam_results = batch_detect_spam(sender_groups)
     high_spam = sum(1 for v in spam_results.values() if v["spam_level"] == "高")
     med_spam = sum(1 for v in spam_results.values() if v["spam_level"] == "中")
-    print(f"[Phase 4.5] 检测完成: 高风险 {high_spam} | 中风险 {med_spam}")
+    print(f"[Phase 2.5] 检测完成: 高风险 {high_spam} | 中风险 {med_spam}")
 
     # 回写所有 sender 的真实检测结果（阶段4 save_sender 时检测尚未运行，库中是 "低"/0.0 占位值）
     for mid_hash, result in spam_results.items():
         update_sender_spam(bvid, mid_hash, result["spam_level"], result["spam_score"])
-    print(f"[Phase 4.5] 已回写 {len(spam_results)} 个发送者的刷屏检测结果")
+    print(f"[Phase 2.5] 已回写 {len(spam_results)} 个发送者的刷屏检测结果")
     return spam_results
 
 
-def phase_collect_users(resolved: dict, client, max_users: int = MAX_ANALYZE_USERS, force: bool = False):
-    """阶段5: 深度采集用户数据（成功立即落库可断点续采；force=True 跳过缓存强制重采）"""
+def phase_cringe(danmaku_list: list, sender_groups: dict, video_info: dict) -> dict:
+    """阶段2.6: 尬语检测（LLM，未配置 Key 或失败时返回空 dict 降级）"""
+    print("\n[Phase 2.6] 弹幕尬语检测...")
+    try:
+        return detect_cringe_danmaku(danmaku_list, sender_groups, video_info)
+    except Exception as e:
+        print(f"[Phase 2.6] 警告: 尬语检测失败（{e}），降级跳过")
+        return {}
+
+
+def phase_collect_users(resolved: dict, client, force: bool = False):
+    """阶段5: 深度采集用户数据（名单已由阶段4兴趣定员，此处不再设限；
+    成功立即落库可断点续采；force=True 跳过缓存强制重采）"""
     print("\n[Phase 5/6] 深度采集用户信息...")
 
     # 筛选需要采集的用户（有UID且置信度 acceptable）
@@ -298,10 +337,10 @@ def phase_collect_users(resolved: dict, client, max_users: int = MAX_ANALYZE_USE
     skipped_dup = len(uids_to_collect) - len(deduped)
     if skipped_dup > 0:
         print(f"[Phase 5] 去重: {skipped_dup} 个 mid_hash 指向重复 UID，合并采集")
-    uids_to_collect = deduped[:max_users]
+    uids_to_collect = deduped
 
     total = len(uids_to_collect)
-    print(f"[Phase 5] 需采集用户: {total} 人 (上限 {max_users})")
+    print(f"[Phase 5] 需采集用户: {total} 人")
 
     user_data_map = {}
     processed = set()
@@ -400,7 +439,7 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]) -> dict | None:
         return None
 
 
-def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_USERS):
+def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
     """
     执行完整分析流程
     """
@@ -426,25 +465,37 @@ def run_analysis(bvid: str, force: bool = False, max_users: int = MAX_ANALYZE_US
         print("[Main] 弹幕为空，终止分析")
         return
 
-    # 阶段3: 评论 + 充电名单（comment_location_map 为 uid→IP属地，阶段6贯通进画像）
-    comments, comment_uid_map, comment_location_map, charge_uid_map = phase_comment(video_info, client)
-
-    # 阶段4: UID解析
-    resolved = phase_resolve(bvid, sender_groups, comment_uid_map, client,
-                             max_users=max_users, charge_uid_map=charge_uid_map,
-                             command_uid_map=build_command_uid_map(command_dms))
-
-    # 阶段4.5: 刷屏检测
+    # 阶段2.5: 刷屏检测（本地，提前到解析前驱动选人）
     spam_results = phase_spam(bvid, sender_groups)
 
-    # 合并刷屏数据到resolved
+    # 阶段2.6: 尬语检测（LLM，可降级）
+    cringe_results = phase_cringe(danmaku_list, sender_groups, video_info)
+
+    # 阶段3: 评论 + 充电名单（comment_location_map 为 uid→IP属地，uid_comments 阶段6贯通进画像）
+    comments, comment_uid_map, comment_location_map, charge_uid_map = phase_comment(video_info, client)
+    # uid → 该用户在本视频的评论（按点赞降序），供阶段6注入画像与阶段7深掘证据包
+    uid_comments: dict[int, list] = {}
+    for c in comments:
+        uid_comments.setdefault(c["uid"], []).append(c)
+    for lst in uid_comments.values():
+        lst.sort(key=lambda x: x.get("like", 0), reverse=True)
+
+    # 阶段4: UID解析（兴趣分驱动选人）
+    resolved = phase_resolve(bvid, sender_groups, comment_uid_map, client,
+                             max_users=max_users, charge_uid_map=charge_uid_map,
+                             command_uid_map=build_command_uid_map(command_dms),
+                             spam_results=spam_results, cringe_results=cringe_results)
+
+    # 合并刷屏/尬语数据到resolved（阶段5置信度过滤与阶段6画像注入均从此处取）
     for mid_hash in resolved:
         if mid_hash in spam_results:
             resolved[mid_hash]["spam_level"] = spam_results[mid_hash]["spam_level"]
             resolved[mid_hash]["spam_score"] = spam_results[mid_hash]["spam_score"]
+        if mid_hash in cringe_results:
+            resolved[mid_hash]["cringe"] = cringe_results[mid_hash]
 
     # 阶段5: 用户采集
-    user_data_map = phase_collect_users(resolved, client, max_users=max_users, force=force)
+    user_data_map = phase_collect_users(resolved, client, force=force)
 
     # 阶段6: 画像分析（评论IP属地在此贯通进画像）
     profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups, comment_location_map)
@@ -503,7 +554,7 @@ def load_batch_bvids(path: str) -> list[str]:
     return bvids
 
 
-def run_batch(batch_file: str, force: bool = False, max_users: int = MAX_ANALYZE_USERS):
+def run_batch(batch_file: str, force: bool = False, max_users: int | None = None):
     """批量分析：逐个视频调用 run_analysis，单个失败只警告不中断，最后打印汇总"""
     bvids = load_batch_bvids(batch_file)
     if not bvids:
@@ -549,7 +600,7 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="清除该视频的缓存并强制重采全部用户（忽略断点续采）")
     parser.add_argument("--max-users", type=int, default=None,
-                        help="手动硬上限覆盖阈值制动态定员 (默认不限制，阈值命中者全进)")
+                        help="手动硬上限覆盖阈值制动态定员 (默认按兴趣阈值定员，兜底上限 MAX_ANALYZE_USERS_HARD_CAP)")
     parser.add_argument("--batch", metavar="FILE",
                         help="批量模式：从文件逐行读取BV号（忽略空行与 # 注释行）")
     args = parser.parse_args()
