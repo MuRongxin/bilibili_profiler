@@ -175,9 +175,9 @@ def generate_user_card(profile: dict) -> str:
                 <div class="ai-text">{ai_html}</div>
             </div>'''
 
-    # 问题弹幕内联标记（弹幕行为行尾）
+    # 问题弹幕内联标记（弹幕行为行尾；类别用分色 chips，与问题弹幕榜视觉一致）
     cringe = profile.get("cringe", {})
-    cringe_note = (f'，其中问题弹幕 {cringe["count"]} 条（{"、".join(cringe.get("categories", []))}）'
+    cringe_note = (f'，其中问题弹幕 {cringe["count"]} 条（{_category_chips(cringe.get("categories", []))}）'
                    if cringe.get("count") else "")
 
     # 本视频评论小节（按点赞降序，至多10条，来自阶段6注入；is_sub 子评论加前缀标注）
