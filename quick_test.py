@@ -19,7 +19,7 @@ from uid_resolver import resolve_sender
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
-from report import save_report
+from storage import init_db, save_video_info, save_danmaku
 from main import _merge_history_danmaku
 
 
@@ -48,6 +48,14 @@ def main():
     # 对齐主流程：开启历史弹幕时合并每日弹幕池快照，保证刷屏 top-N 口径与 run.py 一致
     if HISTORY_DANMAKU_ENABLED:
         danmaku_list, sender_groups = _merge_history_danmaku(video_info, danmaku_list, client)
+
+    # 弹幕落库（供 web.py 弹幕浏览器查询；失败只警告不中断冒烟流程）
+    try:
+        init_db()
+        save_video_info(bvid, video_info)
+        save_danmaku(bvid, danmaku_list)
+    except Exception as e:
+        print(f"   警告: 弹幕落库失败（{e}），web.py 中将无该视频数据")
 
     print(f"   弹幕: {len(danmaku_list)} 条, 发送者: {len(sender_groups)} 人")
 
@@ -129,9 +137,9 @@ def main():
         except Exception as e:
             print(f"   AI 分析失败: {e}")
 
-    # 报告
-    report_path = save_report(video_info, profiles)
-    print(f"\n✅ 报告: {report_path}")
+    # 静态 HTML 报告已被 web.py 交互式报告完全替换
+    print(f"\n✅ 分析完成: {len(profiles)} 人生成画像")
+    print("   运行 python web.py 查看交互式报告（本视频弹幕已落库）")
 
 
 if __name__ == "__main__":

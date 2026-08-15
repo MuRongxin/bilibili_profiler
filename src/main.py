@@ -9,11 +9,13 @@ B站弹幕发送者用户画像分析系统 — 主控流程
 import sys
 import os
 import argparse
+from datetime import datetime
 
-from config import MAX_ANALYZE_USERS_HARD_CAP, LLM_API_KEY, HISTORY_DANMAKU_ENABLED
+from config import MAX_ANALYZE_USERS_HARD_CAP, LLM_API_KEY, HISTORY_DANMAKU_ENABLED, REPORT_DIR
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
+from storage import save_danmaku
 from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page, fetch_command_dms, build_command_uid_map
 from danmaku_history import fetch_history_danmaku
@@ -24,7 +26,6 @@ from cringe_detector import detect_cringe_danmaku
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
-from report import save_report
 from exporter import export_csv, export_json
 
 
@@ -45,11 +46,21 @@ def phase_danmaku(bvid: str, client):
     """阶段2: 采集弹幕（实时弹幕池 + 可选历史弹幕快照合并 + 互动弹幕明文mid）"""
     print("\n[Phase 2/6] 采集弹幕数据...")
     video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, client)
-    save_video_info(bvid, video_info)
 
     # 实时弹幕池只保留最近几千条；开启历史弹幕时拉取每日弹幕池快照补全历史
     if HISTORY_DANMAKU_ENABLED:
         danmaku_list, sender_groups = _merge_history_danmaku(video_info, danmaku_list, client)
+
+    # 落库时机在历史合并之后：danmaku_coverage 由 _merge_history_danmaku 写入 video_info，
+    # 提前保存会导致 Web 概览页拿不到覆盖率
+    save_video_info(bvid, video_info)
+
+    # 全量弹幕落库（web.py 弹幕浏览器数据源；失败只警告不中断主流程）
+    try:
+        save_danmaku(bvid, danmaku_list)
+        print(f"[Phase 2] 已落库 {len(danmaku_list)} 条弹幕（danmaku 表）")
+    except Exception as e:
+        print(f"[Phase 2] 警告: 弹幕落库失败（{e}），web.py 弹幕浏览器将无本视频数据")
 
     # 互动弹幕（含明文mid，需SESSDATA；失败降级不影响主流程）
     command_dms = fetch_command_dms(video_info, client)
@@ -519,32 +530,30 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
     # 阶段7: LLM 重点深掘（结果在 phase 内直接注入 profile）
     phase_ai_analysis(video_info, profiles)
 
-    # 生成报告
-    print("\n[Report] 生成HTML报告...")
-    report_path = save_report(video_info, profiles)
-    print(f"[Report] 报告已保存: {report_path}")
+    # 静态单文件 HTML 报告已被交互式 Web 报告（web.py）完全替换，不再生成 .html
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    export_base = os.path.join(REPORT_DIR, f"report_{bvid}_{ts}")
 
-    # 同步导出 CSV/JSON：与 HTML 报告同前缀（复用同一时间戳），
-    # 导出失败只打印警告降级，不影响已生成的 HTML 报告
-    export_base = os.path.splitext(report_path)[0]
+    # 同步导出 CSV/JSON（web.py 报告页提供下载链接）；导出失败只警告降级
+    os.makedirs(REPORT_DIR, exist_ok=True)
     try:
         csv_path = export_base + ".csv"
         export_csv(profiles, csv_path)
         print(f"[Export] CSV 已导出: {csv_path}")
     except Exception as e:
-        print(f"[Export] 警告: CSV 导出失败（不影响HTML报告）: {e}")
+        print(f"[Export] 警告: CSV 导出失败: {e}")
     try:
         json_path = export_base + ".json"
         export_json(video_info, profiles, json_path)
         print(f"[Export] JSON 已导出: {json_path}")
     except Exception as e:
-        print(f"[Export] 警告: JSON 导出失败（不影响HTML报告）: {e}")
+        print(f"[Export] 警告: JSON 导出失败: {e}")
 
     print("\n" + "=" * 60)
     print("  分析完成!")
     print(f"  视频: {video_info.get('title', '')}")
     print(f"  分析用户: {len(profiles)} 人")
-    print(f"  报告: {report_path}")
+    print("  运行 python web.py 查看交互式报告")
     print("=" * 60)
 
 
