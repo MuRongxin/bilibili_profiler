@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 from flask import Flask, abort, jsonify, request, send_from_directory
 
 from config import REPORT_DIR, LLM_API_KEY
-from auth import load_cookie, verify_cookie
+from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
 from storage import get_db, init_db
 from storage import (load_senders, load_global_uid_map, save_global_uid,
@@ -56,27 +56,38 @@ class CookieInvalidError(Exception):
 
 def _get_client() -> BiliAPIClient:
     """懒加载创建带登录态的 BiliAPIClient（auth.load_cookie 读 data/cookie.json +
-    verify_cookie 联网校验一次）；失败抛 CookieInvalidError，由路由按 503 处理"""
+    verify_cookie 联网校验）；失败抛 CookieInvalidError（携带 503 文案），由路由按 503 处理。
+
+    失效判定（对齐 auth.login_by_qrcode 口径）：Cookie 文件缺失/损坏直接判定失效；
+    验证失败但有 refresh_token 时先 _try_refresh_cookie 刷新再重验——verify_cookie 对
+    网络抖动也返回 False，刷新路径本身是一次额外联网确认，只有刷新后仍失败（或无
+    refresh_token）才置 _client_failed 粘性标记，避免单次抖动误判为永久失效。"""
     global _client, _client_failed
     with _CLIENT_LOCK:
         if _client is not None:
             return _client
         if _client_failed:
-            raise CookieInvalidError()
+            raise CookieInvalidError("Cookie 失效，请先运行 python login.py")
         cookie_dict = load_cookie()
         if not cookie_dict or not cookie_dict.get("SESSDATA"):
             _client_failed = True
-            raise CookieInvalidError()
+            raise CookieInvalidError("Cookie 失效，请先运行 python login.py")
         refresh_token = cookie_dict.pop("_refresh_token", None)
         client = BiliAPIClient()
         client.update_cookies(cookie_dict)
         if refresh_token:
             client._refresh_token = refresh_token
-        if not verify_cookie(client):
-            _client_failed = True
-            raise CookieInvalidError()
-        _client = client
-        return _client
+        if verify_cookie(client):
+            _client = client
+            return _client
+        # 验证失败但 refresh_token 可能仍有效：先尝试刷新再重验
+        if refresh_token and _try_refresh_cookie(client) and verify_cookie(client):
+            _client = client
+            return _client
+        _client_failed = True
+        if refresh_token:
+            raise CookieInvalidError("Cookie 失效且刷新失败，请先运行 python login.py")
+        raise CookieInvalidError("Cookie 失效，请先运行 python login.py")
 
 
 def _sender_danmaku_stats(bvid: str, mid_hash: str) -> dict:
@@ -114,8 +125,8 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
 
     try:
         client = _get_client()
-    except CookieInvalidError:
-        add_error("Cookie 失效，请先运行 python login.py（job 已终止）")
+    except CookieInvalidError as e:
+        add_error(f"{e}（job 已终止）")
         update(finished=True, current="")
         return
     except Exception as e:
@@ -923,8 +934,8 @@ def api_analyze(bvid: str):
         return jsonify({"error": "mid_hashes 为空"}), 400
     try:
         _get_client()
-    except CookieInvalidError:
-        return jsonify({"error": "Cookie 失效，请先运行 python login.py"}), 503
+    except CookieInvalidError as e:
+        return jsonify({"error": str(e) or "Cookie 失效，请先运行 python login.py"}), 503
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[job_id] = {"total": len(mid_hashes), "done": 0, "current": "",
