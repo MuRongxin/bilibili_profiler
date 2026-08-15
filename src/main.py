@@ -27,6 +27,7 @@ from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
 from exporter import export_csv, export_json
+from web_autostart import maybe_launch_web
 
 
 def print_banner():
@@ -465,9 +466,11 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]):
         print(f"[Phase 7] LLM 分析失败: {e}")
 
 
-def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
+def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, launch_web: bool = True):
     """
     执行完整分析流程
+
+    launch_web=False 供批量模式使用（避免逐视频开浏览器标签页）
     """
     print_banner()
 
@@ -553,8 +556,13 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None):
     print("  分析完成!")
     print(f"  视频: {video_info.get('title', '')}")
     print(f"  分析用户: {len(profiles)} 人")
-    print("  运行 python web.py 查看交互式报告")
     print("=" * 60)
+
+    # 分析完毕自动启动 web.py 并打开报告页（WEB_AUTOSTART 可关；失败只打印 URL 降级）
+    if launch_web:
+        maybe_launch_web(bvid)
+    else:
+        print("  运行 python web.py 查看交互式报告")
 
 
 def load_batch_bvids(path: str) -> list[str]:
@@ -592,7 +600,7 @@ def run_batch(batch_file: str, force: bool = False, max_users: int | None = None
             failed.append(bvid)
             continue
         try:
-            run_analysis(bvid, force=force, max_users=max_users)
+            run_analysis(bvid, force=force, max_users=max_users, launch_web=False)
             succeeded.append(bvid)
         except KeyboardInterrupt:
             # Ctrl+C 不再继续后续视频，但仍打印已完成的汇总

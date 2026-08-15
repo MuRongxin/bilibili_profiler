@@ -85,6 +85,9 @@ MAX_ANALYZE_USERS_HARD_CAP = 300   # 动态定员安全上限（兴趣命中者�
 LLM_DEEP_TOP_K = 20                # LLM 重点深掘人数（兴趣分 top K 单人单调用）
 CRINGE_BATCH_SIZE = 200            # 问题弹幕检测每批弹幕条数
 
+# ========== Web 报告配置 ==========
+WEB_AUTOSTART = True   # run.py/quick_test.py 分析完毕自动启动 web.py 并用浏览器打开报告页（False 关闭）
+
 # ========== LLM 配置 ==========
 # DeepSeek 官方 OpenAI 兼容端点（https://api-docs.deepseek.com）
 # 填入你的 API Key，或用环境变量 LLM_API_KEY 覆盖；留空则自动跳过 LLM 分析
