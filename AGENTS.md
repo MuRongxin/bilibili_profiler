@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-**B站弹幕发送者用户画像分析系统**：输入视频 BV 号，采集该视频的全部弹幕（实时弹幕池 + 历史快照），先做本地刷屏检测 + LLM 问题弹幕检测（七类：中二抒情/尬夸捧杀/引战阴阳/人身攻击/恶意剧透/广告引流/键政敏感，结果按 llm_cache 缓存），按兴趣分（中/高刷屏或问题弹幕命中）阈值制动态定员，再破解入选发送者的匿名 `mid_hash`（MITM 中间相遇 CRC32 反查 + 评论/充电名单/互动弹幕明文 UID 交叉验证 + 全局映射库），对每个发送者做四维度深度画像（主页信息、互动足迹、社交关系、行为模式），可选调用 LLM 对兴趣分 top K 重点深掘生成 AI 画像（llm_cache 缓存，全员粗筛已砍），最终输出交互式 Web 报告（根目录 `web.py`，Flask 本地服务 127.0.0.1:8000，四标签页：概览/用户画像/弹幕浏览器/问题弹幕榜；静态单文件 HTML 已完全移除）。
+**B站弹幕发送者用户画像分析系统**：输入视频 BV 号，采集该视频的全部弹幕（实时弹幕池 + 历史快照），先做本地刷屏检测 + LLM 问题弹幕检测（七类：中二抒情/尬夸捧杀/引战阴阳/人身攻击/恶意剧透/广告引流/键政敏感，结果按 llm_cache 缓存），按兴趣分（中/高刷屏或问题弹幕命中）阈值制动态定员，再破解入选发送者的匿名 `mid_hash`（MITM 中间相遇 CRC32 反查 + 评论/充电名单/互动弹幕明文 UID 交叉验证 + 全局映射库），对每个发送者做四维度深度画像（主页信息、互动足迹、社交关系、行为模式），可选调用 LLM 对兴趣分 top K 重点深掘生成 AI 画像（llm_cache 缓存，全员粗筛已砍），最终输出交互式 Web 报告（根目录 `web.py`，Flask 本地服务 127.0.0.1:8000，五标签页：概览/用户画像/弹幕浏览器/问题弹幕榜/完整报告（原静态报告结构纵向呈现）；弹幕浏览器支持勾选 mid_hash 手动触发强制分析（后台 job：UID解析+采集+画像+LLM深掘）；run.py/quick_test.py 分析完毕自动启动 web.py 并打开报告页（WEB_AUTOSTART 可关）；静态单文件 HTML 已完全移除）。
 
 - 纯 Python 3 项目，无构建系统（无 pyproject.toml / setup.py / package.json），依赖通过 `requirements.txt` 管理。
 - 主要依赖：`requests`（HTTP）、`lxml`（弹幕 XML 解析）、`qrcode` + `pillow`（扫码登录）、`openai`（LLM 客户端）、`pycryptodome`、`flask`（Web 报告服务）。
@@ -28,6 +28,8 @@ python quick_test.py [BV号] [--top N]  # 快速分析：只分析刷屏得分�
 python web.py       # 交互式 Web 报告（127.0.0.1:8000，PROFILER_PORT 可覆盖端口）
 ```
 
+注意：`run.py`/`quick_test.py` 分析完毕会自动启动 web.py 并打开报告页（`config.py` 中 `WEB_AUTOSTART=False` 关闭；批量模式不自动启动）。
+
 首次运行会提示用 B站 APP 扫码登录；Cookie 自动保存到 `data/cookie.json` 并复用。
 
 ## 代码结构
@@ -35,9 +37,10 @@ python web.py       # 交互式 Web 报告（127.0.0.1:8000，PROFILER_PORT 可�
 入口 `run.py` 将 `src/` 加入 `sys.path` 后调用 `main.main()`。模块间以**扁平的非包方式导入**（`from config import ...`，不带 `src.` 前缀），修改时务必保持这一约定。
 
 ```
-web.py               # 交互式 Web 报告服务（Flask，首页视频列表 + 四标签页报告 + 弹幕 JSON API）
+web.py               # 交互式 Web 报告服务（Flask，首页 + 五标签页报告 + 弹幕 JSON API + 手动分析 job API）
 src/
 ├── main.py              # 主控流程：登录→弹幕(实时+历史)→刷屏检测→问题弹幕检测→评论→兴趣分UID解析→用户采集→画像分析→LLM深掘→报告
+├── web_autostart.py     # 分析完毕自动启动 web.py 并打开报告页（maybe_launch_web，WEB_AUTOSTART 开关）
 ├── config.py            # 全部配置常量：API 端点、限速/重试、采集翻页上限、LLM 配置（含 API Key，已被 .gitignore 排除）
 ├── api_client.py        # BiliAPIClient：HTTP 封装（线程安全限速 0.6–1.0s、重试退避、-412及重签无效的-352/-403风控全局冷却、Cookie、WBI签名、bili_ticket）
 ├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新
