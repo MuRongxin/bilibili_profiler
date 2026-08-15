@@ -14,20 +14,199 @@ import os
 import json
 import glob
 import sqlite3
+import threading
+import uuid
 from contextlib import closing
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
-from config import REPORT_DIR
+from config import REPORT_DIR, LLM_API_KEY
+from auth import load_cookie, verify_cookie
+from api_client import BiliAPIClient
 from storage import get_db, init_db
+from storage import (load_senders, load_global_uid_map, save_global_uid,
+                     save_sender, save_user_data, has_user_data, load_video_info)
+from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
+from user_collector import collect_user_data
+from profile_analyzer import analyze_profile
+from spam_detector import batch_detect_spam
+from llm_analyzer import LLMAnalyzer
 from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats,
                     generate_chart_data, generate_cringe_board, sort_profiles_by_risk,
                     up_wordcloud_data, PROBLEM_CATEGORY_COLORS)
 
 app = Flask(__name__)
 PAGE_SIZE = 100  # 弹幕 API 固定每页条数（spec 4）
+
+
+# ========== 手动勾选分析 job（spec B；状态存内存 dict，服务重启即失效——spec 已接受） ==========
+
+JOBS: dict[str, dict] = {}
+JOBS_LOCK = threading.Lock()
+_CLIENT_LOCK = threading.Lock()
+_client = None          # 懒加载的 BiliAPIClient（其内部线程安全，限速全局共享）
+_client_failed = False  # Cookie 校验失败过一次即记住，后续 POST 直接 503，不重复打验证请求
+
+
+class CookieInvalidError(Exception):
+    """Cookie 缺失/失效：POST 返回 503，job 启动即整体终止"""
+
+
+def _get_client() -> BiliAPIClient:
+    """懒加载创建带登录态的 BiliAPIClient（auth.load_cookie 读 data/cookie.json +
+    verify_cookie 联网校验一次）；失败抛 CookieInvalidError，由路由按 503 处理"""
+    global _client, _client_failed
+    with _CLIENT_LOCK:
+        if _client is not None:
+            return _client
+        if _client_failed:
+            raise CookieInvalidError()
+        cookie_dict = load_cookie()
+        if not cookie_dict or not cookie_dict.get("SESSDATA"):
+            _client_failed = True
+            raise CookieInvalidError()
+        refresh_token = cookie_dict.pop("_refresh_token", None)
+        client = BiliAPIClient()
+        client.update_cookies(cookie_dict)
+        if refresh_token:
+            client._refresh_token = refresh_token
+        if not verify_cookie(client):
+            _client_failed = True
+            raise CookieInvalidError()
+        _client = client
+        return _client
+
+
+def _sender_danmaku_stats(bvid: str, mid_hash: str) -> dict:
+    """从 danmaku 表重建该发送者的弹幕统计（web 端无内存态 sender_groups）"""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT content, time, timestamp FROM danmaku WHERE bvid = ? AND mid_hash = ? ORDER BY time",
+            (bvid, mid_hash)).fetchall()
+    return {
+        "count": len(rows),
+        "contents": [r["content"] for r in rows],
+        "timestamps": [r["timestamp"] for r in rows],
+        "video_times": [r["time"] for r in rows],
+    }
+
+
+def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
+    """后台 job：每个 mid_hash 串行 解析→强制采集→规则画像→LLM深掘→落库（串行即天然限流）。
+
+    错误处理（spec 5）：单发送者失败记 errors 继续；Cookie 失效 job 整体终止并标记。
+    写库全部走 storage 的 save_*（各自短事务），不持长连接。
+    """
+    def update(**kw):
+        with JOBS_LOCK:
+            JOBS[job_id].update(kw)
+
+    def add_error(msg):
+        with JOBS_LOCK:
+            JOBS[job_id]["errors"].append(msg)
+        print(f"[Job {job_id}] 失败: {msg}")
+
+    def add_result(uid):
+        with JOBS_LOCK:
+            JOBS[job_id]["results"].append(uid)
+
+    try:
+        client = _get_client()
+    except CookieInvalidError:
+        add_error("Cookie 失效，请先运行 python login.py（job 已终止）")
+        update(finished=True, current="")
+        return
+    except Exception as e:
+        add_error(f"创建 API 客户端失败: {e}（job 已终止）")
+        update(finished=True, current="")
+        return
+
+    cached = {r["mid_hash"]: r for r in load_senders(bvid)}
+    video_info = load_video_info(bvid) or {}
+    # web 端无评论映射（spec 7 明确不做）：全局映射库作为唯一明文源，CRC32 彩虹表破解兜底
+    global_map = load_global_uid_map()
+    plain_uid_map = {h: ent["uid"] for h, ent in global_map.items()}
+    method_map = {h: ent["source"] for h, ent in global_map.items()}
+    # LLM 深掘器：未配置 LLM_API_KEY 时跳过（spec 3.3）；初始化失败也只跳过深掘
+    analyzer = None
+    if LLM_API_KEY:
+        try:
+            analyzer = LLMAnalyzer()
+        except Exception as e:
+            print(f"[Job {job_id}] 警告: LLM 初始化失败（{e}），本次 job 跳过深掘")
+
+    for i, mid_hash in enumerate(mid_hashes, 1):
+        update(current=f"[{i}/{len(mid_hashes)}] {mid_hash}")
+        try:
+            row = cached.get(mid_hash)
+            uid = row["uid"] if row else None
+            # 已分析过（senders 有 uid 且 users 有数据）→ 直接跳过计入 results（spec 3.3）
+            if uid is not None and has_user_data(uid):
+                add_result(uid)
+                update(done=i)
+                continue
+
+            stats = _sender_danmaku_stats(bvid, mid_hash)
+            if uid is None:
+                # 1. UID 解析：全局库明文命中优先，CRC32 彩虹表破解兜底；失败记 errors 继续
+                uid, confidence, method, _info, collision_risk, candidates = resolve_sender(
+                    mid_hash, stats["contents"], plain_uid_map, client, method_map=method_map)
+                if uid is None:
+                    add_error(f"{mid_hash}: UID 解析失败（{method}）")
+                    update(done=i)
+                    continue
+                # 落库保留真实置信度/方法（"低"/碰撞在画像页有"可能误识别"徽标）
+                save_sender(bvid, mid_hash, uid, confidence, method,
+                            stats["count"], stats["contents"],
+                            (row["spam_level"] if row else None) or "低",
+                            (row["spam_score"] if row else None) or 0.0)
+                # 沉淀全局映射库：多候选碰撞条目不沉淀（对齐 main.phase_resolve 口径）
+                if not (method == METHOD_CRC32_CRACK and len(candidates) > 1):
+                    save_global_uid(mid_hash, uid, method)
+            else:
+                # senders 有 uid 但 users 无数据的中间态：跳过解析直接采集；
+                # collision_risk 从 method 推断（缓存无该字段，口径同 main.py 阶段4）
+                collision_risk = row["method"] == METHOD_CRC32_CRACK
+
+            # 2. 强制采集（无视置信度，含"低"/碰撞）
+            user_data = collect_user_data(uid, client)
+            if "error" in user_data:
+                add_error(f"{mid_hash} (UID:{uid}): 采集失败 {user_data['error']}")
+                update(done=i)
+                continue
+
+            # 3. 规则画像：刷屏统计从 danmaku 表现算（web 端无内存态 spam_results）
+            spam = batch_detect_spam({mid_hash: stats}).get(mid_hash, {})
+            profile = analyze_profile(user_data,
+                                      {"count": stats["count"], "contents": stats["contents"],
+                                       "video_times": stats["video_times"]},
+                                      spam)
+            profile["collision_risk"] = collision_risk
+            profile["comments"] = []   # web 端无评论数据（spec 7 不做评论采集）
+            profile["cringe"] = {}     # 手动分析不重跑问题弹幕 LLM 检测
+
+            # 4. LLM 深掘（top_k=1 单人单调用，llm_cache 命中零 token；失败只影响深掘）
+            if analyzer is not None:
+                try:
+                    deep = analyzer.analyze_deep([profile], video_info, top_k=1)
+                    if uid in deep:
+                        profile["ai_deep"] = deep[uid]
+                except Exception as e:
+                    print(f"[Job {job_id}] 警告: UID:{uid} LLM 深掘失败（{e}），仅跳过深掘")
+
+            save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0),
+                           user_data, profile)
+            add_result(uid)
+            update(done=i)
+            print(f"[Job {job_id}] [{i}/{len(mid_hashes)}] {mid_hash} → UID:{uid} 完成")
+        except Exception as e:
+            add_error(f"{mid_hash}: {e}")
+            update(done=i)
+
+    update(finished=True, current="")
+    print(f"[Job {job_id}] 完成: 成功 {len(JOBS[job_id]['results'])}/{len(mid_hashes)}")
 
 
 # ========== 数据加载辅助 ==========
@@ -347,11 +526,14 @@ function loadDanmaku() {
                     '<span style="display:inline-block;background:' + (dmCatColors[c] || '#999') +
                     ';color:#fff;font-size:12px;border-radius:4px;padding:1px 8px;margin:1px 2px;">' +
                     escHtml(c) + '</span>').join('');
-                return '<tr><td>' + escHtml(row.content) + dup + '</td><td>' + sender + '</td><td>' +
+                const chk = '<input type="checkbox" class="dm-check" data-mid="' + escHtml(row.mid_hash) + '"' +
+                    (dmSelected.has(row.mid_hash) ? ' checked' : '') + '>';
+                return '<tr><td>' + chk + '</td><td>' + escHtml(row.content) + dup + '</td><td>' + sender + '</td><td>' +
                     fmtVideoTime(row.first_video_time) + '</td><td>' +
                     new Date(row.first_send_time * 1000).toLocaleString() + '</td><td>' + cats + '</td><td>' +
                     escHtml(row.spam_level) + '</td></tr>';
-            }).join('') || '<tr><td colspan="6" class="empty-note">无匹配弹幕</td></tr>';
+            }).join('') || '<tr><td colspan="7" class="empty-note">无匹配弹幕</td></tr>';
+            dmBindChecks();
             const pages = Math.max(1, Math.ceil(data.total / 100));
             document.getElementById('dmPageInfo').textContent =
                 '第 ' + data.page + ' / ' + pages + ' 页（共 ' + data.total + ' 行）';
@@ -380,8 +562,100 @@ if (document.getElementById('dmTbody')) {
     document.getElementById('dmSender').addEventListener('input', () => { clearTimeout(dmTimer); dmTimer = setTimeout(dmReload, 400); });
     ['dmCategory', 'dmSpam', 'dmSort', 'dmOrder', 'dmAnalyzed'].forEach(id =>
         document.getElementById(id).addEventListener('change', dmReload));
+    document.getElementById('dmCheckAll').addEventListener('change', function() {
+        document.querySelectorAll('.dm-check').forEach(c => {
+            c.checked = this.checked;
+            if (this.checked) dmSelected.add(c.dataset.mid); else dmSelected.delete(c.dataset.mid);
+        });
+        dmUpdateAnalyzeStatus();
+    });
     loadDanmaku();
 }
+
+// 手动勾选分析（spec B）：勾选状态跨页保留在 dmSelected（key=mid_hash，天然去重）；
+// job_id 存 sessionStorage，刷新页面后可继续轮询（spec 5；服务重启 job 丢失则提示后清除）
+const dmSelected = new Set();
+const DM_JOB_KEY = 'dmJob_' + BVID;
+
+function dmUpdateAnalyzeStatus(text) {
+    const el = document.getElementById('dmAnalyzeStatus');
+    if (!el) return;  // 旧视频无弹幕面板时无此元素
+    el.textContent = text !== undefined ? text
+        : (dmSelected.size ? '已选 ' + dmSelected.size + ' 个发送者' : '');
+}
+function dmBindChecks() {
+    document.querySelectorAll('.dm-check').forEach(c =>
+        c.addEventListener('change', function() {
+            if (this.checked) dmSelected.add(this.dataset.mid); else dmSelected.delete(this.dataset.mid);
+            dmUpdateAnalyzeStatus();
+        }));
+}
+function startAnalysis() {
+    const mids = Array.from(dmSelected);
+    if (!mids.length) { dmUpdateAnalyzeStatus('请先勾选弹幕行'); return; }
+    dmUpdateAnalyzeStatus('正在启动分析...');
+    fetch('/api/video/' + encodeURIComponent(BVID) + '/analyze', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mid_hashes: mids})
+    }).then(r => r.json().then(j => ({ok: r.ok, j})))
+      .then(({ok, j}) => {
+          if (!ok) { dmUpdateAnalyzeStatus('启动失败: ' + (j.error || ('HTTP 未知错误'))); return; }
+          sessionStorage.setItem(DM_JOB_KEY, j.job_id);
+          dmSelected.clear();
+          document.querySelectorAll('.dm-check').forEach(c => c.checked = false);
+          pollJob(j.job_id);
+      })
+      .catch(e => dmUpdateAnalyzeStatus('启动失败: ' + e.message));
+}
+function pollJob(jobId) {
+    fetch('/api/job/' + jobId)
+        .then(r => r.json())
+        .then(j => {
+            if (j.error) {  // 服务重启 job 丢失
+                dmUpdateAnalyzeStatus('任务状态查询失败: ' + j.error + '（数据可能已部分落库）');
+                sessionStorage.removeItem(DM_JOB_KEY);
+                return;
+            }
+            dmUpdateAnalyzeStatus('分析中 ' + j.done + '/' + j.total + (j.current ? '　' + j.current : ''));
+            if (j.finished) {
+                sessionStorage.removeItem(DM_JOB_KEY);
+                // 新卡片需服务端渲染才有 DOM：记录待高亮 UID 后重载页面，
+                // 加载恢复逻辑跳「完整报告」标签页并闪烁高亮（复用 gotoUser 高亮思路）
+                sessionStorage.setItem('dmFlash_' + BVID, JSON.stringify(j.results || []));
+                const errs = (j.errors && j.errors.length) ? '（' + j.errors.length + ' 条失败，详见服务端日志）' : '';
+                sessionStorage.setItem('dmFlashMsg_' + BVID,
+                    '手动分析完成: 成功 ' + (j.results || []).length + '/' + j.total + errs);
+                location.reload();
+            } else {
+                setTimeout(() => pollJob(jobId), 2000);
+            }
+        })
+        .catch(() => setTimeout(() => pollJob(jobId), 2000));  // 网络抖动重试，不丢 job
+}
+
+// 页面加载恢复：优先处理"分析完成重载"的跳转+高亮；否则有未完成 job 则继续轮询
+(function() {
+    const flashMsg = sessionStorage.getItem('dmFlashMsg_' + BVID);
+    if (flashMsg) {
+        sessionStorage.removeItem('dmFlashMsg_' + BVID);
+        const uids = JSON.parse(sessionStorage.getItem('dmFlash_' + BVID) || '[]');
+        sessionStorage.removeItem('dmFlash_' + BVID);
+        switchTab('full');
+        dmUpdateAnalyzeStatus(flashMsg);
+        uids.forEach(uid => {
+            const el = document.getElementById('full-uid-' + uid);
+            if (el) {
+                el.classList.add('flash-highlight');
+                setTimeout(() => el.classList.remove('flash-highlight'), 3000);
+            }
+        });
+        const first = document.getElementById('full-uid-' + uids[0]);
+        if (first) first.scrollIntoView({behavior: 'smooth', block: 'center'});
+        return;
+    }
+    const jobId = sessionStorage.getItem(DM_JOB_KEY);
+    if (jobId) pollJob(jobId);
+})();
 """
 
 
@@ -505,10 +779,12 @@ def video_page(bvid: str):
                 <option value="sender_count">发送者弹幕数</option>
             </select>
             <select id="dmOrder"><option value="asc">升序</option><option value="desc">降序</option></select>
+            <button id="dmAnalyzeBtn" class="filter-btn" onclick="startAnalysis()">分析选中发送者</button>
+            <span id="dmAnalyzeStatus"></span>
         </div>
         <div class="dm-table-wrap">
             <table class="dm-table">
-                <thead><tr><th>弹幕内容</th><th>发送者</th><th>视频时间</th><th>发送时间</th><th>类别</th><th>刷屏</th></tr></thead>
+                <thead><tr><th><input type="checkbox" id="dmCheckAll" title="全选当前页"></th><th>弹幕内容</th><th>发送者</th><th>视频时间</th><th>发送时间</th><th>类别</th><th>刷屏</th></tr></thead>
                 <tbody id="dmTbody"></tbody>
             </table>
             <div class="dm-pager">
@@ -629,6 +905,43 @@ def video_page(bvid: str):
 <script>{script}</script>
 </body>
 </html>'''
+
+
+@app.route("/api/video/<bvid>/analyze", methods=["POST"])
+def api_analyze(bvid: str):
+    """启动手动勾选发送者分析 job（spec 3.2）。起后台线程立即返回 job_id。
+
+    未知 bvid → 404；空列表 → 400；无有效 Cookie → 503。
+    """
+    if _load_video_row(bvid) is None:
+        return jsonify({"error": "未知视频"}), 404
+    body = request.get_json(silent=True) or {}
+    # 去重保序；非字符串/空串项丢弃
+    mid_hashes = list(dict.fromkeys(
+        h for h in body.get("mid_hashes", []) if isinstance(h, str) and h))
+    if not mid_hashes:
+        return jsonify({"error": "mid_hashes 为空"}), 400
+    try:
+        _get_client()
+    except CookieInvalidError:
+        return jsonify({"error": "Cookie 失效，请先运行 python login.py"}), 503
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {"total": len(mid_hashes), "done": 0, "current": "",
+                        "errors": [], "finished": False, "results": []}
+    threading.Thread(target=_run_analysis_job,
+                     args=(job_id, bvid, mid_hashes), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/job/<job_id>")
+def api_job(job_id: str):
+    """轮询 job 进度（spec 3.2）：total/done/current/errors/finished/results"""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return jsonify({"error": "未知 job"}), 404
+        return jsonify(dict(job))
 
 
 @app.route("/api/video/<bvid>/danmaku")
