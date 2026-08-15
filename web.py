@@ -144,6 +144,7 @@ VIDEO_EXTRA_CSS = """
 .dm-panel { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:15px; margin-bottom:20px; }
 .top10-list { font-size:14px; color:#555; line-height:2; }
 .top10-list a { color:#00a1d6; cursor:pointer; text-decoration:none; }
+.flash-highlight { box-shadow:0 0 0 3px #fb7299 !important; transition:box-shadow .3s; }
 """
 
 # 弹幕浏览器样式（Task 6）
@@ -166,6 +167,7 @@ VIDEO_JS = """
 function switchTab(name) {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
     document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
+    if (name === 'full') initFullCharts();
 }
 
 // 概览图表
@@ -220,25 +222,32 @@ document.querySelectorAll('.up-chip').forEach(chip => {
     chip.addEventListener('mouseleave', function() { popup.style.display = 'none'; });
 });
 
-// 用户画像：筛选按钮 + 昵称/UID 搜索（前端过滤，spec 4）
-let currentFilter = 'all';
-function filter(type, el) {
-    currentFilter = type;
-    document.querySelectorAll('.filter-bar .filter-btn').forEach(b => b.classList.remove('active'));
+// 用户画像/完整报告：筛选按钮 + 昵称/UID 搜索（前端过滤，两页各一份卡片 DOM、状态独立）
+const userFilterState = {users: 'all', full: 'all'};
+const USER_SCOPE = {
+    users: {grid: 'userGrid', input: 'userSearch'},
+    full: {grid: 'fullUserGrid', input: 'fullSearch'},
+};
+function filter(type, el, scope) {
+    scope = scope || 'users';
+    userFilterState[scope] = type;
+    document.querySelectorAll('#tab-' + scope + ' .filter-bar .filter-btn').forEach(b => b.classList.remove('active'));
     el.classList.add('active');
-    applyUserFilter();
+    applyUserFilter(scope);
 }
-function searchUsers() { applyUserFilter(); }
-function applyUserFilter() {
-    const kw = (document.getElementById('userSearch').value || '').trim().toLowerCase();
-    document.querySelectorAll('.user-card').forEach(card => {
+function searchUsers(scope) { applyUserFilter(scope || 'users'); }
+function applyUserFilter(scope) {
+    scope = scope || 'users';
+    const cfg = USER_SCOPE[scope];
+    const kw = (document.getElementById(cfg.input).value || '').trim().toLowerCase();
+    document.querySelectorAll('#' + cfg.grid + ' .user-card').forEach(card => {
         const level = parseInt(card.dataset.level) || 0;
         const isVip = card.dataset.vip === 'true';
         const spam = card.dataset.spam;
         const official = card.dataset.official === 'true';
         const isCreator = parseInt(card.querySelector('.stats-bar .stat:nth-child(4) .num')?.textContent || 0) > 0;
         let show = true;
-        switch (currentFilter) {
+        switch (userFilterState[scope]) {
             case 'all': show = true; break;
             case 'high-level': show = level >= 5; break;
             case 'vip': show = isVip; break;
@@ -253,6 +262,27 @@ function applyUserFilter() {
         }
         card.style.display = show ? '' : 'none';
     });
+}
+
+// 完整报告页图表：克隆概览页四个图（canvas 独立 id，数据复用 chartData），首次切入时懒初始化
+let fullChartsInit = false;
+function initFullCharts() {
+    if (fullChartsInit || !document.getElementById('levelChart2')) return;
+    fullChartsInit = true;
+    new Chart(document.getElementById('levelChart2'), {type:'bar',
+        data:{labels:chartData.level_labels, datasets:[{label:'人数', data:chartData.level_data, backgroundColor:'#00a1d6', borderRadius:6}]},
+        options:{responsive:true, plugins:{legend:{display:false}}}});
+    new Chart(document.getElementById('spamChart2'), {type:'doughnut',
+        data:{labels:['低风险','中风险','高风险'], datasets:[{data:chartData.spam_data, backgroundColor:['#4caf50','#ff9800','#f44336']}]},
+        options:{responsive:true}});
+    new Chart(document.getElementById('tagChart2'), {type:'bar',
+        data:{labels:chartData.tag_labels, datasets:[{label:'出现次数', data:chartData.tag_data, backgroundColor:'#ff9f43', borderRadius:6}]},
+        options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
+    if (chartData.region_labels.length && document.getElementById('regionChart2')) {
+        new Chart(document.getElementById('regionChart2'), {type:'bar',
+            data:{labels:chartData.region_labels, datasets:[{label:'人数', data:chartData.region_data, backgroundColor:'#fb7299', borderRadius:6}]},
+            options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
+    }
 }
 
 // 弹幕浏览器点击发送者跳转到用户画像卡片（锚点 id="uid-{uid}"，spec 4）
@@ -420,6 +450,11 @@ def video_page(bvid: str):
     board_html = generate_cringe_board(profiles) or '<p class="empty-note">本视频无问题弹幕命中</p>'
     panel = _danmaku_panel_stats(bvid)
 
+    # 完整报告标签页（spec A）：卡片第二份 DOM 的锚点 id 改写为 full-uid- 防 DOM id 冲突
+    full_cards_html = cards_html.replace('id="uid-', 'id="full-uid-')
+    region_canvas2 = ('<div class="chart-card"><h3>地域分布 Top10</h3><canvas id="regionChart2"></canvas></div>'
+                      if chart["region_labels"] else "")
+
     # CSV/JSON 导出下载链接（spec 2：指向 data/reports/ 同名前缀文件，存在才显示）
     links = " ".join(f'<a class="filter-btn" href="/download/{esc(fname)}">{esc(ext)} 下载</a>'
                      for fname, ext in _export_links(bvid))
@@ -524,6 +559,7 @@ def video_page(bvid: str):
         <button class="tab-btn" data-tab="users" onclick="switchTab('users')">用户画像</button>
         <button class="tab-btn" data-tab="danmaku" onclick="switchTab('danmaku')">弹幕浏览器</button>
         <button class="tab-btn" data-tab="cringe" onclick="switchTab('cringe')">问题弹幕榜</button>
+        <button class="tab-btn" data-tab="full" onclick="switchTab('full')">完整报告</button>
     </div>
 
     <div id="tab-overview" class="tab-pane active">
@@ -559,6 +595,34 @@ def video_page(bvid: str):
     <div id="tab-danmaku" class="tab-pane">{danmaku_tab}</div>
 
     <div id="tab-cringe" class="tab-pane">{board_html}</div>
+
+    <div id="tab-full" class="tab-pane">
+        <div class="stats-grid">
+            <div class="stat-card"><div class="num">{stats['total']}</div><div class="label">分析用户</div></div>
+            <div class="stat-card"><div class="num">{stats['vip_count']}</div><div class="label">大会员</div></div>
+            <div class="stat-card"><div class="num">{lv5_count}</div><div class="label">Lv.5+</div></div>
+            <div class="stat-card"><div class="num">{stats['spam_levels'].get('高', 0)}</div><div class="label">重度刷屏</div></div>
+            <div class="stat-card"><div class="num">{stats['spam_levels'].get('中', 0)}</div><div class="label">中度刷屏</div></div>
+            <div class="stat-card"><div class="num">{ai_count}</div><div class="label">AI画像</div></div>
+        </div>
+        <div class="charts-grid">
+            <div class="chart-card"><h3>用户等级分布</h3><canvas id="levelChart2"></canvas></div>
+            <div class="chart-card"><h3>刷屏风险分布</h3><canvas id="spamChart2"></canvas></div>
+            <div class="chart-card"><h3>用户标签 Top10</h3><canvas id="tagChart2"></canvas></div>
+            {region_canvas2}
+        </div>
+        <div class="filter-bar">
+            <button class="filter-btn active" onclick="filter('all', this, 'full')">全部</button>
+            <button class="filter-btn" onclick="filter('high-level', this, 'full')">Lv.5+</button>
+            <button class="filter-btn" onclick="filter('vip', this, 'full')">大会员</button>
+            <button class="filter-btn" onclick="filter('official', this, 'full')">认证用户</button>
+            <button class="filter-btn" onclick="filter('spam', this, 'full')">刷屏用户</button>
+            <button class="filter-btn" onclick="filter('creator', this, 'full')">UP主</button>
+            <input id="fullSearch" class="search-input" placeholder="搜索昵称/UID..." oninput="searchUsers('full')">
+        </div>
+        <div class="user-grid" id="fullUserGrid">{full_cards_html}</div>
+        {board_html}
+    </div>
 
     <div id="wc-popup" class="wc-popup"><canvas id="wc-popup-canvas" width="276" height="216"></canvas></div>
 </div>
