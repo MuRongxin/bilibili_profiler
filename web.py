@@ -446,6 +446,132 @@ def video_page(bvid: str):
 </html>'''
 
 
+@app.route("/api/video/<bvid>/danmaku")
+def api_danmaku(bvid: str):
+    """弹幕 JSON API（spec 4）。
+
+    合并规则：同一 mid_hash 相同 content 合并为一行带 dup_count（GROUP BY mid_hash, content）；
+    不同 mid_hash 的相同内容不合并。
+    参数：search（内容 LIKE）、sender（mid_hash 或昵称/UID 精确）、category（7类之一，
+    命中该发送者的问题弹幕类别）、spam（高/中/低/未分析）、analyzed=1（只看已解析用户）、
+    sort（video_time/send_time/dup_count/sender_count）、order（asc/desc）、page（page_size 固定 100）。
+    返回 {rows: [...], total: int, page: int}；每行 content/dup_count/mid_hash/uid/name/
+    first_video_time/first_send_time/categories/spam_level。
+    """
+    if _load_video_row(bvid) is None:
+        return jsonify({"error": "未知视频"}), 404
+
+    args = request.args
+    search = args.get("search", "").strip()
+    sender = args.get("sender", "").strip()
+    category = args.get("category", "").strip()
+    spam = args.get("spam", "").strip()
+    analyzed = args.get("analyzed") == "1"
+    order = "DESC" if args.get("order", "asc").lower() == "desc" else "ASC"
+    try:
+        page = max(1, int(args.get("page", "1")))
+    except ValueError:
+        page = 1
+
+    meta = _sender_meta(bvid)
+
+    where = ["d.bvid = ?"]
+    params: list = [bvid]
+
+    if search:
+        where.append("d.content LIKE ?")
+        params.append(f"%{search}%")
+
+    if sender:
+        # mid_hash 精确（8位hex小写），否则按昵称/UID 精确匹配反查 mid_hash 集合
+        hashes = set()
+        if len(sender) == 8 and all(c in "0123456789abcdef" for c in sender.lower()):
+            hashes.add(sender.lower())
+        for h, m in meta.items():
+            if m["name"] == sender or (m["uid"] is not None and str(m["uid"]) == sender):
+                hashes.add(h)
+        if not hashes:
+            return jsonify({"rows": [], "total": 0, "page": page})
+        where.append("d.mid_hash IN (%s)" % ",".join("?" * len(hashes)))
+        params.extend(sorted(hashes))
+
+    if category:
+        # 命中该类别的发送者集合（categories 是 Python 侧解析，先求集合再 SQL 过滤）
+        hashes = [h for h, m in meta.items() if category in m["categories"]]
+        if not hashes:
+            return jsonify({"rows": [], "total": 0, "page": page})
+        where.append("d.mid_hash IN (%s)" % ",".join("?" * len(hashes)))
+        params.extend(hashes)
+
+    if spam in ("高", "中", "低"):
+        where.append("s.spam_level = ?")
+        params.append(spam)
+    elif spam == "未分析":
+        # senders 无行（未进解析名单）或旧缓存 spam_level 为 NULL 均属未分析
+        where.append("s.spam_level IS NULL")
+
+    if analyzed:
+        where.append("s.uid IS NOT NULL")
+
+    sort_col = {
+        "video_time": "first_video_time",
+        "send_time": "first_send_time",
+        "dup_count": "dup_count",
+        "sender_count": "sender_count",
+    }.get(args.get("sort", "video_time"), "first_video_time")
+
+    where_sql = " AND ".join(where)
+    # sender_count：发送者在本视频的总弹幕数，子查询按 mid_hash 预聚合
+    # 注意参数顺序：子查询的 bvid=? 在 SQL 文本中最先出现，绑定参数也要最先放
+    base_sql = f'''
+        FROM danmaku d
+        LEFT JOIN senders s ON s.bvid = d.bvid AND s.mid_hash = d.mid_hash
+        LEFT JOIN users u ON u.uid = s.uid
+        LEFT JOIN (
+            SELECT mid_hash, COUNT(*) AS cnt FROM danmaku WHERE bvid = ? GROUP BY mid_hash
+        ) sc ON sc.mid_hash = d.mid_hash
+        WHERE {where_sql}
+        GROUP BY d.mid_hash, d.content
+    '''
+    count_sql = f"SELECT COUNT(*) FROM (SELECT d.mid_hash, d.content {base_sql})"
+    rows_sql = f'''
+        SELECT d.mid_hash, d.content, COUNT(*) AS dup_count,
+               MIN(d.time) AS first_video_time, MIN(d.timestamp) AS first_send_time,
+               s.uid AS uid, u.name AS name, s.spam_level AS spam_level,
+               sc.cnt AS sender_count
+        {base_sql}
+        ORDER BY {sort_col} {order}, d.mid_hash, d.content
+        LIMIT {PAGE_SIZE} OFFSET {(page - 1) * PAGE_SIZE}
+    '''
+    full_params = [bvid] + params
+
+    # 数据库锁定/查询异常 → 500 JSON（spec 7），前端显示错误提示不崩溃
+    try:
+        conn = get_db()
+        total = conn.execute(count_sql, full_params).fetchone()[0]
+        raw_rows = conn.execute(rows_sql, full_params).fetchall()
+        conn.close()
+    except sqlite3.Error as e:
+        return jsonify({"error": f"数据库查询失败: {e}"}), 500
+
+    rows = []
+    for r in raw_rows:
+        m = meta.get(r["mid_hash"], {})
+        rows.append({
+            "content": r["content"],
+            "dup_count": r["dup_count"],
+            "mid_hash": r["mid_hash"],
+            "uid": r["uid"],
+            "name": r["name"],
+            "first_video_time": r["first_video_time"],
+            "first_send_time": r["first_send_time"],
+            "categories": m.get("categories", []),
+            "spam_level": r["spam_level"] or "未分析",
+            "sender_count": r["sender_count"],
+        })
+    return jsonify({"rows": rows, "total": total, "page": page})
+
+
 @app.route("/download/<path:filename>")
 def download(filename: str):
     """CSV/JSON 导出文件下载（仅允许 report_ 前缀文件，防目录外文件被下载）"""
