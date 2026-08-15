@@ -1,17 +1,129 @@
 """
-HTML报告生成器
+报告渲染函数库
 
-生成包含统计图表、词云和用户深度画像的交互式HTML报告。
+静态单文件 HTML 报告已移除（被 web.py 交互式报告完全替换）。
+本模块保留可复用的渲染件：用户卡片/问题弹幕榜/图表统计/基础 CSS，
+由 web.py 服务端渲染时组装。
 """
 import json
 import re
-import os
 import html as _html
 from datetime import datetime
 from collections import Counter
 from urllib.parse import urlparse
 
-from config import REPORT_DIR
+
+# 报告基础样式（原静态 HTML 骨架的 <style> 内容平移；web.py 页面模板注入）
+REPORT_CSS = """
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#e8ecf1; color:#333; line-height:1.7; font-size:17px; }
+.container { max-width:1400px; margin:0 auto; padding:24px; }
+
+.header { background:linear-gradient(135deg,#00a1d6,#fb7299); color:white; padding:40px; border-radius:16px; margin-bottom:30px; box-shadow:0 10px 40px rgba(0,161,214,0.2); }
+.header h1 { font-size:30px; margin-bottom:10px; }
+.header .meta { opacity:0.9; font-size:15px; }
+
+.stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:15px; margin-bottom:30px; }
+.stat-card { background:white; padding:20px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); text-align:center; }
+.stat-card .num { font-size:36px; font-weight:700; color:#00a1d6; }
+.stat-card .label { font-size:13px; color:#999; margin-top:5px; }
+
+.charts-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px; margin-bottom:30px; }
+.chart-card { background:white; padding:25px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); }
+.chart-card h3 { font-size:17px; margin-bottom:15px; color:#555; }
+
+.filter-bar { display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }
+.filter-btn { padding:8px 20px; border:2px solid #e0e0e0; border-radius:25px; background:white; cursor:pointer; font-size:14px; transition:all 0.2s; }
+.filter-btn:hover { border-color:#00a1d6; color:#00a1d6; }
+.filter-btn.active { background:#00a1d6; color:white; border-color:#00a1d6; }
+
+.user-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(520px,1fr)); gap:20px; }
+.user-card { background:white; border-radius:14px; overflow:hidden; box-shadow:0 4px 24px rgba(0,0,0,0.10); transition:all 0.3s; border:1px solid #e8e8e8; }
+.user-card:hover { transform:translateY(-3px); box-shadow:0 8px 40px rgba(0,0,0,0.15); }
+
+.card-header { display:flex; align-items:flex-start; padding:20px; background:linear-gradient(135deg,#fafafa,#f0f0f0); }
+.avatar { width:60px; height:60px; border-radius:50%; overflow:hidden; margin-right:15px; flex-shrink:0; background:#e0e0e0; display:flex; align-items:center; justify-content:center; }
+.avatar img { width:100%; height:100%; object-fit:cover; }
+.avatar-text { font-size:24px; font-weight:bold; color:#00a1d6; }
+.header-info { flex:1; }
+.name-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+.username { font-size:20px; font-weight:600; }
+.username-link { text-decoration:none; color:inherit; }
+.username-link:hover { color:#00a1d6; }
+.uid { font-size:12px; color:#999; background:#f0f0f0; padding:2px 8px; border-radius:10px; }
+.level-badge { font-size:12px; background:#00a1d6; color:white; padding:2px 8px; border-radius:10px; }
+.vip-badge { font-size:12px; background:#fb7299; color:white; padding:2px 8px; border-radius:10px; }
+.risk-badge { font-size:12px; background:#ff9800; color:white; padding:2px 8px; border-radius:10px; }
+.sign { font-size:13px; color:#666; margin-top:4px; }
+.tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+.tag { font-size:12px; background:#e3f2fd; color:#1976d2; padding:3px 10px; border-radius:12px; }
+
+.stats-bar { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; padding:15px 20px; border-bottom:1px solid #f0f0f0; }
+.stats-bar .stat { text-align:center; }
+.stats-bar .num { font-size:18px; font-weight:700; color:#00a1d6; }
+.stats-bar .label { font-size:12px; color:#999; }
+
+.card-body { padding:15px 20px; }
+.section { margin-bottom:15px; padding-bottom:15px; border-bottom:1px solid #f5f5f5; }
+.section:last-child { border-bottom:none; margin-bottom:0; }
+.section h4 { font-size:15px; color:#555; margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+.spam-badge { font-size:12px; padding:2px 8px; border-radius:10px; margin-left:auto; }
+.spam-低 { background:#e8f5e9; color:#388e3c; }
+.spam-中 { background:#fff3e0; color:#f57c00; }
+.spam-高 { background:#ffebee; color:#d32f2f; }
+.detail { font-size:13px; color:#666; margin-bottom:8px; }
+.reason { font-size:12px; color:#d32f2f; margin-top:6px; }
+.info-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; font-size:18px; color:#555; }
+.list { list-style:none; font-size:13px; color:#555; }
+.list li { padding:4px 0; border-bottom:1px dotted #eee; }
+.list li:last-child { border-bottom:none; }
+
+/* 弹幕编号列表 */
+.dm-list { font-size:14px; color:#444; padding-left:24px; margin:6px 0; max-height:200px; overflow-y:auto; }
+.dm-list li { padding:6px 0; border-bottom:1px dotted #eee; line-height:1.5; }
+.dm-list li:last-child { border-bottom:none; }
+
+.dm-time { font-size:12px; color:#999; margin-left:6px; font-family:monospace; background:#f0f0f0; padding:1px 6px; border-radius:4px; }
+
+.samples { display:flex; flex-wrap:wrap; gap:6px; }
+.sample { font-size:13px; background:#f5f5f5; color:#555; padding:4px 10px; border-radius:8px; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sample.following { background:#e8f5e9; color:#2e7d32; }
+
+.ai-section { background:#f8f9ff; border-radius:8px; padding:12px 15px; }
+.ai-section h4 { color:#6c5ce7; }
+.ai-text { font-size:14px; color:#555; line-height:1.8; }
+.ai-text p { margin:6px 0; }
+.ai-text strong { color:#333; }
+.ai-text br { display:block; content:''; margin:2px 0; }
+
+/* 问题弹幕榜 */
+.cringe-board { background:white; padding:25px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); margin-bottom:30px; }
+.cringe-board h3 { font-size:17px; margin-bottom:15px; color:#555; }
+.cringe-board table { width:100%; border-collapse:collapse; font-size:14px; }
+.cringe-board th, .cringe-board td { text-align:left; padding:8px 10px; border-bottom:1px solid #f0f0f0; vertical-align:top; }
+.cringe-board th { color:#999; font-weight:500; }
+.cringe-board a { color:#00a1d6; text-decoration:none; }
+.cringe-reason { font-size:12px; color:#999; }
+
+/* 关注偏好 */
+.fol-section { background:#f0f4ff; border-radius:8px; padding:14px 16px; }
+.fol-stats { display:flex; gap:16px; flex-wrap:wrap; font-size:14px; color:#555; margin-bottom:10px; }
+.fol-stats span { background:white; padding:3px 10px; border-radius:10px; font-weight:500; }
+.up-chips { display:flex; flex-wrap:wrap; gap:8px; max-height:120px; overflow-y:auto; }
+.up-chip { font-size:14px; background:white; color:#2e7d32; padding:5px 12px; border-radius:10px; cursor:pointer; transition:all 0.2s; border:1px solid #e8f5e9; position:relative; }
+.up-chip:hover { background:#2e7d32; color:white; transform:scale(1.05); box-shadow:0 2px 8px rgba(46,125,50,0.3); z-index:10; }
+
+/* 词云弹窗 */
+.wc-popup { display:none; position:fixed; z-index:9999; background:white; border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.2); padding:12px; width:300px; height:240px; }
+.wc-popup canvas { width:100%; height:100%; }
+
+@media(max-width:768px){
+.user-grid { grid-template-columns:1fr; }
+.stats-bar { grid-template-columns:repeat(3,1fr); }
+.info-grid { grid-template-columns:repeat(2,1fr); }
+.charts-grid { grid-template-columns:1fr; }
+}
+"""
 
 
 def esc(s):
@@ -202,7 +314,7 @@ def generate_user_card(profile: dict) -> str:
     avatar_html = f'<a href="{profile_url}" target="_blank"><img src="{safe_url(face)}" alt="{esc(name)}" loading="lazy" onerror="this.style.display=\'none\'"></a>' if face else f'<div class="avatar-text">{esc(name[0]) if name else "?"}</div>'
 
     return f'''
-    <div class="user-card" data-level="{esc(level)}" data-vip="{profile.get('vip_status',0)==1}" data-spam="{esc(spam_level)}" data-official="{profile.get('official_type',-1)>=0}">
+    <div class="user-card" id="uid-{esc(uid)}" data-level="{esc(level)}" data-vip="{profile.get('vip_status',0)==1}" data-spam="{esc(spam_level)}" data-official="{profile.get('official_type',-1)>=0}">
         <div class="card-header">
             <div class="avatar">{avatar_html}</div>
             <div class="header-info">
@@ -283,41 +395,32 @@ def generate_summary_stats(profiles: list[dict]) -> dict:
     }
 
 
-def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
-    """生成完整HTML报告"""
-    stats = generate_summary_stats(profiles)
-    title = video_info.get("title", "未知视频")
-    bvid = video_info.get("bvid", "")
-
-    # 用户卡片
-    # 用户卡片按风险等级排序展示：高→中→低；同级按兴趣分（刷屏分/问题弹幕严重度/弹幕数）降序
+def sort_profiles_by_risk(profiles: list[dict]) -> list[dict]:
+    """用户卡片排序：风险等级 高→中→低；同级按兴趣分（刷屏分/问题弹幕严重度/弹幕数）降序"""
     risk_rank = {"高": 0, "中": 1, "低": 2}
-    profiles = sorted(profiles, key=lambda p: (
+    return sorted(profiles, key=lambda p: (
         risk_rank.get(p.get("danmaku", {}).get("spam_level", "低"), 2),
         -p.get("danmaku", {}).get("spam_score", 0.0),
         -p.get("cringe", {}).get("max_severity", 0),
         -p.get("danmaku", {}).get("count", 0),
     ))
-    cards_html = "".join(generate_user_card(p) for p in profiles)
 
-    # 图表数据
-    level_labels = [f"Lv.{i}" for i in range(7)]
-    level_data = [stats["levels"].get(i, 0) for i in range(7)]
 
-    spam_labels = ["低", "中", "高"]
-    spam_data = [stats["spam_levels"].get(l, 0) for l in spam_labels]
-
-    tag_labels = list(stats["top_tags"].keys())[:10]
-    tag_data = list(stats["top_tags"].values())[:10]
-
-    # 统计AI画像覆盖（深掘/旧字段任一存在即计数）
-    ai_count = sum(1 for p in profiles if p.get("ai_deep") or p.get("ai_analysis"))
-
-    # 地域分布：从 ip_location（格式 "IP属地：江苏"）提取省份，Top10 + 其他
+def generate_chart_data(profiles: list[dict]) -> dict:
+    """概览标签页四个图表的数据（等级/刷屏风险/标签/地域分布 Top10+其他）"""
+    stats = generate_summary_stats(profiles)
+    data = {
+        "level_labels": [f"Lv.{i}" for i in range(7)],
+        "level_data": [stats["levels"].get(i, 0) for i in range(7)],
+        "spam_labels": ["低", "中", "高"],
+        "spam_data": [stats["spam_levels"].get(l, 0) for l in ["低", "中", "高"]],
+        "tag_labels": list(stats["top_tags"].keys())[:10],
+        "tag_data": list(stats["top_tags"].values())[:10],
+    }
+    # 地域分布：从 ip_location（格式 "IP属地：江苏"）提取省份，Top10 + 其他；
+    # 注意无评论属地的用户该键存在但值为 None，不能用 p.get("ip_location", "")
     region_counts = Counter()
     for p in profiles:
-        # 注意：无评论属地的用户该键存在但值为 None（profile_analyzer 用 .get 透传），
-        # 不能用 p.get("ip_location", "")——默认值只在缺键时生效
         loc = p.get("ip_location") or ""
         if loc.startswith("IP属地："):
             province = loc[len("IP属地："):].strip()
@@ -330,56 +433,31 @@ def generate_html_report(video_info: dict, profiles: list[dict]) -> str:
     if other_count > 0:
         region_labels.append("其他")
         region_data.append(other_count)
-    # 无任何属地数据时不渲染该图
-    region_chart_html = '<div class="chart-card"><h3>地域分布 Top10</h3><canvas id="regionChart"></canvas></div>' if region_labels else ''
-    region_chart_js = f'''
-new Chart(document.getElementById('regionChart'),{{
-    type:'bar',
-    data:{{labels:{js_json(region_labels)},datasets:[{{label:'人数',data:{js_json(region_data)},backgroundColor:'#fb7299',borderRadius:6}}]}},
-    options:{{responsive:true,indexAxis:'y',plugins:{{legend:{{display:false}}}}}}
-}});''' if region_labels else ''
+    data["region_labels"] = region_labels
+    data["region_data"] = region_data
+    return data
 
-    # 历史弹幕覆盖率（阶段2合并历史快照时由 main.py 写入；数字均为 int）
-    coverage = video_info.get("danmaku_coverage")
-    coverage_line = ""
-    if coverage:
-        coverage_line = (
-            f"<br>弹幕覆盖: 实时池 {coverage['realtime']:,} 条 + "
-            f"历史快照去重后新增 {coverage['history_new']:,} 条 = 合并共 {coverage['merged']:,} 条"
-            f"（历史快照原始 {coverage['history']:,} 条，每日上限1000条，可能不完整）"
-        )
 
-    # 收集所有UP主词云数据 (per-upid word freq)
-    up_wc_entries = []
-    for p in profiles:
-        uid = p.get("uid", 0)
-        fol = p.get("following_summary", {})
-        for i, up in enumerate(fol.get("up_details", [])):
-            wf = up.get("word_freq", [])
-            if wf:
-                up_id = f"up_{uid}_{i}"
-                up_wc_entries.append(f'{js_json(up_id)}:{js_json(wf)}')
-    up_wc_js = "{" + ",".join(up_wc_entries) + "}"
-
-    # 问题弹幕榜：按发送者聚合（最高严重度、条数降序），无命中时不渲染
+def generate_cringe_board(profiles: list[dict]) -> str:
+    """问题弹幕榜：按发送者聚合（最高严重度、条数降序），无命中时返回空串"""
     cringe_entries = [p for p in profiles if p.get("cringe", {}).get("count", 0) >= 1]
     cringe_entries.sort(key=lambda p: (p["cringe"].get("max_severity", 0), p["cringe"]["count"]),
                         reverse=True)
-    cringe_board_html = ""
-    if cringe_entries:
-        rows = []
-        for p in cringe_entries:
-            cr = p["cringe"]
-            example = (cr.get("examples") or [{}])[0]
-            rows.append(
-                f'<tr><td><a href="https://space.bilibili.com/{esc(p.get("uid", 0))}" target="_blank" rel="noopener">{esc(p.get("name", "未知"))}</a></td>'
-                f'<td>{esc(cr["count"])}</td>'
-                f'<td>{_category_chips(cr.get("categories", []))}</td>'
-                f'<td>{esc(cr.get("max_severity", 0))}</td>'
-                f'<td>{esc(example.get("content", ""))}<br>'
-                f'<span class="cringe-reason">{esc(example.get("category", ""))}: {esc(example.get("reason", ""))}</span></td></tr>'
-            )
-        cringe_board_html = f'''
+    if not cringe_entries:
+        return ""
+    rows = []
+    for p in cringe_entries:
+        cr = p["cringe"]
+        example = (cr.get("examples") or [{}])[0]
+        rows.append(
+            f'<tr><td><a href="https://space.bilibili.com/{esc(p.get("uid", 0))}" target="_blank" rel="noopener">{esc(p.get("name", "未知"))}</a></td>'
+            f'<td>{esc(cr["count"])}</td>'
+            f'<td>{_category_chips(cr.get("categories", []))}</td>'
+            f'<td>{esc(cr.get("max_severity", 0))}</td>'
+            f'<td>{esc(example.get("content", ""))}<br>'
+            f'<span class="cringe-reason">{esc(example.get("category", ""))}: {esc(example.get("reason", ""))}</span></td></tr>'
+        )
+    return f'''
     <div class="cringe-board">
         <h3>🚨 问题弹幕榜（{len(cringe_entries)} 人命中）</h3>
         <table>
@@ -388,282 +466,15 @@ new Chart(document.getElementById('regionChart'),{{
         </table>
     </div>'''
 
-    html = f'''<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>B站弹幕用户画像分析 - {esc(title)}</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/wordcloud@1.2.2/src/wordcloud2.min.js"></script>
-<style>
-* {{ margin:0; padding:0; box-sizing:border-box; }}
-body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#e8ecf1; color:#333; line-height:1.7; font-size:17px; }}
-.container {{ max-width:1400px; margin:0 auto; padding:24px; }}
 
-.header {{ background:linear-gradient(135deg,#00a1d6,#fb7299); color:white; padding:40px; border-radius:16px; margin-bottom:30px; box-shadow:0 10px 40px rgba(0,161,214,0.2); }}
-.header h1 {{ font-size:30px; margin-bottom:10px; }}
-.header .meta {{ opacity:0.9; font-size:15px; }}
-
-.stats-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:15px; margin-bottom:30px; }}
-.stat-card {{ background:white; padding:20px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); text-align:center; }}
-.stat-card .num {{ font-size:36px; font-weight:700; color:#00a1d6; }}
-.stat-card .label {{ font-size:13px; color:#999; margin-top:5px; }}
-
-.charts-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px; margin-bottom:30px; }}
-.chart-card {{ background:white; padding:25px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); }}
-.chart-card h3 {{ font-size:17px; margin-bottom:15px; color:#555; }}
-
-.filter-bar {{ display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }}
-.filter-btn {{ padding:8px 20px; border:2px solid #e0e0e0; border-radius:25px; background:white; cursor:pointer; font-size:14px; transition:all 0.2s; }}
-.filter-btn:hover {{ border-color:#00a1d6; color:#00a1d6; }}
-.filter-btn.active {{ background:#00a1d6; color:white; border-color:#00a1d6; }}
-
-.user-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(520px,1fr)); gap:20px; }}
-.user-card {{ background:white; border-radius:14px; overflow:hidden; box-shadow:0 4px 24px rgba(0,0,0,0.10); transition:all 0.3s; border:1px solid #e8e8e8; }}
-.user-card:hover {{ transform:translateY(-3px); box-shadow:0 8px 40px rgba(0,0,0,0.15); }}
-
-.card-header {{ display:flex; align-items:flex-start; padding:20px; background:linear-gradient(135deg,#fafafa,#f0f0f0); }}
-.avatar {{ width:60px; height:60px; border-radius:50%; overflow:hidden; margin-right:15px; flex-shrink:0; background:#e0e0e0; display:flex; align-items:center; justify-content:center; }}
-.avatar img {{ width:100%; height:100%; object-fit:cover; }}
-.avatar-text {{ font-size:24px; font-weight:bold; color:#00a1d6; }}
-.header-info {{ flex:1; }}
-.name-line {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }}
-.username {{ font-size:20px; font-weight:600; }}
-.username-link {{ text-decoration:none; color:inherit; }}
-.username-link:hover {{ color:#00a1d6; }}
-.uid {{ font-size:12px; color:#999; background:#f0f0f0; padding:2px 8px; border-radius:10px; }}
-.level-badge {{ font-size:12px; background:#00a1d6; color:white; padding:2px 8px; border-radius:10px; }}
-.vip-badge {{ font-size:12px; background:#fb7299; color:white; padding:2px 8px; border-radius:10px; }}
-.risk-badge {{ font-size:12px; background:#ff9800; color:white; padding:2px 8px; border-radius:10px; }}
-.sign {{ font-size:13px; color:#666; margin-top:4px; }}
-.tags {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }}
-.tag {{ font-size:12px; background:#e3f2fd; color:#1976d2; padding:3px 10px; border-radius:12px; }}
-
-.stats-bar {{ display:grid; grid-template-columns:repeat(5,1fr); gap:10px; padding:15px 20px; border-bottom:1px solid #f0f0f0; }}
-.stats-bar .stat {{ text-align:center; }}
-.stats-bar .num {{ font-size:18px; font-weight:700; color:#00a1d6; }}
-.stats-bar .label {{ font-size:12px; color:#999; }}
-
-.card-body {{ padding:15px 20px; }}
-.section {{ margin-bottom:15px; padding-bottom:15px; border-bottom:1px solid #f5f5f5; }}
-.section:last-child {{ border-bottom:none; margin-bottom:0; }}
-.section h4 {{ font-size:15px; color:#555; margin-bottom:10px; display:flex; align-items:center; gap:8px; }}
-.spam-badge {{ font-size:12px; padding:2px 8px; border-radius:10px; margin-left:auto; }}
-.spam-低 {{ background:#e8f5e9; color:#388e3c; }}
-.spam-中 {{ background:#fff3e0; color:#f57c00; }}
-.spam-高 {{ background:#ffebee; color:#d32f2f; }}
-.detail {{ font-size:13px; color:#666; margin-bottom:8px; }}
-.reason {{ font-size:12px; color:#d32f2f; margin-top:6px; }}
-.info-grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; font-size:18px; color:#555; }}
-.list {{ list-style:none; font-size:13px; color:#555; }}
-.list li {{ padding:4px 0; border-bottom:1px dotted #eee; }}
-.list li:last-child {{ border-bottom:none; }}
-
-/* 弹幕编号列表 */
-.dm-list {{ font-size:14px; color:#444; padding-left:24px; margin:6px 0; max-height:200px; overflow-y:auto; }}
-.dm-list li {{ padding:6px 0; border-bottom:1px dotted #eee; line-height:1.5; }}
-.dm-list li:last-child {{ border-bottom:none; }}
-
-.dm-time {{ font-size:12px; color:#999; margin-left:6px; font-family:monospace; background:#f0f0f0; padding:1px 6px; border-radius:4px; }}
-
-.samples {{ display:flex; flex-wrap:wrap; gap:6px; }}
-.sample {{ font-size:13px; background:#f5f5f5; color:#555; padding:4px 10px; border-radius:8px; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.sample.following {{ background:#e8f5e9; color:#2e7d32; }}
-
-.ai-section {{ background:#f8f9ff; border-radius:8px; padding:12px 15px; }}
-.ai-section h4 {{ color:#6c5ce7; }}
-.ai-text {{ font-size:14px; color:#555; line-height:1.8; }}
-.ai-text p {{ margin:6px 0; }}
-.ai-text strong {{ color:#333; }}
-.ai-text br {{ display:block; content:''; margin:2px 0; }}
-
-/* 问题弹幕榜 */
-.cringe-board {{ background:white; padding:25px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); margin-bottom:30px; }}
-.cringe-board h3 {{ font-size:17px; margin-bottom:15px; color:#555; }}
-.cringe-board table {{ width:100%; border-collapse:collapse; font-size:14px; }}
-.cringe-board th, .cringe-board td {{ text-align:left; padding:8px 10px; border-bottom:1px solid #f0f0f0; vertical-align:top; }}
-.cringe-board th {{ color:#999; font-weight:500; }}
-.cringe-board a {{ color:#00a1d6; text-decoration:none; }}
-.cringe-reason {{ font-size:12px; color:#999; }}
-
-/* 关注偏好 */
-.fol-section {{ background:#f0f4ff; border-radius:8px; padding:14px 16px; }}
-.fol-stats {{ display:flex; gap:16px; flex-wrap:wrap; font-size:14px; color:#555; margin-bottom:10px; }}
-.fol-stats span {{ background:white; padding:3px 10px; border-radius:10px; font-weight:500; }}
-.up-chips {{ display:flex; flex-wrap:wrap; gap:8px; max-height:120px; overflow-y:auto; }}
-.up-chip {{ font-size:14px; background:white; color:#2e7d32; padding:5px 12px; border-radius:10px; cursor:pointer; transition:all 0.2s; border:1px solid #e8f5e9; position:relative; }}
-.up-chip:hover {{ background:#2e7d32; color:white; transform:scale(1.05); box-shadow:0 2px 8px rgba(46,125,50,0.3); z-index:10; }}
-
-/* 词云弹窗 */
-.wc-popup {{ display:none; position:fixed; z-index:9999; background:white; border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.2); padding:12px; width:300px; height:240px; }}
-.wc-popup canvas {{ width:100%; height:100%; }}
-
-@media(max-width:768px){{
-.user-grid {{ grid-template-columns:1fr; }}
-.stats-bar {{ grid-template-columns:repeat(3,1fr); }}
-.info-grid {{ grid-template-columns:repeat(2,1fr); }}
-.charts-grid {{ grid-template-columns:1fr; }}
-}}
-</style>
-</head>
-<body>
-<div class="container">
-    <div class="header">
-        <h1>🎬 B站弹幕用户画像分析</h1>
-        <div class="meta">
-            <strong>{esc(title)}</strong><br>
-            BV: {esc(bvid)} | 播放: {video_info.get('stat',{}).get('view',0):,} | 
-            弹幕: {video_info.get('stat',{}).get('danmaku',0):,} | 
-            评论: {video_info.get('stat',{}).get('reply',0):,}<br>
-            分析用户数: {stats['total']} | 大会员: {stats['vip_count']} | 
-            刷屏用户: {stats['spam_levels'].get('高',0)+stats['spam_levels'].get('中',0)} |
-            AI画像: {ai_count}{coverage_line}
-        </div>
-    </div>
-
-    <div class="stats-grid">
-        <div class="stat-card"><div class="num">{stats['total']}</div><div class="label">分析用户</div></div>
-        <div class="stat-card"><div class="num">{stats['vip_count']}</div><div class="label">大会员</div></div>
-        <div class="stat-card"><div class="num">{sum(1 for p in profiles if p.get('level',0)>=5)}</div><div class="label">Lv.5+</div></div>
-        <div class="stat-card"><div class="num">{stats['spam_levels'].get('高',0)}</div><div class="label">重度刷屏</div></div>
-        <div class="stat-card"><div class="num">{stats['spam_levels'].get('中',0)}</div><div class="label">中度刷屏</div></div>
-        <div class="stat-card"><div class="num">{ai_count}</div><div class="label">AI画像</div></div>
-    </div>
-
-    <div class="charts-grid">
-        <div class="chart-card"><h3>用户等级分布</h3><canvas id="levelChart"></canvas></div>
-        <div class="chart-card"><h3>刷屏风险分布</h3><canvas id="spamChart"></canvas></div>
-        <div class="chart-card"><h3>用户标签 Top10</h3><canvas id="tagChart"></canvas></div>
-        {region_chart_html}
-    </div>
-
-    {cringe_board_html}
-
-    <div class="filter-bar">
-        <button class="filter-btn active" onclick="filter('all', this)">全部</button>
-        <button class="filter-btn" onclick="filter('high-level', this)">Lv.5+</button>
-        <button class="filter-btn" onclick="filter('vip', this)">大会员</button>
-        <button class="filter-btn" onclick="filter('official', this)">认证用户</button>
-        <button class="filter-btn" onclick="filter('spam', this)">刷屏用户</button>
-        <button class="filter-btn" onclick="filter('creator', this)">UP主</button>
-    </div>
-
-    <div class="user-grid" id="userGrid">
-        {cards_html}
-    </div>
-
-    <div id="wc-popup" class="wc-popup">
-        <canvas id="wc-popup-canvas" width="276" height="216"></canvas>
-    </div>
-
-    <div style="text-align:center; padding:40px; color:#999; font-size:12px;">
-        报告生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    </div>
-</div>
-
-<script>
-// 词云数据
-// UP主词云数据
-const upWcData = {up_wc_js};
-
-// UP主悬停词云弹窗
-const popup = document.getElementById('wc-popup');
-const popupCanvas = document.getElementById('wc-popup-canvas');
-let activeUpId = null;
-
-document.querySelectorAll('.up-chip').forEach(chip => {{
-    chip.addEventListener('mouseenter', function(e) {{
-        const upId = this.dataset.upid;
-        const data = upWcData[upId];
-        if (!data || data.length === 0) return;
-        activeUpId = upId;
-
-        // 定位弹窗在chip旁边
-        const rect = this.getBoundingClientRect();
-        popup.style.display = 'block';
-        popup.style.left = Math.min(rect.left, window.innerWidth - 320) + 'px';
-        popup.style.top = (rect.bottom + 8) + 'px';
-
-        // 渲染词云
-        const maxW = Math.max(...data.map(d => d[1]));
-        const minW = Math.min(...data.map(d => d[1]));
-        const scaled = data.map(d => [d[0], 10 + (d[1] - minW) / Math.max(maxW - minW, 1) * 50]);
-        WordCloud(popupCanvas, {{
-            list: scaled,
-            gridSize: 10,
-            weightFactor: 1,
-            fontFamily: 'sans-serif',
-            color: () => ['#00a1d6','#fb7299','#ff9f43','#6c5ce7','#2e7d32'][Math.floor(Math.random()*5)],
-            rotateRatio: 0,
-            backgroundColor: '#ffffff',
-            shape: 'circle',
-            clearCanvas: true,
-        }});
-    }});
-    chip.addEventListener('mouseleave', function() {{
-        popup.style.display = 'none';
-        activeUpId = null;
-    }});
-}});
-
-// 筛选
-function filter(type, el) {{
-    document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
-    el.classList.add('active');
-    document.querySelectorAll('.user-card').forEach(card=>{{
-        let show=true;
-        const level=parseInt(card.dataset.level)||0;
-        const isVip=card.dataset.vip==='true';
-        const spam=card.dataset.spam;
-        const official=card.dataset.official==='true';
-        const isCreator=parseInt(card.querySelector('.stats-bar .stat:nth-child(4) .num')?.textContent||0)>0;
-        switch(type){{
-            case 'all': show=true; break;
-            case 'high-level': show=level>=5; break;
-            case 'vip': show=isVip; break;
-            case 'official': show=official; break;
-            case 'spam': show=spam!=='低'; break;
-            case 'creator': show=isCreator; break;
-        }}
-        card.style.display=show?'':'none';
-    }});
-}}
-
-new Chart(document.getElementById('levelChart'),{{
-    type:'bar',
-    data:{{labels:{js_json(level_labels)},datasets:[{{label:'人数',data:{js_json(level_data)},backgroundColor:'#00a1d6',borderRadius:6}}]}},
-    options:{{responsive:true,plugins:{{legend:{{display:false}}}}}}
-}});
-
-new Chart(document.getElementById('spamChart'),{{
-    type:'doughnut',
-    data:{{labels:['低风险','中风险','高风险'],datasets:[{{data:{js_json(spam_data)},backgroundColor:['#4caf50','#ff9800','#f44336']}}]}},
-    options:{{responsive:true}}
-}});
-
-new Chart(document.getElementById('tagChart'),{{
-    type:'bar',
-    data:{{labels:{js_json(tag_labels)},datasets:[{{label:'出现次数',data:{js_json(tag_data)},backgroundColor:'#ff9f43',borderRadius:6}}]}},
-    options:{{responsive:true,indexAxis:'y',plugins:{{legend:{{display:false}}}}}}
-}});
-{region_chart_js}
-</script>
-</body>
-</html>'''
-
-    return html
-
-
-def save_report(video_info: dict, profiles: list[dict]) -> str:
-    """保存HTML报告到文件"""
-    bvid = video_info.get("bvid", "unknown")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"report_{bvid}_{timestamp}.html"
-    filepath = os.path.join(REPORT_DIR, filename)
-
-    html = generate_html_report(video_info, profiles)
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    return filepath
+def up_wordcloud_data(profiles: list[dict]) -> dict:
+    """收集所有UP主词云数据：{up_{uid}_{i}: [[词, 权重], ...]}，供 up-chip 悬停词云弹窗"""
+    result = {}
+    for p in profiles:
+        uid = p.get("uid", 0)
+        fol = p.get("following_summary", {})
+        for i, up in enumerate(fol.get("up_details", [])):
+            wf = up.get("word_freq", [])
+            if wf:
+                result[f"up_{uid}_{i}"] = wf
+    return result
