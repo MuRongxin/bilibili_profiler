@@ -14,6 +14,7 @@ import os
 import json
 import glob
 import sqlite3
+from contextlib import closing
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
@@ -33,10 +34,8 @@ PAGE_SIZE = 100  # 弹幕 API 固定每页条数（spec 4）
 
 def _load_video_row(bvid: str):
     """videos 表整行；不存在返回 None"""
-    conn = get_db()
-    row = conn.execute("SELECT * FROM videos WHERE bvid = ?", (bvid,)).fetchone()
-    conn.close()
-    return row
+    with closing(get_db()) as conn:
+        return conn.execute("SELECT * FROM videos WHERE bvid = ?", (bvid,)).fetchone()
 
 
 def _load_profiles(bvid: str) -> list[dict]:
@@ -60,14 +59,14 @@ def _load_profiles(bvid: str) -> list[dict]:
 def _sender_meta(bvid: str) -> dict:
     """发送者联查（spec 5）：mid_hash → {uid, name, spam_level, categories}。
     uid/name/spam_level 来自 senders LEFT JOIN users；categories 从 users.profile_json
-    的 cringe 字段 Python 侧解析（非 SQL）。senders 无行的 mid_hash 不在此表 → 未分析。"""
-    conn = get_db()
-    rows = conn.execute('''
+    的 cringe 字段 Python 侧解析（非 SQL）。senders 无行的 mid_hash 不在此表 → 未分析。
+    连接用 closing 保证异常路径也关闭（参照 storage.py 模式）。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute('''
         SELECT s.mid_hash, s.uid, s.spam_level, u.name, u.profile_json
         FROM senders s LEFT JOIN users u ON u.uid = s.uid
         WHERE s.bvid = ?
     ''', (bvid,)).fetchall()
-    conn.close()
     meta = {}
     for r in rows:
         categories = []
@@ -458,7 +457,13 @@ def api_danmaku(bvid: str):
     返回 {rows: [...], total: int, page: int}；每行 content/dup_count/mid_hash/uid/name/
     first_video_time/first_send_time/categories/spam_level。
     """
-    if _load_video_row(bvid) is None:
+    # 数据库锁定/查询异常 → 500 JSON（spec 7），与下方主查询同一降级口径
+    try:
+        video_row = _load_video_row(bvid)
+    except sqlite3.Error as e:
+        return jsonify({"error": f"数据库查询失败: {e}"}), 500
+    # 返回 None 是"未知视频→404"的正常路径，不能与异常混淆
+    if video_row is None:
         return jsonify({"error": "未知视频"}), 404
 
     args = request.args
@@ -473,7 +478,11 @@ def api_danmaku(bvid: str):
     except ValueError:
         page = 1
 
-    meta = _sender_meta(bvid)
+    # 数据库锁定 → 500 JSON（与主查询同一降级口径）
+    try:
+        meta = _sender_meta(bvid)
+    except sqlite3.Error as e:
+        return jsonify({"error": f"数据库查询失败: {e}"}), 500
 
     where = ["d.bvid = ?"]
     params: list = [bvid]
@@ -546,11 +555,11 @@ def api_danmaku(bvid: str):
     full_params = [bvid] + params
 
     # 数据库锁定/查询异常 → 500 JSON（spec 7），前端显示错误提示不崩溃
+    # closing 保证异常路径连接也关闭，不泄漏
     try:
-        conn = get_db()
-        total = conn.execute(count_sql, full_params).fetchone()[0]
-        raw_rows = conn.execute(rows_sql, full_params).fetchall()
-        conn.close()
+        with closing(get_db()) as conn:
+            total = conn.execute(count_sql, full_params).fetchone()[0]
+            raw_rows = conn.execute(rows_sql, full_params).fetchall()
     except sqlite3.Error as e:
         return jsonify({"error": f"数据库查询失败: {e}"}), 500
 
