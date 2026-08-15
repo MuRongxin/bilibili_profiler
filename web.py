@@ -146,8 +146,20 @@ VIDEO_EXTRA_CSS = """
 .top10-list a { color:#00a1d6; cursor:pointer; text-decoration:none; }
 """
 
-# 弹幕浏览器样式占位（Task 6 填充）
-DM_CSS = ""
+# 弹幕浏览器样式（Task 6）
+DM_CSS = """
+.dm-controls { display:flex; gap:10px; margin-bottom:15px; flex-wrap:wrap; align-items:center; }
+.dm-controls select { padding:7px 10px; border:2px solid #e0e0e0; border-radius:8px; font-size:14px; background:white; }
+.dm-table-wrap { background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); padding:15px; overflow-x:auto; }
+.dm-table { width:100%; border-collapse:collapse; font-size:14px; }
+.dm-table th, .dm-table td { text-align:left; padding:8px 10px; border-bottom:1px solid #f0f0f0; vertical-align:top; }
+.dm-table th { color:#999; font-weight:500; white-space:nowrap; }
+.dm-table a { color:#00a1d6; text-decoration:none; cursor:pointer; }
+.dm-pager { display:flex; gap:15px; align-items:center; justify-content:center; padding:15px; }
+.dm-pager button { padding:6px 18px; border:2px solid #e0e0e0; border-radius:20px; background:white; cursor:pointer; }
+.dm-pager button:disabled { opacity:0.4; cursor:default; }
+.dm-error { color:#d32f2f; padding:15px; text-align:center; }
+"""
 
 VIDEO_JS = """
 // 标签页切换
@@ -254,7 +266,92 @@ function gotoUser(uid) {
     }
 }
 
-// __DM_BROWSER_JS__
+// 弹幕浏览器（JSON API + 前端渲染当前页，spec 4）
+const BVID = "__BVID__";
+const dmState = {page: 1};
+let dmTimer = null;
+
+function dmParams() {
+    const p = new URLSearchParams();
+    const search = document.getElementById('dmSearch').value.trim();
+    const sender = document.getElementById('dmSender').value.trim();
+    const cat = document.getElementById('dmCategory').value;
+    const spam = document.getElementById('dmSpam').value;
+    if (search) p.set('search', search);
+    if (sender) p.set('sender', sender);
+    if (cat) p.set('category', cat);
+    if (spam) p.set('spam', spam);
+    if (document.getElementById('dmAnalyzed').checked) p.set('analyzed', '1');
+    p.set('sort', document.getElementById('dmSort').value);
+    p.set('order', document.getElementById('dmOrder').value);
+    p.set('page', dmState.page);
+    return p.toString();
+}
+
+function escHtml(s) {
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function fmtVideoTime(sec) {
+    const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+    return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+
+function loadDanmaku() {
+    const err = document.getElementById('dmError');
+    err.style.display = 'none';
+    fetch('/api/video/' + encodeURIComponent(BVID) + '/danmaku?' + dmParams())
+        .then(r => {
+            if (!r.ok) return r.json().then(j => Promise.reject(new Error(j.error || ('HTTP ' + r.status))));
+            return r.json();
+        })
+        .then(data => {
+            const tbody = document.getElementById('dmTbody');
+            tbody.innerHTML = data.rows.map(row => {
+                const sender = row.uid
+                    ? '<a onclick="gotoUser(' + row.uid + ')">' + escHtml(row.name || row.uid) + '</a><br><span class="dm-time">UID:' + row.uid + '</span>'
+                    : '<span class="dm-time">' + escHtml(row.mid_hash) + '</span>';
+                const dup = row.dup_count > 1 ? ' <span class="dm-time">×' + row.dup_count + '</span>' : '';
+                const cats = (row.categories || []).map(c =>
+                    '<span style="display:inline-block;background:' + (dmCatColors[c] || '#999') +
+                    ';color:#fff;font-size:12px;border-radius:4px;padding:1px 8px;margin:1px 2px;">' +
+                    escHtml(c) + '</span>').join('');
+                return '<tr><td>' + escHtml(row.content) + dup + '</td><td>' + sender + '</td><td>' +
+                    fmtVideoTime(row.first_video_time) + '</td><td>' +
+                    new Date(row.first_send_time * 1000).toLocaleString() + '</td><td>' + cats + '</td><td>' +
+                    escHtml(row.spam_level) + '</td></tr>';
+            }).join('') || '<tr><td colspan="6" class="empty-note">无匹配弹幕</td></tr>';
+            const pages = Math.max(1, Math.ceil(data.total / 100));
+            document.getElementById('dmPageInfo').textContent =
+                '第 ' + data.page + ' / ' + pages + ' 页（共 ' + data.total + ' 行）';
+            document.getElementById('dmPrev').disabled = data.page <= 1;
+            document.getElementById('dmNext').disabled = data.page >= pages;
+        })
+        .catch(e => {
+            err.textContent = '弹幕加载失败: ' + e.message;
+            err.style.display = 'block';
+        });
+}
+
+function dmPage(delta) { dmState.page = Math.max(1, dmState.page + delta); loadDanmaku(); }
+function dmReload() { dmState.page = 1; loadDanmaku(); }
+
+// 统计面板 Top10 点击 → 切到弹幕浏览器并筛选该发送者（spec 4）
+function filterSender(midHash) {
+    switchTab('danmaku');
+    document.getElementById('dmSender').value = midHash;
+    dmReload();
+}
+
+// 事件绑定（旧视频无全量弹幕时无 dmTbody，跳过）
+if (document.getElementById('dmTbody')) {
+    document.getElementById('dmSearch').addEventListener('input', () => { clearTimeout(dmTimer); dmTimer = setTimeout(dmReload, 400); });
+    document.getElementById('dmSender').addEventListener('input', () => { clearTimeout(dmTimer); dmTimer = setTimeout(dmReload, 400); });
+    ['dmCategory', 'dmSpam', 'dmSort', 'dmOrder', 'dmAnalyzed'].forEach(id =>
+        document.getElementById(id).addEventListener('change', dmReload));
+    loadDanmaku();
+}
 """
 
 
@@ -360,7 +457,32 @@ def video_page(bvid: str):
             <div class="chart-card"><h3>问题弹幕类别分布</h3><canvas id="dmCatChart"></canvas></div>
             <div class="chart-card"><h3>发送者弹幕数 Top10（点击筛选）</h3><div class="top10-list">{top10_html}</div></div>
         </div>
-        <div id="dmBrowser"></div>'''
+        <div class="dm-controls">
+            <input id="dmSearch" class="search-input" placeholder="搜索弹幕内容...">
+            <input id="dmSender" class="search-input" placeholder="发送者（昵称/UID/mid_hash）">
+            <select id="dmCategory"><option value="">全部类别</option>{"".join(f'<option value="{esc(c)}">{esc(c)}</option>' for c in PROBLEM_CATEGORY_COLORS)}</select>
+            <select id="dmSpam"><option value="">全部风险</option><option>高</option><option>中</option><option>低</option><option>未分析</option></select>
+            <label><input type="checkbox" id="dmAnalyzed"> 只看已解析</label>
+            <select id="dmSort">
+                <option value="video_time">视频时间</option>
+                <option value="send_time">发送时间</option>
+                <option value="dup_count">重复次数</option>
+                <option value="sender_count">发送者弹幕数</option>
+            </select>
+            <select id="dmOrder"><option value="asc">升序</option><option value="desc">降序</option></select>
+        </div>
+        <div class="dm-table-wrap">
+            <table class="dm-table">
+                <thead><tr><th>弹幕内容</th><th>发送者</th><th>视频时间</th><th>发送时间</th><th>类别</th><th>刷屏</th></tr></thead>
+                <tbody id="dmTbody"></tbody>
+            </table>
+            <div class="dm-pager">
+                <button id="dmPrev" onclick="dmPage(-1)">上一页</button>
+                <span id="dmPageInfo"></span>
+                <button id="dmNext" onclick="dmPage(1)">下一页</button>
+            </div>
+            <div id="dmError" class="dm-error" style="display:none"></div>
+        </div>'''
 
     script = (VIDEO_JS
               .replace("__CHART_JSON__", js_json(chart))
