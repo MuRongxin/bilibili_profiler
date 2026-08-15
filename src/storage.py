@@ -92,6 +92,18 @@ def init_db():
             )
         ''')
 
+        # 全量弹幕表（Web 弹幕浏览器数据源；只存 5 列，mode/fontsize/color/pool/dmid 不入库）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS danmaku (
+                bvid TEXT NOT NULL,
+                mid_hash TEXT NOT NULL,
+                content TEXT NOT NULL,
+                time REAL NOT NULL,        -- 视频内出现时间(秒)
+                timestamp INTEGER NOT NULL -- 发送时间戳
+            )
+        ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_danmaku_bvid ON danmaku(bvid)")
+
         conn.commit()
 
         # 清理旧版本的 progress 表（断点续采已改为纯 senders/users 缓存机制）
@@ -220,6 +232,24 @@ def has_user_data(uid: int) -> bool:
     return row is not None
 
 
+# ========== 全量弹幕（Web 弹幕浏览器数据源） ==========
+
+def save_danmaku(bvid: str, danmaku_list: list[dict]):
+    """阶段2弹幕合并后批量落库：先删该 bvid 旧行再插入，幂等可重跑。
+
+    只存 bvid/mid_hash/content/time/timestamp 五列；Web API 直接 SQL 查询，无 load_danmaku。
+    """
+    rows = [(bvid, dm["mid_hash"], dm["content"], dm["time"], dm["timestamp"])
+            for dm in danmaku_list]
+    with closing(get_db()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
+        cursor.executemany(
+            "INSERT INTO danmaku (bvid, mid_hash, content, time, timestamp) VALUES (?, ?, ?, ?, ?)",
+            rows)
+        conn.commit()
+
+
 # ========== 缓存清理 ==========
 
 def clear_video_cache(bvid: str):
@@ -229,6 +259,7 @@ def clear_video_cache(bvid: str):
     - 删除该 bvid 的全部 senders 记录
     - users 表无 bvid 列，按 uid 关联：仅删除"该 bvid 的 senders 引用、
       且不再被其他 bvid 的 senders 引用"的用户数据，避免误删共享缓存
+    - 删除该 bvid 的全部 danmaku 弹幕行
     - 删除 videos 表中该 bvid 的视频信息记录
     - 删除 llm_cache 中该 bvid 的问题弹幕判定缓存（cringe:{bvid}:*），深掘缓存（deep:*）保留
     """
@@ -240,6 +271,7 @@ def clear_video_cache(bvid: str):
 
         cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,))
+        cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
         # 该视频的问题弹幕判定缓存一并清除（key 前缀 cringe:{bvid}:）；
         # 深掘缓存 key 为 deep:{uid}:...，按用户跨视频复用，不清
         cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cringe:{bvid}:%",))
