@@ -16,8 +16,8 @@
   3. 社交关系网络（关注列表、粉丝、互关）
   4. 行为模式分析（活跃时段、活跃周期、消费行为）
 - **扫码登录**：B站APP扫码，Cookie自动保存复用（支持自动刷新）
-- **交互式HTML报告**：Chart.js图表 + 用户卡片 + 筛选功能 + 地域分布
-- **数据导出**：CSV/JSON 与 HTML 报告同名输出
+- **交互式Web报告**：`python web.py` 启动本地服务（127.0.0.1:8000），多视频浏览 + 概览图表 + 用户画像 + 全量弹幕浏览器 + 问题弹幕榜
+- **数据导出**：CSV/JSON 导出（report_{BV号}_{时间} 前缀），Web 报告页提供下载链接
 - **断点续采**：SQLite持久化，中断后可恢复
 
 ## 安装
@@ -62,14 +62,15 @@ python run.py --batch videos.txt
 
 ## 输出
 
-- **HTML报告**：`data/reports/report_{BV号}_{时间}.html`
-- **数据导出**：`data/reports/report_{BV号}_{时间}.csv` / `.json`（与 HTML 同名）
+- **Web 报告**：`python web.py` 后访问 http://127.0.0.1:8000
+- **数据导出**：`data/reports/report_{BV号}_{时间}.csv` / `.json`（与分析运行同时间戳）
 - **数据库**：`data/profiler.db`（支持中断恢复）
 - **Cookie**：`data/cookie.json`（自动管理登录态）
 
 ## 技术架构
 
 ```
+web.py                 # 交互式 Web 报告服务（Flask，127.0.0.1:8000）
 src/
 ├── main.py              # 主控流程（6阶段流水线）
 ├── auth.py              # 扫码登录 + Cookie管理
@@ -80,7 +81,7 @@ src/
 ├── spam_detector.py     # 刷屏智能检测
 ├── user_collector.py    # 用户深度数据采集（四维度）
 ├── profile_analyzer.py  # 画像分析 + 标签生成
-├── report.py            # HTML报告生成器
+├── report.py            # 报告渲染函数库（被 web.py 复用）
 ├── storage.py           # SQLite持久化
 └── config.py            # 配置常量
 ```
