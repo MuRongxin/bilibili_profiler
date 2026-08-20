@@ -15,7 +15,7 @@ from config import MAX_ANALYZE_USERS_HARD_CAP, LLM_API_KEY, HISTORY_DANMAKU_ENAB
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
-from storage import save_danmaku
+from storage import save_danmaku, save_comments
 from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page, fetch_command_dms, build_command_uid_map
 from danmaku_history import fetch_history_danmaku
@@ -508,6 +508,11 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         uid_comments.setdefault(c["uid"], []).append(c)
     for lst in uid_comments.values():
         lst.sort(key=lambda x: x.get("like", 0), reverse=True)
+    # 评论落库（跨视频足迹数据源，幂等去重；失败只警告不中断）
+    try:
+        save_comments(bvid, comments)
+    except Exception as e:
+        print(f"    警告: 评论落库失败（{e}），跨视频足迹将缺评论")
 
     # 阶段4: UID解析（兴趣分驱动选人）
     resolved = phase_resolve(bvid, sender_groups, comment_uid_map, client,

@@ -50,9 +50,13 @@ def maybe_launch_web(bvid: str):
             if not _alive():
                 print(f"  [Web] web.py 启动超时，日志见 {log_path}")
         if _alive():
+            # 终端下拉起 GTK 系浏览器会打印 "Not loading module atk-bridge" 警告
+            # （at-spi 无障碍桥未加载），无害但脏输出；GTK 读到该环境变量即跳过模块
+            os.environ.setdefault("NO_AT_BRIDGE", "1")
             # webbrowser.open 在无图形环境返回 False/抛异常，降级打印 URL
             if webbrowser.open(url):
                 print(f"  报告页已在浏览器打开: {url}")
+                print("  停止后台 web 服务: python web.py --stop")
             else:
                 print(f"  浏览器打开失败，请手动访问: {url}")
         else:

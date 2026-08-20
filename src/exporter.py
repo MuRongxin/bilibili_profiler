@@ -1,8 +1,8 @@
 """
 画像数据导出模块
 
-在 HTML 报告之外，将发送者画像同步导出为 CSV（Excel 汇总查看）和
-JSON（完整数据留档/二次分析）。文件名与 HTML 报告同前缀。
+将发送者画像同步导出为 CSV（Excel 汇总查看）和 JSON（完整数据留档/二次分析）。
+文件名前缀 report_{BV号}_{时间}；静态单文件 HTML 报告已移除，下载链接由 web.py 报告页提供。
 """
 import csv
 import json

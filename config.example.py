@@ -66,6 +66,21 @@ MITM_MAX_UID = 10_000_000_000   # MITM 反查覆盖上限：全部 ≤10 位 UID
 # ========== 采集配置 ==========
 MAX_COMMENT_PAGES = 100      # 评论最大翻页数（约20条/页，上限~2000条主评论）
 COMMENT_REPLY_MAX_PAGES = 25  # 每条主评论的子评论最多补采页数（pn分页，每页20条，上限500条）
+
+# 跨视频足迹（用户卡片「其他视频足迹」区块：该用户在其他已分析视频中的弹幕/评论）
+MAX_FOOTPRINT_VIDEOS = 5              # 每张卡片最多展示的其他视频数
+MAX_FOOTPRINT_DANMAKU_SAMPLES = 5     # 每个其他视频的弹幕样本条数
+MAX_FOOTPRINT_COMMENT_SAMPLES = 5     # 每个其他视频的评论样本条数
+
+# 高回复评论页（单独成页的潜在争执热点：回复数达阈值的评论独立展示）
+HOT_COMMENT_MIN_REPLIES = 20          # 入选门槛：主评论回复数 >= 该值
+HOT_COMMENT_MAX_SHOW = 50             # 页面最多展示的高回复评论条数
+HOT_COMMENT_REPLY_SAMPLES = 5         # 每条高回复评论下展示的子回复样本数
+
+# 用户互动时间线页（/user/<uid>：该用户在已分析视频中的弹幕/评论足迹，按最近互动倒序）
+USER_TIMELINE_MAX_VIDEOS = 50         # 时间线最多展示的视频数（超出显示「另有 N 个」）
+USER_TIMELINE_SAMPLES = 3             # 每个视频展示的弹幕/评论样本条数
+
 HISTORY_DANMAKU_ENABLED = True   # 是否采集全量历史弹幕（需登录）
 HISTORY_MAX_MONTHS = 24          # 历史弹幕最多回溯月数
 HISTORY_MAX_DAYS = 400           # 历史弹幕最多采集天数（逐日接口，每日1次请求）

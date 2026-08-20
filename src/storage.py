@@ -104,6 +104,33 @@ def init_db():
         ''')
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_danmaku_bvid ON danmaku(bvid)")
 
+        # 评论表（跨视频足迹 + 高回复评论页数据源；reply_count 只对主评论有意义，
+        # root_rpid 记录子评论所属主评论的 rpid，供「高回复评论」页关联争议主楼与回复）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bvid TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                rpid INTEGER NOT NULL DEFAULT 0,
+                content TEXT NOT NULL,
+                ctime INTEGER NOT NULL DEFAULT 0,   -- 评论发送时间戳
+                like INTEGER NOT NULL DEFAULT 0,
+                is_sub INTEGER NOT NULL DEFAULT 0,  -- 1=子评论 0=主评论
+                reply_count INTEGER NOT NULL DEFAULT 0,  -- 主评论的回复总数（rcount）
+                root_rpid INTEGER NOT NULL DEFAULT 0,    -- 子评论所属主评论 rpid
+                UNIQUE(bvid, rpid, uid)
+            )
+        ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_bvid ON comments(bvid)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_uid ON comments(uid)")
+
+        # 旧库迁移：comments 表补 reply_count / root_rpid 列（高回复评论功能）
+        comment_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(comments)").fetchall()}
+        if "reply_count" not in comment_cols:
+            cursor.execute("ALTER TABLE comments ADD COLUMN reply_count INTEGER NOT NULL DEFAULT 0")
+        if "root_rpid" not in comment_cols:
+            cursor.execute("ALTER TABLE comments ADD COLUMN root_rpid INTEGER NOT NULL DEFAULT 0")
+
         conn.commit()
 
         # 清理旧版本的 progress 表（断点续采已改为纯 senders/users 缓存机制）
@@ -250,6 +277,28 @@ def save_danmaku(bvid: str, danmaku_list: list[dict]):
         conn.commit()
 
 
+def save_comments(bvid: str, comments: list[dict]):
+    """阶段3评论采集后批量落库（跨视频足迹数据源）。
+
+    UNIQUE(bvid, rpid, uid) + INSERT OR IGNORE 幂等去重：同一次分析重复落库、
+    --force 重采（清缓存后重采同一批评论）都不会产生重复行。
+    只存 8 列；uname/sign/avatar/location 等仅用于当次运行的内存流程，不入库。
+    """
+    rows = [(bvid, c["uid"], c.get("rpid", 0), c.get("content", ""),
+             c.get("ctime", 0), c.get("like", 0), 1 if c.get("is_sub") else 0,
+             c.get("reply_count", 0), c.get("root_rpid", 0))
+            for c in comments if c.get("uid") and c.get("content")]
+    if not rows:
+        return
+    with closing(get_db()) as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO comments "
+            "(bvid, uid, rpid, content, ctime, like, is_sub, reply_count, root_rpid) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows)
+        conn.commit()
+
+
 # ========== 缓存清理 ==========
 
 def clear_video_cache(bvid: str):
@@ -260,6 +309,7 @@ def clear_video_cache(bvid: str):
     - users 表无 bvid 列，按 uid 关联：仅删除"该 bvid 的 senders 引用、
       且不再被其他 bvid 的 senders 引用"的用户数据，避免误删共享缓存
     - 删除该 bvid 的全部 danmaku 弹幕行
+    - 删除该 bvid 的全部 comments 评论行（跨视频足迹数据源）
     - 删除 videos 表中该 bvid 的视频信息记录
     - 删除 llm_cache 中该 bvid 的问题弹幕判定缓存（cringe:{bvid}:*），深掘缓存（deep:*）保留
     """
@@ -272,6 +322,7 @@ def clear_video_cache(bvid: str):
         cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
+        cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,))
         # 该视频的问题弹幕判定缓存一并清除（key 前缀 cringe:{bvid}:）；
         # 深掘缓存 key 为 deep:{uid}:...，按用户跨视频复用，不清
         cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cringe:{bvid}:%",))
@@ -282,6 +333,43 @@ def clear_video_cache(bvid: str):
                 cursor.execute("DELETE FROM users WHERE uid = ?", (uid,))
 
         conn.commit()
+
+
+def delete_video_data(bvid: str) -> dict:
+    """彻底删除指定视频的全部分析数据（Web 报告页「删除」按钮，spec 9）。
+
+    与 clear_video_cache 的区别——共享缓存一并清除（用户明确选择）：
+    - users 画像行无条件删除（即使仍被其他视频的 senders 引用）
+    - llm_cache 深掘缓存 deep:{uid}:* 删除
+    - global_uid_map 中该视频涉及的 mid_hash 条目删除
+    返回各项删除行数 dict。"""
+    with closing(get_db()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT uid, mid_hash FROM senders WHERE bvid = ?", (bvid,))
+        rows = cursor.fetchall()
+        uids = {r["uid"] for r in rows if r["uid"] is not None}
+        mid_hashes = {r["mid_hash"] for r in rows}
+
+        counts = {}
+        counts["senders"] = cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,)).rowcount
+        counts["danmaku"] = cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,)).rowcount
+        counts["comments"] = cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,)).rowcount
+        counts["videos"] = cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,)).rowcount
+        counts["cringe_cache"] = cursor.execute(
+            "DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cringe:{bvid}:%",)).rowcount
+        counts["deep_cache"] = 0
+        for uid in uids:
+            counts["deep_cache"] += cursor.execute(
+                "DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"deep:{uid}:%",)).rowcount
+        counts["global_uid_map"] = 0
+        for mh in mid_hashes:
+            counts["global_uid_map"] += cursor.execute(
+                "DELETE FROM global_uid_map WHERE mid_hash = ?", (mh,)).rowcount
+        counts["users"] = 0
+        for uid in uids:
+            counts["users"] += cursor.execute("DELETE FROM users WHERE uid = ?", (uid,)).rowcount
+        conn.commit()
+    return counts
 
 
 # ========== 全局 mid_hash→UID 映射库（跨视频复用） ==========

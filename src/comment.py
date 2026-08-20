@@ -118,7 +118,11 @@ def _collect_page(replies: list, oid: int, client: BiliAPIClient) -> list[dict]:
             if c:
                 preview.append(c)
 
-        comments.extend(_fetch_sub_replies(oid, r.get("rpid"), main["reply_count"], preview, client))
+        # 子评论记录所属主评论 root_rpid（「高回复评论」页据此关联争议主楼与回复）
+        subs = _fetch_sub_replies(oid, r.get("rpid"), main["reply_count"], preview, client)
+        for c in subs:
+            c["root_rpid"] = main["rpid"]
+        comments.extend(subs)
     return comments
 
 

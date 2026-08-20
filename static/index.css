@@ -1,0 +1,24 @@
+/* 首页样式（原 web.py INDEX_EXTRA_CSS 平移，Task 7 追加搜索/排序/分页样式） */
+.video-table { width:100%; border-collapse:collapse; background:white; border-radius:12px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,0.04); }
+.video-table th, .video-table td { text-align:left; padding:12px 16px; border-bottom:1px solid #f0f0f0; font-size:15px; }
+.video-table th { color:#999; font-weight:500; }
+.video-table a { color:#00a1d6; text-decoration:none; }
+
+/* 首页：搜索框 / 可排序列头 / 分页条（spec 6） */
+.idx-controls { margin-bottom:16px; }
+.video-table th[data-sort] { cursor:pointer; user-select:none; }
+.video-table th[data-sort]:hover { color:#00a1d6; }
+.video-table th[data-sort]::after { content:' ⇅'; font-size:12px; }
+.idx-pager { display:flex; gap:12px; align-items:center; justify-content:center; padding:18px; }
+.idx-pager span { font-size:14px; color:#999; }
+/* 与 report.css 同款分页按钮（首页不加载 report.css，此处复制） */
+.pager-btn { padding:6px 14px; border:2px solid #e0e0e0; border-radius:18px; background:white; cursor:pointer; font-size:14px; }
+.pager-btn:hover:not(:disabled) { border-color:#00a1d6; color:#00a1d6; }
+.pager-btn:disabled { opacity:0.4; cursor:default; }
+/* 与 report.css 同款搜索框（首页不加载 report.css，此处复制） */
+.search-input { padding:8px 14px; border:2px solid #e0e0e0; border-radius:25px; font-size:14px; width:220px; outline:none; }
+.search-input:focus { border-color:#00a1d6; }
+
+/* 删除按钮警示色（spec 9） */
+.btn-danger { border-color:#f44336 !important; color:#f44336 !important; }
+.btn-danger:hover:not(:disabled) { background:#f44336 !important; color:white !important; }

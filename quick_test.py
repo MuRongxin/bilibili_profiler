@@ -19,7 +19,7 @@ from uid_resolver import resolve_sender
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
-from storage import init_db, save_video_info, save_danmaku
+from storage import init_db, save_video_info, save_danmaku, save_comments
 from main import _merge_history_danmaku
 from web_autostart import maybe_launch_web
 
@@ -94,6 +94,11 @@ def main():
         uid_comments.setdefault(c["uid"], []).append(c)
     for lst in uid_comments.values():
         lst.sort(key=lambda x: x.get("like", 0), reverse=True)
+    # 评论落库（跨视频足迹数据源，幂等去重；失败只警告不中断）
+    try:
+        save_comments(bvid, comments)
+    except Exception as e:
+        print(f"   警告: 评论落库失败（{e}），跨视频足迹将缺评论")
 
     # 5. 逐个解析 + 采集 + 画像 + AI
     profiles = []

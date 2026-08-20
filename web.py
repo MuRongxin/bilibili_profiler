@@ -13,21 +13,33 @@ import sys
 import os
 import json
 import glob
+import argparse
+import atexit
+import signal
 import sqlite3
 import threading
+import time
 import uuid
+from datetime import datetime
 from contextlib import closing
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
-from config import REPORT_DIR, LLM_API_KEY
+from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTORY_MAX_DAYS,
+                     MAX_FOOTPRINT_VIDEOS, MAX_FOOTPRINT_DANMAKU_SAMPLES,
+                     MAX_FOOTPRINT_COMMENT_SAMPLES,
+                     HOT_COMMENT_MIN_REPLIES, HOT_COMMENT_MAX_SHOW,
+                     HOT_COMMENT_REPLY_SAMPLES,
+                     USER_TIMELINE_MAX_VIDEOS, USER_TIMELINE_SAMPLES)
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
 from storage import get_db, init_db
 from storage import (load_senders, load_global_uid_map, save_global_uid,
-                     save_sender, save_user_data, has_user_data, load_video_info)
+                     save_sender, save_user_data, has_user_data, load_video_info,
+                     delete_video_data)
+from main import run_analysis
 from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
@@ -38,7 +50,7 @@ from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summa
                     up_wordcloud_data, PROBLEM_CATEGORY_COLORS)
 
 app = Flask(__name__)
-PAGE_SIZE = 100  # 弹幕 API 固定每页条数（spec 4）
+PAGE_SIZE = 100  # 弹幕 API 默认/回退每页条数（可选 50/100/200，spec 3）
 
 
 # ========== 手动勾选分析 job（spec B；状态存内存 dict，服务重启即失效——spec 已接受） ==========
@@ -107,17 +119,18 @@ def _sender_danmaku_stats(bvid: str, mid_hash: str) -> dict:
 def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
     """后台 job：每个 mid_hash 串行 解析→强制采集→规则画像→LLM深掘→落库（串行即天然限流）。
 
-    错误处理（spec 5）：单发送者失败记 errors 继续；Cookie 失效 job 整体终止并标记。
+    错误处理（spec 5）：单发送者失败记 errors（{mid_hash, error} 结构，供前端透出与重试）继续；Cookie 失效 job 整体终止并标记。
     写库全部走 storage 的 save_*（各自短事务），不持长连接。
     """
     def update(**kw):
         with JOBS_LOCK:
             JOBS[job_id].update(kw)
 
-    def add_error(msg):
+    def add_error(msg, mid_hash=None):
+        # 失败明细结构化：mid_hash 供前端"重试失败项"按钮重新提交，msg 为人类可读摘要
         with JOBS_LOCK:
-            JOBS[job_id]["errors"].append(msg)
-        print(f"[Job {job_id}] 失败: {msg}")
+            JOBS[job_id]["errors"].append({"mid_hash": mid_hash, "error": msg})
+        print(f"[Job {job_id}] 失败: {mid_hash or '-'} {msg}")
 
     def add_result(uid):
         with JOBS_LOCK:
@@ -165,7 +178,7 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
                 uid, confidence, method, _info, collision_risk, candidates = resolve_sender(
                     mid_hash, stats["contents"], plain_uid_map, client, method_map=method_map)
                 if uid is None:
-                    add_error(f"{mid_hash}: UID 解析失败（{method}）")
+                    add_error(f"UID 解析失败（{method}）", mid_hash)
                     update(done=i)
                     continue
                 # 落库保留真实置信度/方法（"低"/碰撞在画像页有"可能误识别"徽标）
@@ -184,7 +197,7 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
             # 2. 强制采集（无视置信度，含"低"/碰撞）
             user_data = collect_user_data(uid, client)
             if "error" in user_data:
-                add_error(f"{mid_hash} (UID:{uid}): 采集失败 {user_data['error']}")
+                add_error(f"UID:{uid} 采集失败 {user_data['error']}", mid_hash)
                 update(done=i)
                 continue
 
@@ -213,7 +226,7 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
             update(done=i)
             print(f"[Job {job_id}] [{i}/{len(mid_hashes)}] {mid_hash} → UID:{uid} 完成")
         except Exception as e:
-            add_error(f"{mid_hash}: {e}")
+            add_error(str(e), mid_hash)
             update(done=i)
 
     update(finished=True, current="")
@@ -229,21 +242,122 @@ def _load_video_row(bvid: str):
 
 
 def _load_profiles(bvid: str) -> list[dict]:
-    """该视频已解析发送者的画像（senders.uid JOIN users.profile_json；同 uid 多 mid_hash 去重）"""
+    """该视频已解析发送者的画像（senders JOIN users；同 uid 多 mid_hash 按 uid 去重）。
+
+    附带注入渲染期键（不落库）：resolve_method/resolve_confidence 来自 senders 表
+    （卡片解析徽标 tooltip），collected_at 来自 users 表（基础信息采集时间）。
+    GROUP BY u.uid 下 method/confidence 取该 uid 任一行（同 uid 多 mid_hash 极少见，可接受）。"""
     conn = get_db()
     rows = conn.execute('''
-        SELECT DISTINCT u.profile_json
+        SELECT u.profile_json, s.method, s.confidence, u.collected_at
         FROM senders s JOIN users u ON u.uid = s.uid
         WHERE s.bvid = ? AND s.uid IS NOT NULL
+        GROUP BY u.uid
     ''', (bvid,)).fetchall()
     conn.close()
     profiles = []
     for r in rows:
         try:
-            profiles.append(json.loads(r["profile_json"]))
+            p = json.loads(r["profile_json"])
         except Exception:
             continue
+        p["resolve_method"] = r["method"] or ""
+        p["resolve_confidence"] = r["confidence"] or ""
+        p["collected_at"] = r["collected_at"] or ""
+        profiles.append(p)
     return profiles
+
+
+def _attach_other_videos(bvid: str, profiles: list[dict]):
+    """跨视频足迹：把「该用户在其他已分析视频中的出现、弹幕与评论」批量注入每个
+    profile 的 other_videos 渲染期键（不落库），供 report.generate_user_card 渲染。
+
+    数据源：senders 跨视频关联（uid 在其它 bvid 的行，JOIN videos 取标题）+
+    danmaku 表弹幕样本 + comments 表评论样本。旧版本分析（danmaku/comments 无行）
+    降级为只显示计数或「未留存」提示。
+
+    批量策略：全部 uid 分块 IN 查询（SQLite 变量上限防护）只跑一轮，
+    每 uid 按活跃度（弹幕数+评论数）取前 MAX_FOOTPRINT_VIDEOS 个视频，
+    其余计 more；样本查询只针对保留的视频（每卡片至多 5×5 行，量级可控）。
+    """
+    uids: list[int] = []
+    for p in profiles:
+        try:
+            u = int(p.get("uid"))
+        except (TypeError, ValueError):
+            continue
+        if u and u not in uids:
+            uids.append(u)
+    if not uids:
+        return
+
+    by_uid: dict[int, dict[str, dict]] = {}      # uid → bvid → {mid_hashes, danmaku_count, title}
+    comment_counts: dict[tuple[int, str], int] = {}
+    with closing(get_db()) as conn:
+        for i in range(0, len(uids), 500):       # 分块规避 SQLite 变量数上限
+            chunk = uids[i:i + 500]
+            qmarks = ",".join("?" * len(chunk))
+            for r in conn.execute(f'''
+                    SELECT s.uid, s.bvid, s.mid_hash, s.danmaku_count, v.title
+                    FROM senders s JOIN videos v ON v.bvid = s.bvid
+                    WHERE s.uid IN ({qmarks}) AND s.bvid != ?
+            ''', (*chunk, bvid)).fetchall():
+                ent = by_uid.setdefault(r["uid"], {}).setdefault(r["bvid"], {
+                    "mid_hashes": [], "danmaku_count": r["danmaku_count"] or 0,
+                    "title": r["title"] or ""})
+                if r["mid_hash"] not in ent["mid_hashes"]:
+                    ent["mid_hashes"].append(r["mid_hash"])
+            for row in conn.execute(f'''
+                    SELECT uid, bvid, COUNT(*) AS cnt FROM comments
+                    WHERE uid IN ({qmarks}) AND bvid != ?
+                    GROUP BY uid, bvid
+            ''', (*chunk, bvid)).fetchall():
+                comment_counts[(row["uid"], row["bvid"])] = row["cnt"]
+
+        for p in profiles:
+            try:
+                uid = int(p.get("uid"))
+            except (TypeError, ValueError):
+                continue
+            vids = by_uid.get(uid)
+            if not vids:
+                continue
+            ranked = sorted(
+                ((vb, ent["danmaku_count"] + comment_counts.get((uid, vb), 0), ent)
+                 for vb, ent in vids.items()),
+                key=lambda x: x[1], reverse=True)
+            kept, rest = ranked[:MAX_FOOTPRINT_VIDEOS], ranked[MAX_FOOTPRINT_VIDEOS:]
+            items = []
+            for vb, _score, ent in kept:
+                # 该视频 danmaku 表完全无行 → 旧版本分析（弹幕/评论均未留存），
+                # 前端据此显示「未留存」而非「无」，语义更准确
+                legacy = conn.execute(
+                    "SELECT 1 FROM danmaku WHERE bvid = ? LIMIT 1", (vb,)).fetchone() is None
+                dm_samples: list[str] = []
+                for mh in ent["mid_hashes"]:
+                    dm_samples.extend(r["content"] for r in conn.execute(
+                        "SELECT content FROM danmaku WHERE bvid = ? AND mid_hash = ? "
+                        "ORDER BY timestamp DESC LIMIT ?",
+                        (vb, mh, MAX_FOOTPRINT_DANMAKU_SAMPLES)).fetchall())
+                    if len(dm_samples) >= MAX_FOOTPRINT_DANMAKU_SAMPLES:
+                        break
+                cmt_samples = [
+                    {"content": r["content"], "ctime": r["ctime"],
+                     "like": r["like"], "is_sub": r["is_sub"]}
+                    for r in conn.execute(
+                        "SELECT content, ctime, like, is_sub FROM comments "
+                        "WHERE bvid = ? AND uid = ? ORDER BY like DESC, ctime DESC LIMIT ?",
+                        (vb, uid, MAX_FOOTPRINT_COMMENT_SAMPLES)).fetchall()]
+                items.append({
+                    "bvid": vb,
+                    "title": ent["title"] or vb,
+                    "danmaku_count": ent["danmaku_count"],
+                    "danmaku_samples": dm_samples[:MAX_FOOTPRINT_DANMAKU_SAMPLES],
+                    "comment_count": comment_counts.get((uid, vb), 0),
+                    "comment_samples": cmt_samples,
+                    "legacy": legacy,
+                })
+            p["other_videos"] = {"items": items, "more": len(rest)}
 
 
 def _sender_meta(bvid: str) -> dict:
@@ -304,380 +418,202 @@ def _danmaku_panel_stats(bvid: str) -> dict:
     }
 
 
-def _export_links(bvid: str) -> list[tuple[str, str]]:
-    """data/reports/ 下 report_{bvid}_*.csv/.json 下载链接（spec 2：存在才显示，按时间倒序）"""
-    links = []
+def _fmt_duration(sec) -> str:
+    """秒 → mm:ss 或 h:mm:ss 时长文本（首页视频列表时长列）"""
+    sec = int(sec or 0)
+    h, sec = divmod(sec, 3600)
+    m, s = divmod(sec, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _fmt_video_time(sec) -> str:
+    """视频内时间（秒）→ mm:ss（用户时间线弹幕样本用）"""
+    sec = int(sec or 0)
+    m, s = divmod(sec, 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def _export_links(bvid: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """data/reports/ 下 report_{bvid}_*.csv/.json 下载链接，分（最新一组, 历史组）。
+
+    文件名含时间戳，按文件名倒序即时间倒序；每种格式第一个为最新，其余收进历史折叠块。"""
+    latest, history = [], []
     for ext in ("csv", "json"):
         files = sorted(glob.glob(os.path.join(REPORT_DIR, f"report_{bvid}_*.{ext}")), reverse=True)
-        links.extend((os.path.basename(f), ext.upper()) for f in files)
-    return links
+        for i, f in enumerate(files):
+            (latest if i == 0 else history).append((os.path.basename(f), ext.upper()))
+    return latest, history
 
 
-# ========== 页面模板 CSS/JS（字面量全放常量，避免 f-string 大括号转义） ==========
+def _hot_comments(bvid: str, aid: int | None) -> dict:
+    """高回复评论页数据（潜在争执热点）：回复数 >= HOT_COMMENT_MIN_REPLIES 的主评论，
+    按回复数降序，附点赞最高的子回复样本与作者昵称（users 表关联，未解析的评论者回退 UID）。
 
-INDEX_EXTRA_CSS = """
-.video-table { width:100%; border-collapse:collapse; background:white; border-radius:12px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,0.04); }
-.video-table th, .video-table td { text-align:left; padding:12px 16px; border-bottom:1px solid #f0f0f0; font-size:15px; }
-.video-table th { color:#999; font-weight:500; }
-.video-table a { color:#00a1d6; text-decoration:none; }
-"""
+    返回 {"legacy": bool, "items": [...], "total_replies": int}；legacy=True 表示该视频
+    评论回复数未留存（旧版本分析），页面显示对应空态。"""
+    with closing(get_db()) as conn:
+        if conn.execute("SELECT 1 FROM comments WHERE bvid = ? LIMIT 1", (bvid,)).fetchone() is None:
+            return {"legacy": True, "items": [], "total_replies": 0}
+        rows = conn.execute('''
+            SELECT c.rpid, c.uid, c.content, c.ctime, c.like, c.reply_count, u.name
+            FROM comments c LEFT JOIN users u ON u.uid = c.uid
+            WHERE c.bvid = ? AND c.is_sub = 0 AND c.reply_count >= ?
+            ORDER BY c.reply_count DESC, c.like DESC
+            LIMIT ?
+        ''', (bvid, HOT_COMMENT_MIN_REPLIES, HOT_COMMENT_MAX_SHOW)).fetchall()
+        items = []
+        for r in rows:
+            subs = conn.execute('''
+                SELECT c.uid, c.content, c.like, u.name
+                FROM comments c LEFT JOIN users u ON u.uid = c.uid
+                WHERE c.bvid = ? AND c.is_sub = 1 AND c.root_rpid = ?
+                ORDER BY c.like DESC LIMIT ?
+            ''', (bvid, r["rpid"], HOT_COMMENT_REPLY_SAMPLES)).fetchall()
+            items.append({
+                "rpid": r["rpid"],
+                "uid": r["uid"],
+                "name": r["name"] or f"UID:{r['uid']}",
+                "content": r["content"],
+                "ctime": r["ctime"],
+                "like": r["like"],
+                "reply_count": r["reply_count"],
+                "subs": [{"uid": s["uid"], "name": s["name"] or f"UID:{s['uid']}",
+                          "content": s["content"], "like": s["like"]} for s in subs],
+            })
+    return {"legacy": False, "items": items,
+            "total_replies": sum(i["reply_count"] for i in items)}
 
-VIDEO_EXTRA_CSS = """
-.tab-bar { display:flex; gap:4px; margin-bottom:24px; border-bottom:2px solid #e0e0e0; flex-wrap:wrap; }
-.tab-btn { padding:10px 24px; border:none; background:none; cursor:pointer; font-size:16px; color:#666; border-bottom:3px solid transparent; margin-bottom:-2px; }
-.tab-btn.active { color:#00a1d6; border-bottom-color:#00a1d6; font-weight:600; }
-.tab-pane { display:none; }
-.tab-pane.active { display:block; }
-.search-input { padding:8px 14px; border:2px solid #e0e0e0; border-radius:25px; font-size:14px; width:220px; outline:none; }
-.search-input:focus { border-color:#00a1d6; }
-.empty-note { color:#999; text-align:center; padding:40px; }
-.dm-panel { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:15px; margin-bottom:20px; }
-.top10-list { font-size:14px; color:#555; line-height:2; }
-.top10-list a { color:#00a1d6; cursor:pointer; text-decoration:none; }
-.flash-highlight { box-shadow:0 0 0 3px #fb7299 !important; transition:box-shadow .3s; }
-"""
 
-# 弹幕浏览器样式（Task 6）
-DM_CSS = """
-.dm-controls { display:flex; gap:10px; margin-bottom:15px; flex-wrap:wrap; align-items:center; }
-.dm-controls select { padding:7px 10px; border:2px solid #e0e0e0; border-radius:8px; font-size:14px; background:white; }
-.dm-table-wrap { background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); padding:15px; overflow-x:auto; }
-.dm-table { width:100%; border-collapse:collapse; font-size:14px; }
-.dm-table th, .dm-table td { text-align:left; padding:8px 10px; border-bottom:1px solid #f0f0f0; vertical-align:top; }
-.dm-table th { color:#999; font-weight:500; white-space:nowrap; }
-.dm-table a { color:#00a1d6; text-decoration:none; cursor:pointer; }
-.dm-pager { display:flex; gap:15px; align-items:center; justify-content:center; padding:15px; }
-.dm-pager button { padding:6px 18px; border:2px solid #e0e0e0; border-radius:20px; background:white; cursor:pointer; }
-.dm-pager button:disabled { opacity:0.4; cursor:default; }
-.dm-error { color:#d32f2f; padding:15px; text-align:center; }
-"""
+def _hot_comments_html(bvid: str, aid: int | None) -> str:
+    """高回复评论标签页 HTML（服务端渲染，spec：单独成页的潜在争执热点）"""
+    data = _hot_comments(bvid, aid)
+    if data["legacy"]:
+        return ('<p class="empty-note">该视频为旧版本分析，评论回复数未留存；'
+                '点「🔄 重新生成报告」重跑后可查看高回复评论</p>')
+    if not data["items"]:
+        return (f'<p class="empty-note">本视频没有回复数 ≥ {HOT_COMMENT_MIN_REPLIES} 的评论'
+                f'（阈值 HOT_COMMENT_MIN_REPLIES 可在 config.py 调整）</p>')
+    items_html = []
+    for it in data["items"]:
+        date = datetime.fromtimestamp(it["ctime"]).strftime("%Y-%m-%d") if it["ctime"] else ""
+        subs_html = "".join(
+            f'<li><span class="hot-sub-author">{esc(s["name"])}</span>：{esc(s["content"])} '
+            f'<span class="dm-time">👍{s["like"]:,}</span></li>'
+            for s in it["subs"]) or '<li class="ov-none">暂无子回复样本</li>'
+        origin = (f'<a class="hot-origin" href="https://www.bilibili.com/video/av{aid}#reply{it["rpid"]}" '
+                  f'target="_blank" rel="noopener">去B站围观 ↗</a>') if aid else ""
+        items_html.append(f'''
+            <div class="hot-item">
+                <div class="hot-head">
+                    <a class="hot-author" href="/user/{esc(it["uid"])}"
+                       title="查看该用户在已分析视频中的互动时间线">{esc(it["name"])}</a>
+                    <span class="hot-badge">💬 {it["reply_count"]:,} 条回复</span>
+                    <span class="dm-time">👍{it["like"]:,} · {date}</span>
+                    {origin}
+                </div>
+                <div class="hot-content">{esc(it["content"])}</div>
+                <div class="hot-subs"><div class="hot-sub-label">高赞回复</div>
+                    <ul class="ov-list">{subs_html}</ul></div>
+            </div>''')
+    return f'''
+        <div class="hot-note">💥 回复数特别多的评论往往意味着争执：以下为该视频回复数 ≥
+            {HOT_COMMENT_MIN_REPLIES} 的评论（按回复数降序，最多 {HOT_COMMENT_MAX_SHOW} 条）。</div>
+        <div class="hot-stats">共 {len(data["items"])} 条高回复评论 · 合计 {data["total_replies"]:,} 条回复</div>
+        <div class="hot-list">{"".join(items_html)}</div>'''
 
-VIDEO_JS = """
-// 标签页切换
-function switchTab(name) {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
-    document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
-    if (name === 'full') initFullCharts();
-}
 
-// 概览图表
-const chartData = __CHART_JSON__;
-new Chart(document.getElementById('levelChart'), {type:'bar',
-    data:{labels:chartData.level_labels, datasets:[{label:'人数', data:chartData.level_data, backgroundColor:'#00a1d6', borderRadius:6}]},
-    options:{responsive:true, plugins:{legend:{display:false}}}});
-new Chart(document.getElementById('spamChart'), {type:'doughnut',
-    data:{labels:['低风险','中风险','高风险'], datasets:[{data:chartData.spam_data, backgroundColor:['#4caf50','#ff9800','#f44336']}]},
-    options:{responsive:true}});
-new Chart(document.getElementById('tagChart'), {type:'bar',
-    data:{labels:chartData.tag_labels, datasets:[{label:'出现次数', data:chartData.tag_data, backgroundColor:'#ff9f43', borderRadius:6}]},
-    options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
-if (chartData.region_labels.length) {
-    new Chart(document.getElementById('regionChart'), {type:'bar',
-        data:{labels:chartData.region_labels, datasets:[{label:'人数', data:chartData.region_data, backgroundColor:'#fb7299', borderRadius:6}]},
-        options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
-}
+def _user_timeline(uid: int) -> dict:
+    """用户互动时间线数据（/user/<uid> 页）：该用户在全部已分析视频中的弹幕/评论足迹，
+    按最近互动时间倒序——「近期在哪些视频上有互动」的直接答案。
 
-// 问题弹幕类别分布小图（弹幕浏览器统计面板；无弹幕数据的旧视频无此 canvas）
-const dmCatData = __CAT_JSON__;
-const dmCatColors = __CAT_COLORS__;
-const dmCatCanvas = document.getElementById('dmCatChart');
-if (dmCatCanvas) {
-    const catLabels = Object.keys(dmCatData);
-    new Chart(dmCatCanvas, {type:'bar',
-        data:{labels:catLabels, datasets:[{label:'命中人数', data:catLabels.map(k => dmCatData[k]),
-              backgroundColor:catLabels.map(k => dmCatColors[k] || '#999'), borderRadius:6}]},
-        options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
-}
+    与卡片「其他视频足迹」（按活跃度、限 5 个、无时间）互补而非重复：
+    时间线覆盖全部视频、带发送时间、含评论-only 用户（senders 无行只有 comments 行）。
+    弹幕计数取 senders.danmaku_count 与 danmaku 表行数两者较大值（旧版本视频只有前者）；
+    时间戳只在新版 danmaku 表有，旧视频 last_ts=0（排序垫底并标注时间未留存）。"""
+    with closing(get_db()) as conn:
+        u = conn.execute("SELECT name, level FROM users WHERE uid = ?", (uid,)).fetchone()
+        name = (u["name"] if u and u["name"] else f"UID:{uid}")
+        level = (u["level"] or 0) if u else 0
 
-// UP主悬停词云弹窗
-const upWcData = __UPWC_JSON__;
-const popup = document.getElementById('wc-popup');
-const popupCanvas = document.getElementById('wc-popup-canvas');
-document.querySelectorAll('.up-chip').forEach(chip => {
-    chip.addEventListener('mouseenter', function() {
-        const upId = this.dataset.upid;
-        const data = upWcData[upId];
-        if (!data || data.length === 0) return;
-        const rect = this.getBoundingClientRect();
-        popup.style.display = 'block';
-        popup.style.left = Math.min(rect.left, window.innerWidth - 320) + 'px';
-        popup.style.top = (rect.bottom + 8) + 'px';
-        const maxW = Math.max(...data.map(d => d[1]));
-        const minW = Math.min(...data.map(d => d[1]));
-        const scaled = data.map(d => [d[0], 10 + (d[1] - minW) / Math.max(maxW - minW, 1) * 50]);
-        WordCloud(popupCanvas, {list: scaled, gridSize: 10, weightFactor: 1, fontFamily: 'sans-serif',
-            color: () => ['#00a1d6','#fb7299','#ff9f43','#6c5ce7','#2e7d32'][Math.floor(Math.random()*5)],
-            rotateRatio: 0, backgroundColor: '#ffffff', shape: 'circle', clearCanvas: true});
-    });
-    chip.addEventListener('mouseleave', function() { popup.style.display = 'none'; });
-});
+        # 弹幕侧：senders 表覆盖全部解析用户（含旧版本视频）；时间戳与样本只在 danmaku 表有
+        dm_agg: dict[str, dict] = {}
+        for r in conn.execute(
+                "SELECT bvid, SUM(danmaku_count) AS cnt FROM senders WHERE uid = ? GROUP BY bvid",
+                (uid,)).fetchall():
+            dm_agg[r["bvid"]] = {"dm_count": r["cnt"] or 0, "dm_last": 0}
+        for r in conn.execute('''
+                SELECT d.bvid, MAX(d.timestamp) AS last_ts, COUNT(*) AS cnt
+                FROM senders s JOIN danmaku d ON d.bvid = s.bvid AND d.mid_hash = s.mid_hash
+                WHERE s.uid = ? GROUP BY d.bvid
+        ''', (uid,)).fetchall():
+            ent = dm_agg.setdefault(r["bvid"], {"dm_count": 0, "dm_last": 0})
+            ent["dm_last"] = r["last_ts"] or 0
+            ent["dm_count"] = max(ent["dm_count"], r["cnt"])
 
-// 用户画像/完整报告：筛选按钮 + 昵称/UID 搜索（前端过滤，两页各一份卡片 DOM、状态独立）
-const userFilterState = {users: 'all', full: 'all'};
-const USER_SCOPE = {
-    users: {grid: 'userGrid', input: 'userSearch'},
-    full: {grid: 'fullUserGrid', input: 'fullSearch'},
-};
-function filter(type, el, scope) {
-    scope = scope || 'users';
-    userFilterState[scope] = type;
-    document.querySelectorAll('#tab-' + scope + ' .filter-bar .filter-btn').forEach(b => b.classList.remove('active'));
-    el.classList.add('active');
-    applyUserFilter(scope);
-}
-function searchUsers(scope) { applyUserFilter(scope || 'users'); }
-function applyUserFilter(scope) {
-    scope = scope || 'users';
-    const cfg = USER_SCOPE[scope];
-    const kw = (document.getElementById(cfg.input).value || '').trim().toLowerCase();
-    document.querySelectorAll('#' + cfg.grid + ' .user-card').forEach(card => {
-        const level = parseInt(card.dataset.level) || 0;
-        const isVip = card.dataset.vip === 'true';
-        const spam = card.dataset.spam;
-        const official = card.dataset.official === 'true';
-        const isCreator = parseInt(card.querySelector('.stats-bar .stat:nth-child(4) .num')?.textContent || 0) > 0;
-        let show = true;
-        switch (userFilterState[scope]) {
-            case 'all': show = true; break;
-            case 'high-level': show = level >= 5; break;
-            case 'vip': show = isVip; break;
-            case 'official': show = official; break;
-            case 'spam': show = spam !== '低'; break;
-            case 'creator': show = isCreator; break;
-        }
-        if (show && kw) {
-            const uname = (card.querySelector('.username')?.textContent || '').toLowerCase();
-            const uid = (card.querySelector('.uid')?.textContent || '').toLowerCase();
-            show = uname.includes(kw) || uid.includes(kw);
-        }
-        card.style.display = show ? '' : 'none';
-    });
-}
+        # 评论侧（comments 表；评论-only 用户只有这一侧数据）
+        cmt_agg: dict[str, dict] = {}
+        for r in conn.execute(
+                "SELECT bvid, COUNT(*) AS cnt, MAX(ctime) AS last_ts FROM comments WHERE uid = ? GROUP BY bvid",
+                (uid,)).fetchall():
+            cmt_agg[r["bvid"]] = {"cmt_count": r["cnt"] or 0, "cmt_last": r["last_ts"] or 0}
 
-// 完整报告页图表：克隆概览页四个图（canvas 独立 id，数据复用 chartData），首次切入时懒初始化
-let fullChartsInit = false;
-function initFullCharts() {
-    if (fullChartsInit || !document.getElementById('levelChart2')) return;
-    fullChartsInit = true;
-    new Chart(document.getElementById('levelChart2'), {type:'bar',
-        data:{labels:chartData.level_labels, datasets:[{label:'人数', data:chartData.level_data, backgroundColor:'#00a1d6', borderRadius:6}]},
-        options:{responsive:true, plugins:{legend:{display:false}}}});
-    new Chart(document.getElementById('spamChart2'), {type:'doughnut',
-        data:{labels:['低风险','中风险','高风险'], datasets:[{data:chartData.spam_data, backgroundColor:['#4caf50','#ff9800','#f44336']}]},
-        options:{responsive:true}});
-    new Chart(document.getElementById('tagChart2'), {type:'bar',
-        data:{labels:chartData.tag_labels, datasets:[{label:'出现次数', data:chartData.tag_data, backgroundColor:'#ff9f43', borderRadius:6}]},
-        options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
-    if (chartData.region_labels.length && document.getElementById('regionChart2')) {
-        new Chart(document.getElementById('regionChart2'), {type:'bar',
-            data:{labels:chartData.region_labels, datasets:[{label:'人数', data:chartData.region_data, backgroundColor:'#fb7299', borderRadius:6}]},
-            options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
-    }
-}
+        bvids = set(dm_agg) | set(cmt_agg)
+        result = {"uid": uid, "name": name, "level": level, "items": [],
+                  "total_dm": sum(e["dm_count"] for e in dm_agg.values()),
+                  "total_cmt": sum(e["cmt_count"] for e in cmt_agg.values()),
+                  "total_videos": len(bvids), "more": 0}
+        if not bvids:
+            return result
 
-// 弹幕浏览器点击发送者跳转到用户画像卡片（锚点 id="uid-{uid}"，spec 4）
-function gotoUser(uid) {
-    switchTab('users');
-    const el = document.getElementById('uid-' + uid);
-    if (el) {
-        el.scrollIntoView({behavior: 'smooth', block: 'center'});
-        el.style.boxShadow = '0 0 0 3px #00a1d6';
-        setTimeout(() => { el.style.boxShadow = ''; }, 2000);
-    }
-}
+        titles = {r["bvid"]: r["title"] or "" for r in conn.execute(
+            f"SELECT bvid, title FROM videos WHERE bvid IN ({','.join('?' * len(bvids))})",
+            tuple(sorted(bvids))).fetchall()}
+        mid_hashes_by_bvid: dict[str, list[str]] = {}
+        for r in conn.execute("SELECT bvid, mid_hash FROM senders WHERE uid = ?", (uid,)).fetchall():
+            mid_hashes_by_bvid.setdefault(r["bvid"], []).append(r["mid_hash"])
 
-// 弹幕浏览器（JSON API + 前端渲染当前页，spec 4）
-const BVID = "__BVID__";
-const dmState = {page: 1};
-let dmTimer = null;
+        ranked = sorted(bvids, key=lambda b: max(
+            dm_agg.get(b, {}).get("dm_last", 0), cmt_agg.get(b, {}).get("cmt_last", 0)), reverse=True)
+        kept, rest = ranked[:USER_TIMELINE_MAX_VIDEOS], ranked[USER_TIMELINE_MAX_VIDEOS:]
+        result["more"] = len(rest)
 
-function dmParams() {
-    const p = new URLSearchParams();
-    const search = document.getElementById('dmSearch').value.trim();
-    const sender = document.getElementById('dmSender').value.trim();
-    const cat = document.getElementById('dmCategory').value;
-    const spam = document.getElementById('dmSpam').value;
-    if (search) p.set('search', search);
-    if (sender) p.set('sender', sender);
-    if (cat) p.set('category', cat);
-    if (spam) p.set('spam', spam);
-    if (document.getElementById('dmAnalyzed').checked) p.set('analyzed', '1');
-    p.set('sort', document.getElementById('dmSort').value);
-    p.set('order', document.getElementById('dmOrder').value);
-    p.set('page', dmState.page);
-    return p.toString();
-}
+        for b in kept:
+            dm = dm_agg.get(b, {})
+            cm = cmt_agg.get(b, {})
+            dm_samples: list[dict] = []
+            for mh in mid_hashes_by_bvid.get(b, []):
+                dm_samples.extend(
+                    {"content": r["content"], "ts": r["timestamp"], "vt": r["time"]}
+                    for r in conn.execute(
+                        "SELECT content, timestamp, time FROM danmaku "
+                        "WHERE bvid = ? AND mid_hash = ? ORDER BY timestamp DESC LIMIT ?",
+                        (b, mh, USER_TIMELINE_SAMPLES)).fetchall())
+                if len(dm_samples) >= USER_TIMELINE_SAMPLES:
+                    break
+            cmt_samples = [{"content": r["content"], "ts": r["ctime"]} for r in conn.execute(
+                "SELECT content, ctime FROM comments WHERE bvid = ? AND uid = ? "
+                "ORDER BY ctime DESC LIMIT ?", (b, uid, USER_TIMELINE_SAMPLES)).fetchall()]
+            result["items"].append({
+                "bvid": b, "title": titles.get(b) or b,
+                "dm_count": dm.get("dm_count", 0), "dm_samples": dm_samples[:USER_TIMELINE_SAMPLES],
+                "cmt_count": cm.get("cmt_count", 0), "cmt_samples": cmt_samples,
+                "last_ts": max(dm.get("dm_last", 0), cm.get("cmt_last", 0)),
+            })
+    return result
 
-function escHtml(s) {
-    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function fmtVideoTime(sec) {
-    const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
-    return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
-}
-
-function loadDanmaku() {
-    const err = document.getElementById('dmError');
-    err.style.display = 'none';
-    fetch('/api/video/' + encodeURIComponent(BVID) + '/danmaku?' + dmParams())
-        .then(r => {
-            if (!r.ok) return r.json().then(j => Promise.reject(new Error(j.error || ('HTTP ' + r.status))));
-            return r.json();
-        })
-        .then(data => {
-            const tbody = document.getElementById('dmTbody');
-            tbody.innerHTML = data.rows.map(row => {
-                const sender = row.uid
-                    ? '<a onclick="gotoUser(' + row.uid + ')">' + escHtml(row.name || row.uid) + '</a><br><span class="dm-time">UID:' + row.uid + '</span>'
-                    : '<span class="dm-time">' + escHtml(row.mid_hash) + '</span>';
-                const dup = row.dup_count > 1 ? ' <span class="dm-time">×' + row.dup_count + '</span>' : '';
-                const cats = (row.categories || []).map(c =>
-                    '<span style="display:inline-block;background:' + (dmCatColors[c] || '#999') +
-                    ';color:#fff;font-size:12px;border-radius:4px;padding:1px 8px;margin:1px 2px;">' +
-                    escHtml(c) + '</span>').join('');
-                const chk = '<input type="checkbox" class="dm-check" data-mid="' + escHtml(row.mid_hash) + '"' +
-                    (dmSelected.has(row.mid_hash) ? ' checked' : '') + '>';
-                return '<tr><td>' + chk + '</td><td>' + escHtml(row.content) + dup + '</td><td>' + sender + '</td><td>' +
-                    fmtVideoTime(row.first_video_time) + '</td><td>' +
-                    new Date(row.first_send_time * 1000).toLocaleString() + '</td><td>' + cats + '</td><td>' +
-                    escHtml(row.spam_level) + '</td></tr>';
-            }).join('') || '<tr><td colspan="7" class="empty-note">无匹配弹幕</td></tr>';
-            dmBindChecks();
-            const pages = Math.max(1, Math.ceil(data.total / 100));
-            document.getElementById('dmPageInfo').textContent =
-                '第 ' + data.page + ' / ' + pages + ' 页（共 ' + data.total + ' 行）';
-            document.getElementById('dmPrev').disabled = data.page <= 1;
-            document.getElementById('dmNext').disabled = data.page >= pages;
-        })
-        .catch(e => {
-            err.textContent = '弹幕加载失败: ' + e.message;
-            err.style.display = 'block';
-        });
-}
-
-function dmPage(delta) { dmState.page = Math.max(1, dmState.page + delta); loadDanmaku(); }
-function dmReload() { dmState.page = 1; loadDanmaku(); }
-
-// 统计面板 Top10 点击 → 切到弹幕浏览器并筛选该发送者（spec 4）
-function filterSender(midHash) {
-    switchTab('danmaku');
-    document.getElementById('dmSender').value = midHash;
-    dmReload();
-}
-
-// 事件绑定（旧视频无全量弹幕时无 dmTbody，跳过）
-if (document.getElementById('dmTbody')) {
-    document.getElementById('dmSearch').addEventListener('input', () => { clearTimeout(dmTimer); dmTimer = setTimeout(dmReload, 400); });
-    document.getElementById('dmSender').addEventListener('input', () => { clearTimeout(dmTimer); dmTimer = setTimeout(dmReload, 400); });
-    ['dmCategory', 'dmSpam', 'dmSort', 'dmOrder', 'dmAnalyzed'].forEach(id =>
-        document.getElementById(id).addEventListener('change', dmReload));
-    document.getElementById('dmCheckAll').addEventListener('change', function() {
-        document.querySelectorAll('.dm-check').forEach(c => {
-            c.checked = this.checked;
-            if (this.checked) dmSelected.add(c.dataset.mid); else dmSelected.delete(c.dataset.mid);
-        });
-        dmUpdateAnalyzeStatus();
-    });
-    loadDanmaku();
-}
-
-// 手动勾选分析（spec B）：勾选状态跨页保留在 dmSelected（key=mid_hash，天然去重）；
-// job_id 存 sessionStorage，刷新页面后可继续轮询（spec 5；服务重启 job 丢失则提示后清除）
-const dmSelected = new Set();
-const DM_JOB_KEY = 'dmJob_' + BVID;
-
-function dmUpdateAnalyzeStatus(text) {
-    const el = document.getElementById('dmAnalyzeStatus');
-    if (!el) return;  // 旧视频无弹幕面板时无此元素
-    el.textContent = text !== undefined ? text
-        : (dmSelected.size ? '已选 ' + dmSelected.size + ' 个发送者' : '');
-}
-function dmBindChecks() {
-    document.querySelectorAll('.dm-check').forEach(c =>
-        c.addEventListener('change', function() {
-            if (this.checked) dmSelected.add(this.dataset.mid); else dmSelected.delete(this.dataset.mid);
-            dmUpdateAnalyzeStatus();
-        }));
-}
-function startAnalysis() {
-    const mids = Array.from(dmSelected);
-    if (!mids.length) { dmUpdateAnalyzeStatus('请先勾选弹幕行'); return; }
-    dmUpdateAnalyzeStatus('正在启动分析...');
-    fetch('/api/video/' + encodeURIComponent(BVID) + '/analyze', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({mid_hashes: mids})
-    }).then(r => r.json().then(j => ({ok: r.ok, j})))
-      .then(({ok, j}) => {
-          if (!ok) { dmUpdateAnalyzeStatus('启动失败: ' + (j.error || ('HTTP 未知错误'))); return; }
-          sessionStorage.setItem(DM_JOB_KEY, j.job_id);
-          dmSelected.clear();
-          document.querySelectorAll('.dm-check').forEach(c => c.checked = false);
-          pollJob(j.job_id);
-      })
-      .catch(e => dmUpdateAnalyzeStatus('启动失败: ' + e.message));
-}
-function pollJob(jobId) {
-    fetch('/api/job/' + jobId)
-        .then(r => r.json())
-        .then(j => {
-            if (j.error) {  // 服务重启 job 丢失
-                dmUpdateAnalyzeStatus('任务状态查询失败: ' + j.error + '（数据可能已部分落库）');
-                sessionStorage.removeItem(DM_JOB_KEY);
-                return;
-            }
-            dmUpdateAnalyzeStatus('分析中 ' + j.done + '/' + j.total + (j.current ? '　' + j.current : ''));
-            if (j.finished) {
-                sessionStorage.removeItem(DM_JOB_KEY);
-                // 新卡片需服务端渲染才有 DOM：记录待高亮 UID 后重载页面，
-                // 加载恢复逻辑跳「完整报告」标签页并闪烁高亮（复用 gotoUser 高亮思路）
-                sessionStorage.setItem('dmFlash_' + BVID, JSON.stringify(j.results || []));
-                const errs = (j.errors && j.errors.length) ? '（' + j.errors.length + ' 条失败，详见服务端日志）' : '';
-                sessionStorage.setItem('dmFlashMsg_' + BVID,
-                    '手动分析完成: 成功 ' + (j.results || []).length + '/' + j.total + errs);
-                location.reload();
-            } else {
-                setTimeout(() => pollJob(jobId), 2000);
-            }
-        })
-        .catch(() => setTimeout(() => pollJob(jobId), 2000));  // 网络抖动重试，不丢 job
-}
-
-// 页面加载恢复：优先处理"分析完成重载"的跳转+高亮；否则有未完成 job 则继续轮询
-(function() {
-    const flashMsg = sessionStorage.getItem('dmFlashMsg_' + BVID);
-    if (flashMsg) {
-        sessionStorage.removeItem('dmFlashMsg_' + BVID);
-        const uids = JSON.parse(sessionStorage.getItem('dmFlash_' + BVID) || '[]');
-        sessionStorage.removeItem('dmFlash_' + BVID);
-        switchTab('full');
-        dmUpdateAnalyzeStatus(flashMsg);
-        uids.forEach(uid => {
-            const el = document.getElementById('full-uid-' + uid);
-            if (el) {
-                el.classList.add('flash-highlight');
-                setTimeout(() => el.classList.remove('flash-highlight'), 3000);
-            }
-        });
-        const first = document.getElementById('full-uid-' + uids[0]);
-        if (first) first.scrollIntoView({behavior: 'smooth', block: 'center'});
-        return;
-    }
-    const jobId = sessionStorage.getItem(DM_JOB_KEY);
-    if (jobId) pollJob(jobId);
-})();
-"""
 
 
 # ========== 路由 ==========
 
 @app.route("/")
 def index():
-    """首页：已分析视频列表（标题/BV号/分析时间/弹幕数/画像人数/高/中风险人数）"""
+    """首页：已分析视频列表（标题/BV号/时长/播放量/分析时间/弹幕数/画像人数/高/中风险人数）。
+
+    搜索/列头排序/分页由 static/index.js 前端实现：每行带 data-title（标题+BV号小写）、
+    data-time/data-dm/data-profiles 供排序；超 20 条分页。"""
     conn = get_db()
     rows = conn.execute('''
-        SELECT v.bvid, v.title, v.created_at,
+        SELECT v.bvid, v.title, v.created_at, v.duration, v.view_count,
                (SELECT COUNT(*) FROM danmaku d WHERE d.bvid = v.bvid) AS dm_count,
                (SELECT COUNT(DISTINCT s.uid) FROM senders s
                 WHERE s.bvid = v.bvid AND s.uid IS NOT NULL) AS profile_count,
@@ -686,32 +622,48 @@ def index():
         FROM videos v ORDER BY v.created_at DESC
     ''').fetchall()
     conn.close()
-    items = "".join(f'''<tr>
+    items = "".join(f'''<tr data-title="{esc(((r["title"] or "") + " " + r["bvid"]).lower())}"
+        data-time="{esc(r["created_at"])}" data-dm="{r["dm_count"]}" data-profiles="{r["profile_count"]}">
         <td><a href="/video/{esc(r["bvid"])}">{esc(r["title"] or r["bvid"])}</a></td>
         <td>{esc(r["bvid"])}</td>
+        <td>{_fmt_duration(r["duration"])}</td>
+        <td>{(r["view_count"] or 0):,}</td>
         <td>{esc(r["created_at"])}</td>
         <td>{r["dm_count"]:,}</td>
         <td>{r["profile_count"]}</td>
         <td>{r["spam_high"]} / {r["spam_mid"]}</td>
+        <td><button class="filter-btn" onclick="regenVideo('{esc(r["bvid"])}', this)">重新生成</button>
+            <button class="filter-btn btn-danger" onclick="deleteVideo('{esc(r["bvid"])}')">删除</button></td>
     </tr>''' for r in rows)
-    body = items or '<tr><td colspan="6" class="empty-note">暂无已分析视频，先运行 python run.py &lt;BV号&gt;</td></tr>'
+    body = items or '<tr><td colspan="9" class="empty-note">暂无已分析视频，先运行 python run.py &lt;BV号&gt;</td></tr>'
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>B站弹幕用户画像分析 - 视频列表</title>
-<style>{REPORT_CSS}
-{INDEX_EXTRA_CSS}</style>
+<style>{REPORT_CSS}</style>
+<link rel="stylesheet" href="/static/index.css">
 </head>
 <body>
 <div class="container">
     <div class="header"><h1>🎬 B站弹幕用户画像分析</h1><div class="meta">已分析视频列表</div></div>
+    <div class="idx-controls">
+        <input id="idxSearch" class="search-input" placeholder="搜索标题 / BV号...">
+    </div>
     <table class="video-table">
-        <thead><tr><th>标题</th><th>BV号</th><th>分析时间</th><th>弹幕数</th><th>画像人数</th><th>高/中风险</th></tr></thead>
-        <tbody>{body}</tbody>
+        <thead><tr><th>标题</th><th>BV号</th><th>时长</th><th>播放量</th>
+            <th data-sort="time">分析时间</th><th data-sort="dm">弹幕数</th><th data-sort="profiles">画像人数</th>
+            <th>高/中风险</th><th>操作</th></tr></thead>
+        <tbody id="videoTbody">{body}</tbody>
     </table>
+    <div class="idx-pager">
+        <button id="idxPrev" class="pager-btn">上一页</button>
+        <span id="idxPageInfo"></span>
+        <button id="idxNext" class="pager-btn">下一页</button>
+    </div>
 </div>
+<script src="/static/index.js"></script>
 </body>
 </html>'''
 
@@ -728,21 +680,26 @@ def video_page(bvid: str):
         video_info = {}
     title = video_info.get("title") or row["title"] or bvid
 
-    profiles = sort_profiles_by_risk(_load_profiles(bvid))
+    profiles = _load_profiles(bvid)
+    _attach_other_videos(bvid, profiles)   # 跨视频足迹（渲染期注入，不落库）
+    profiles = sort_profiles_by_risk(profiles)
     stats = generate_summary_stats(profiles)
     chart = generate_chart_data(profiles)
     cards_html = "".join(generate_user_card(p) for p in profiles) or '<p class="empty-note">暂无画像数据</p>'
+    hot_tab = _hot_comments_html(bvid, row["aid"])   # 高回复评论页（潜在争执热点）
     board_html = generate_cringe_board(profiles) or '<p class="empty-note">本视频无问题弹幕命中</p>'
     panel = _danmaku_panel_stats(bvid)
 
-    # 完整报告标签页（spec A）：卡片第二份 DOM 的锚点 id 改写为 full-uid- 防 DOM id 冲突
-    full_cards_html = cards_html.replace('id="uid-', 'id="full-uid-')
-    region_canvas2 = ('<div class="chart-card"><h3>地域分布 Top10</h3><canvas id="regionChart2"></canvas></div>'
-                      if chart["region_labels"] else "")
+    # CSV/JSON 导出下载链接：默认只显示最新一组，历史导出收进 <details> 折叠块（spec 6）
+    latest, history = _export_links(bvid)
 
-    # CSV/JSON 导出下载链接（spec 2：指向 data/reports/ 同名前缀文件，存在才显示）
-    links = " ".join(f'<a class="filter-btn" href="/download/{esc(fname)}">{esc(ext)} 下载</a>'
-                     for fname, ext in _export_links(bvid))
+    def _dl_link(fname: str, ext: str) -> str:
+        return f'<a class="filter-btn" href="/download/{esc(fname)}">{esc(ext)} 下载</a>'
+
+    links = " ".join(_dl_link(f, e) for f, e in latest)
+    if history:
+        links += (f' <details class="dl-history"><summary>历史导出（{len(history)} 个）</summary>'
+                  f'{" ".join(_dl_link(f, e) for f, e in history)}</details>')
 
     ai_count = sum(1 for p in profiles if p.get("ai_deep") or p.get("ai_analysis"))
     lv5_count = sum(1 for p in profiles if p.get("level", 0) >= 5)
@@ -753,6 +710,14 @@ def video_page(bvid: str):
     if coverage:
         coverage_line = (f"<br>弹幕覆盖: 实时池 {coverage['realtime']:,} 条 + "
                          f"历史快照去重后新增 {coverage['history_new']:,} 条 = 合并共 {coverage['merged']:,} 条")
+
+    # 弹幕覆盖率说明条（spec 7）：明示数据边界——实时池容量有限、历史快照回溯窗口有限、
+    # 已解析发送者为按兴趣分阈值入选的子集
+    coverage_note = (
+        f'<div class="coverage-note">📊 数据边界：实时弹幕池仅保留最近若干条（容量由B站限定，'
+        f'超出部分被顶出）；历史弹幕按日快照回溯，最多 {HISTORY_MAX_MONTHS} 个月 / {HISTORY_MAX_DAYS} 天，'
+        f'更早的弹幕不在统计范围内。已解析发送者是按兴趣分阈值入选的子集，非全部弹幕发送者。</div>'
+    )
 
     # 无属地数据时不渲染地域图
     region_canvas = ('<div class="chart-card"><h3>地域分布 Top10</h3><canvas id="regionChart"></canvas></div>'
@@ -793,25 +758,44 @@ def video_page(bvid: str):
             <button id="dmAnalyzeBtn" class="filter-btn" onclick="startAnalysis()">分析选中发送者</button>
             <span id="dmAnalyzeStatus"></span>
         </div>
+        <div id="dmFailBar" class="fail-detail" style="display:none">
+            <div>部分发送者分析失败：</div>
+            <ul id="dmFailList"></ul>
+            <button id="dmRetryBtn" class="filter-btn">重试失败项</button>
+            <button id="dmReloadBtn" class="filter-btn">刷新查看结果</button>
+        </div>
         <div class="dm-table-wrap">
             <table class="dm-table">
                 <thead><tr><th><input type="checkbox" id="dmCheckAll" title="全选当前页"></th><th>弹幕内容</th><th>发送者</th><th>视频时间</th><th>发送时间</th><th>类别</th><th>刷屏</th></tr></thead>
                 <tbody id="dmTbody"></tbody>
             </table>
+            <div id="dmSpinner" class="dm-spinner" style="display:none">弹幕加载中…</div>
             <div class="dm-pager">
                 <button id="dmPrev" onclick="dmPage(-1)">上一页</button>
                 <span id="dmPageInfo"></span>
                 <button id="dmNext" onclick="dmPage(1)">下一页</button>
+                <input id="dmGoto" type="number" min="1" placeholder="页码">
+                <button onclick="dmGotoPage()">跳转</button>
+                <select id="dmPageSize">
+                    <option value="50">50 条/页</option>
+                    <option value="100" selected>100 条/页</option>
+                    <option value="200">200 条/页</option>
+                </select>
             </div>
-            <div id="dmError" class="dm-error" style="display:none"></div>
+            <div id="dmError" class="dm-error-bar" style="display:none">
+                <span id="dmErrorText"></span>
+                <button class="dm-retry-btn" onclick="loadDanmaku()">重试</button>
+            </div>
         </div>'''
 
-    script = (VIDEO_JS
-              .replace("__CHART_JSON__", js_json(chart))
-              .replace("__CAT_JSON__", js_json(panel.get("categories", {})))
-              .replace("__CAT_COLORS__", js_json(PROBLEM_CATEGORY_COLORS))
-              .replace("__UPWC_JSON__", js_json(up_wordcloud_data(profiles)))
-              .replace("__BVID__", bvid))
+    # 数据经内联 <script>window.__DATA__</script> 注入，静态 /static/report.js 读取（spec 8）
+    page_data = {
+        "chart": chart,
+        "categories": panel.get("categories", {}),
+        "categoryColors": PROBLEM_CATEGORY_COLORS,
+        "upWordcloud": up_wordcloud_data(profiles),
+        "bvid": bvid,
+    }
 
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -821,9 +805,8 @@ def video_page(bvid: str):
 <title>{esc(title)} - B站弹幕用户画像分析</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/wordcloud@1.2.2/src/wordcloud2.min.js"></script>
-<style>{REPORT_CSS}
-{VIDEO_EXTRA_CSS}
-{DM_CSS}</style>
+<style>{REPORT_CSS}</style>
+<link rel="stylesheet" href="/static/report.css">
 </head>
 <body>
 <div class="container">
@@ -839,6 +822,11 @@ def video_page(bvid: str):
             AI画像: {ai_count}{coverage_line}
         </div>
         <div style="margin-top:10px">{links}</div>
+        <div style="margin-top:10px">
+            <button class="filter-btn" onclick="reportRegen()">🔄 重新生成报告</button>
+            <button class="filter-btn btn-danger" onclick="reportDelete()">🗑 删除报告</button>
+            <span id="reportJobStatus" style="margin-left:10px"></span>
+        </div>
     </div>
 
     <div class="tab-bar">
@@ -846,10 +834,11 @@ def video_page(bvid: str):
         <button class="tab-btn" data-tab="users" onclick="switchTab('users')">用户画像</button>
         <button class="tab-btn" data-tab="danmaku" onclick="switchTab('danmaku')">弹幕浏览器</button>
         <button class="tab-btn" data-tab="cringe" onclick="switchTab('cringe')">问题弹幕榜</button>
-        <button class="tab-btn" data-tab="full" onclick="switchTab('full')">完整报告</button>
+        <button class="tab-btn" data-tab="hot" onclick="switchTab('hot')">高回复评论</button>
     </div>
 
     <div id="tab-overview" class="tab-pane active">
+        {coverage_note}
         <div class="stats-grid">
             <div class="stat-card"><div class="num">{stats['total']}</div><div class="label">分析用户</div></div>
             <div class="stat-card"><div class="num">{stats['vip_count']}</div><div class="label">大会员</div></div>
@@ -868,52 +857,110 @@ def video_page(bvid: str):
 
     <div id="tab-users" class="tab-pane">
         <div class="filter-bar">
-            <button class="filter-btn active" onclick="filter('all', this)">全部</button>
-            <button class="filter-btn" onclick="filter('high-level', this)">Lv.5+</button>
-            <button class="filter-btn" onclick="filter('vip', this)">大会员</button>
-            <button class="filter-btn" onclick="filter('official', this)">认证用户</button>
-            <button class="filter-btn" onclick="filter('spam', this)">刷屏用户</button>
-            <button class="filter-btn" onclick="filter('creator', this)">UP主</button>
-            <input id="userSearch" class="search-input" placeholder="搜索昵称/UID..." oninput="searchUsers()">
+            <button class="filter-btn active" data-filter="all" onclick="userFilter('all', this)">全部</button>
+            <button class="filter-btn" data-filter="high-level" onclick="userFilter('high-level', this)">Lv.5+</button>
+            <button class="filter-btn" data-filter="vip" onclick="userFilter('vip', this)">大会员</button>
+            <button class="filter-btn" data-filter="official" onclick="userFilter('official', this)">认证用户</button>
+            <button class="filter-btn" data-filter="spam" onclick="userFilter('spam', this)">刷屏用户</button>
+            <button class="filter-btn" data-filter="creator" onclick="userFilter('creator', this)">UP主</button>
+            <input id="userSearch" class="search-input" placeholder="搜索昵称/UID...">
+            <select id="userSort" class="sort-select">
+                <option value="risk">默认（风险序）</option>
+                <option value="spam-score">刷屏分</option>
+                <option value="danmaku">弹幕数</option>
+                <option value="fans">粉丝数</option>
+            </select>
+            <span id="userResultCount" class="result-count"></span>
         </div>
         <div class="user-grid" id="userGrid">{cards_html}</div>
+        <div id="userEmpty" class="empty-filter" style="display:none">没有符合条件的用户，请调整筛选或搜索词</div>
+        <div id="userPager" class="user-pager"></div>
     </div>
 
     <div id="tab-danmaku" class="tab-pane">{danmaku_tab}</div>
 
     <div id="tab-cringe" class="tab-pane">{board_html}</div>
 
-    <div id="tab-full" class="tab-pane">
-        <div class="stats-grid">
-            <div class="stat-card"><div class="num">{stats['total']}</div><div class="label">分析用户</div></div>
-            <div class="stat-card"><div class="num">{stats['vip_count']}</div><div class="label">大会员</div></div>
-            <div class="stat-card"><div class="num">{lv5_count}</div><div class="label">Lv.5+</div></div>
-            <div class="stat-card"><div class="num">{stats['spam_levels'].get('高', 0)}</div><div class="label">重度刷屏</div></div>
-            <div class="stat-card"><div class="num">{stats['spam_levels'].get('中', 0)}</div><div class="label">中度刷屏</div></div>
-            <div class="stat-card"><div class="num">{ai_count}</div><div class="label">AI画像</div></div>
-        </div>
-        <div class="charts-grid">
-            <div class="chart-card"><h3>用户等级分布</h3><canvas id="levelChart2"></canvas></div>
-            <div class="chart-card"><h3>刷屏风险分布</h3><canvas id="spamChart2"></canvas></div>
-            <div class="chart-card"><h3>用户标签 Top10</h3><canvas id="tagChart2"></canvas></div>
-            {region_canvas2}
-        </div>
-        <div class="filter-bar">
-            <button class="filter-btn active" onclick="filter('all', this, 'full')">全部</button>
-            <button class="filter-btn" onclick="filter('high-level', this, 'full')">Lv.5+</button>
-            <button class="filter-btn" onclick="filter('vip', this, 'full')">大会员</button>
-            <button class="filter-btn" onclick="filter('official', this, 'full')">认证用户</button>
-            <button class="filter-btn" onclick="filter('spam', this, 'full')">刷屏用户</button>
-            <button class="filter-btn" onclick="filter('creator', this, 'full')">UP主</button>
-            <input id="fullSearch" class="search-input" placeholder="搜索昵称/UID..." oninput="searchUsers('full')">
-        </div>
-        <div class="user-grid" id="fullUserGrid">{full_cards_html}</div>
-        {board_html}
-    </div>
+    <div id="tab-hot" class="tab-pane">{hot_tab}</div>
 
     <div id="wc-popup" class="wc-popup"><canvas id="wc-popup-canvas" width="276" height="216"></canvas></div>
 </div>
-<script>{script}</script>
+<script>window.__DATA__ = {js_json(page_data)};</script>
+<script src="/static/report.js"></script>
+</body>
+</html>'''
+
+
+@app.route("/user/<int:uid>")
+def user_page(uid: int):
+    """用户互动时间线页：该用户在全部已分析视频中的弹幕/评论足迹，按最近互动倒序
+    （与卡片「其他视频足迹」互补：全量视频 + 时间维度 + 覆盖评论-only 用户）。
+
+    数据边界：仅覆盖本系统已分析视频；B站无按用户查询互动历史的公开接口，
+    弹幕本身匿名，无法从 UID 出发反查站内全部弹幕。"""
+    data = _user_timeline(uid)
+    name, level = data["name"], data["level"]
+
+    def _fmt_ts(ts: int) -> str:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "时间未留存"
+
+    if data["total_videos"] == 0:
+        items_html = ('<p class="empty-note">该用户在本系统已分析视频中暂无互动记录。'
+                      '注意：弹幕需该用户的 mid_hash 被解析进画像才会归户；'
+                      '评论仅在评论落库之后的运行中留存。</p>')
+        stats_line = ""
+        more_html = ""
+    else:
+        items = []
+        for it in data["items"]:
+            dm_html = "".join(
+                f'<li>{esc(s["content"])} <span class="tl-time">视频 {_fmt_video_time(s["vt"])} · {_fmt_ts(s["ts"])}</span></li>'
+                for s in it["dm_samples"]) or (
+                '<li class="ov-none">弹幕明细未留存（该视频为旧版本分析）</li>'
+                if it["dm_count"] else '<li class="ov-none">无弹幕样本</li>')
+            cmt_html = "".join(
+                f'<li>{esc(s["content"])} <span class="tl-time">{_fmt_ts(s["ts"])}</span></li>'
+                for s in it["cmt_samples"]) or '<li class="ov-none">无评论</li>'
+            items.append(f'''
+                <div class="tl-item">
+                    <div class="tl-head">
+                        <a class="tl-video" href="/video/{esc(it["bvid"])}">《{esc(it["title"])}》</a>
+                        <span class="tl-last">最近互动 {_fmt_ts(it["last_ts"])}</span>
+                    </div>
+                    <div class="tl-sub">🎤 弹幕 {it["dm_count"]:,} 条（样本）</div>
+                    <ul class="ov-list">{dm_html}</ul>
+                    <div class="tl-sub">📝 评论 {it["cmt_count"]:,} 条（样本）</div>
+                    <ul class="ov-list">{cmt_html}</ul>
+                </div>''')
+        items_html = "".join(items)
+        more_html = (f'<div class="tl-more">另有 {data["more"]} 个视频也出现过（按最近互动排序，未展示）</div>'
+                     if data["more"] else "")
+        stats_line = (f'<div class="tl-stats">涉及视频 {data["total_videos"]} 个 · '
+                      f'弹幕 {data["total_dm"]:,} 条 · 评论 {data["total_cmt"]:,} 条</div>')
+
+    return f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{esc(name)} 互动时间线 - B站弹幕用户画像分析</title>
+<style>{REPORT_CSS}</style>
+<link rel="stylesheet" href="/static/report.css">
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1><a href="/" style="color:white;text-decoration:none">🎬 B站弹幕用户画像分析</a></h1>
+        <div class="meta">
+            <strong>🕐 {esc(name)} 的互动时间线</strong><br>
+            UID: {uid} | Lv.{esc(level)} |
+            <a style="color:#ffd" href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">B站空间 ↗</a><br>
+            <span style="opacity:0.8">仅覆盖本系统已分析视频；按最近互动时间倒序。</span>
+        </div>
+    </div>
+    {stats_line}
+    <div class="tl-list">{items_html}{more_html}</div>
+</div>
 </body>
 </html>'''
 
@@ -938,7 +985,7 @@ def api_analyze(bvid: str):
         return jsonify({"error": str(e) or "Cookie 失效，请先运行 python login.py"}), 503
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
-        JOBS[job_id] = {"total": len(mid_hashes), "done": 0, "current": "",
+        JOBS[job_id] = {"kind": "analyze", "bvid": bvid, "total": len(mid_hashes), "done": 0, "current": "",
                         "errors": [], "finished": False, "results": []}
     threading.Thread(target=_run_analysis_job,
                      args=(job_id, bvid, mid_hashes), daemon=True).start()
@@ -952,7 +999,60 @@ def api_job(job_id: str):
         job = JOBS.get(job_id)
         if job is None:
             return jsonify({"error": "未知 job"}), 404
-        return jsonify(dict(job))
+        # errors/results 列表深拷一层：job 线程仍在 append，浅拷贝会把运行中的列表引用交给序列化
+        return jsonify(dict(job, errors=list(job["errors"]), results=list(job["results"])))
+
+
+def _has_running_job(bvid: str) -> bool:
+    """该视频是否有未完成任务（手动分析/重新生成），有则拒绝删除与重复发起（spec 9）"""
+    with JOBS_LOCK:
+        return any(j.get("bvid") == bvid and not j.get("finished") for j in JOBS.values())
+
+
+@app.route("/api/video/<bvid>/delete", methods=["POST"])
+def api_delete_video(bvid: str):
+    """删除该视频的全部分析数据与导出文件（spec 9：含共享缓存，不可恢复；有任务在跑则 409）"""
+    if _load_video_row(bvid) is None:
+        return jsonify({"error": "未知视频"}), 404
+    if _has_running_job(bvid):
+        return jsonify({"error": "该视频有正在运行的任务，请等待完成后再删除"}), 409
+    counts = delete_video_data(bvid)
+    removed_files = 0
+    for ext in ("csv", "json"):
+        for f in glob.glob(os.path.join(REPORT_DIR, f"report_{bvid}_*.{ext}")):
+            os.remove(f)
+            removed_files += 1
+    return jsonify({"ok": True, "removed_files": removed_files, **counts})
+
+
+def _run_regen_job(job_id: str, bvid: str):
+    """后台完整重跑分析流水线（等价 run.py --force；launch_web=False 防止再起 web 服务/开浏览器）"""
+    try:
+        run_analysis(bvid, force=True, max_users=None, launch_web=False)
+        with JOBS_LOCK:
+            JOBS[job_id].update(done=1, current="", finished=True)
+        print(f"[RegenJob {job_id}] 完成: {bvid}")
+    except Exception as e:
+        with JOBS_LOCK:
+            JOBS[job_id]["errors"].append({"mid_hash": None, "error": str(e)})
+            JOBS[job_id]["finished"] = True
+        print(f"[RegenJob {job_id}] 失败: {e}")
+
+
+@app.route("/api/video/<bvid>/regenerate", methods=["POST"])
+def api_regenerate(bvid: str):
+    """重新生成报告：后台完整重跑分析流水线（spec 9；已有任务在跑则 409）"""
+    if _load_video_row(bvid) is None:
+        return jsonify({"error": "未知视频"}), 404
+    if _has_running_job(bvid):
+        return jsonify({"error": "该视频已有任务在运行，请等待完成"}), 409
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {"kind": "regen", "bvid": bvid, "total": 1, "done": 0,
+                        "current": "重新生成中（完整流水线）", "errors": [],
+                        "finished": False, "results": []}
+    threading.Thread(target=_run_regen_job, args=(job_id, bvid), daemon=True).start()
+    return jsonify({"job_id": job_id})
 
 
 @app.route("/api/video/<bvid>/danmaku")
@@ -963,7 +1063,7 @@ def api_danmaku(bvid: str):
     不同 mid_hash 的相同内容不合并。
     参数：search（内容 LIKE）、sender（mid_hash 或昵称/UID 精确）、category（7类之一，
     命中该发送者的问题弹幕类别）、spam（高/中/低/未分析）、analyzed=1（只看已解析用户）、
-    sort（video_time/send_time/dup_count/sender_count）、order（asc/desc）、page（page_size 固定 100）。
+    sort（video_time/send_time/dup_count/sender_count）、order（asc/desc）、page、page_size（50/100/200，默认100）。
     返回 {rows: [...], total: int, page: int}；每行 content/dup_count/mid_hash/uid/name/
     first_video_time/first_send_time/categories/spam_level。
     """
@@ -987,6 +1087,14 @@ def api_danmaku(bvid: str):
         page = max(1, int(args.get("page", "1")))
     except ValueError:
         page = 1
+
+    # 每页条数：白名单 50/100/200，非法值回退默认 PAGE_SIZE（spec 3 每页条数选择）
+    try:
+        page_size = int(args.get("page_size", str(PAGE_SIZE)))
+    except ValueError:
+        page_size = PAGE_SIZE
+    if page_size not in (50, 100, 200):
+        page_size = PAGE_SIZE
 
     # 数据库锁定 → 500 JSON（与主查询同一降级口径）
     try:
@@ -1060,7 +1168,7 @@ def api_danmaku(bvid: str):
                sc.cnt AS sender_count
         {base_sql}
         ORDER BY {sort_col} {order}, d.mid_hash, d.content
-        LIMIT {PAGE_SIZE} OFFSET {(page - 1) * PAGE_SIZE}
+        LIMIT {page_size} OFFSET {(page - 1) * page_size}
     '''
     full_params = [bvid] + params
 
@@ -1088,7 +1196,7 @@ def api_danmaku(bvid: str):
             "spam_level": r["spam_level"] or "未分析",
             "sender_count": r["sender_count"],
         })
-    return jsonify({"rows": rows, "total": total, "page": page})
+    return jsonify({"rows": rows, "total": total, "page": page, "page_size": page_size})
 
 
 @app.route("/download/<path:filename>")
@@ -1101,15 +1209,103 @@ def download(filename: str):
 
 @app.errorhandler(404)
 def not_found(e):
-    """未知 bvid / 未知路径 → 中文 404 页面（spec 7）"""
-    return ("<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'><title>404</title></head>"
-            "<body style='font-family:sans-serif;text-align:center;padding:80px'>"
-            "<h1>404</h1><p>视频不存在或尚未分析，请先运行 python run.py &lt;BV号&gt;</p>"
-            "<p><a href='/'>返回首页</a></p></body></html>"), 404
+    """未知 bvid / 未知路径 → 中文 404 页面（带站点样式与返回首页按钮，spec 6）"""
+    return f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>404 - B站弹幕用户画像分析</title>
+<style>{REPORT_CSS}</style>
+<link rel="stylesheet" href="/static/report.css">
+</head>
+<body>
+<div class="container">
+    <div class="header"><h1>404</h1><div class="meta">页面或视频不存在</div></div>
+    <div class="nf-card">
+        <p>视频不存在或尚未分析，请先运行 <code>python run.py &lt;BV号&gt;</code></p>
+        <p><a class="filter-btn" href="/">返回首页</a></p>
+    </div>
+</div>
+</body>
+</html>''', 404
+
+
+def _pid_file(port: int) -> str:
+    """web 服务 pidfile 路径（按端口区分，PROFILER_PORT 多实例互不干扰）"""
+    return os.path.join(DATA_DIR, f"web_{port}.pid")
+
+
+def _write_pid(port: int):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(_pid_file(port), "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+
+def _clear_pid(port: int):
+    try:
+        os.remove(_pid_file(port))
+    except OSError:
+        pass
+
+
+def _pid_is_webpy(pid: int) -> bool:
+    """进程存活且命令行含 web.py：防止 PID 复用导致 --stop 误杀无关进程"""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return "web.py" in f.read().decode(errors="ignore")
+    except OSError:
+        return False
+
+
+def _stop_server(port: int):
+    """python web.py --stop：停止该端口的后台 web 服务并释放端口。
+
+    读 pidfile → 校验进程确为本项目 web.py（否则只清残留 pidfile）→ SIGTERM
+    优雅停止，1 秒内未退出则 SIGKILL 兜底；最后清理 pidfile。"""
+    pid_path = _pid_file(port)
+    try:
+        with open(pid_path, encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        print(f"[Web] 未发现 {port} 端口的服务记录（{pid_path} 不存在），服务可能未在运行")
+        return
+    if not _pid_is_webpy(pid):
+        print(f"[Web] 记录中的进程 {pid} 已不存在或不是本项目的 web.py，清理残留 pidfile")
+        _clear_pid(port)
+        return
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(10):
+        if not _pid_is_webpy(pid):
+            break
+        time.sleep(0.1)
+    if _pid_is_webpy(pid):
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.1)
+    _clear_pid(port)
+    print(f"[Web] 已停止 {port} 端口的 web 服务 (pid={pid})，端口已释放")
 
 
 if __name__ == "__main__":
-    init_db()
+    parser = argparse.ArgumentParser(description="B站弹幕用户画像 Web 报告服务")
+    parser.add_argument("--stop", action="store_true",
+                        help="停止本端口（PROFILER_PORT）后台运行的 web 服务并释放端口")
+    args = parser.parse_args()
     port = int(os.environ.get("PROFILER_PORT", "8000"))
+    if args.stop:
+        _stop_server(port)
+        sys.exit(0)
+
+    init_db()
+    _write_pid(port)
+    atexit.register(lambda: _clear_pid(port))
+
+    def _on_term(signum, frame):
+        # SIGTERM（来自 web.py --stop）：清 pidfile 后退出，端口随即释放
+        _clear_pid(port)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_term)
     print(f"[Web] 交互式报告服务已启动: http://127.0.0.1:{port}")
+    print(f"[Web] 停止服务: python web.py --stop")
     app.run(host="127.0.0.1", port=port, debug=False)

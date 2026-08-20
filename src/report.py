@@ -117,6 +117,10 @@ body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif
 .wc-popup { display:none; position:fixed; z-index:9999; background:white; border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.2); padding:12px; width:300px; height:240px; }
 .wc-popup canvas { width:100%; height:100%; }
 
+/* UID 解析徽标与直播徽标（spec 7） */
+.method-badge { font-size:11px; background:#f0f0f0; color:#888; padding:2px 8px; border-radius:10px; margin-left:6px; cursor:help; }
+.live-badge { font-size:12px; background:#f44336; color:white; padding:2px 8px; border-radius:10px; }
+
 @media(max-width:768px){
 .user-grid { grid-template-columns:1fr; }
 .stats-bar { grid-template-columns:repeat(3,1fr); }
@@ -201,6 +205,16 @@ def generate_user_card(profile: dict) -> str:
     spam_reason = dm.get("spam_reason", "")
     spam_class = f"spam-{esc(spam_level)}"
 
+    # 精确刷屏分值 + UID 解析方式/置信度徽标（tooltip 呈现，spec 7）；
+    # resolve_method/resolve_confidence 由 web.py _load_profiles 渲染期注入，缺失时不渲染徽标
+    spam_score = dm.get("spam_score") or 0.0   # senders.spam_score 可空，None 防御
+    resolve_method = profile.get("resolve_method", "")
+    resolve_confidence = profile.get("resolve_confidence", "")
+    method_badge = (f'<span class="method-badge" title="UID 解析方式：{esc(resolve_method)}">解析:{esc(resolve_method)}</span>'
+                    if resolve_method else "")
+    conf_badge = (f'<span class="method-badge" title="解析置信度：{esc(resolve_confidence)}（低置信度可能误识别）">置信度:{esc(resolve_confidence)}</span>'
+                  if resolve_confidence and resolve_confidence != "无" else "")   # "无"=无置信度信息，不渲染
+
     # 活动模式
     act = profile.get("activity_pattern", {})
     act_type = act.get("activity_type", "未知")
@@ -222,6 +236,10 @@ def generate_user_card(profile: dict) -> str:
     # 动态
     dyn = profile.get("dynamic", {})
     dyn_count = dyn.get("count", 0)
+    dyn_total_likes = dyn.get("total_likes", 0)
+
+    # 采集时间（users.collected_at 渲染期注入，ISO 串取日期部分）；缺失不渲染
+    collected_at = (profile.get("collected_at") or "")[:10]
 
     # 关注偏好
     fol_summary = profile.get("following_summary", {})
@@ -264,6 +282,18 @@ def generate_user_card(profile: dict) -> str:
                     <span>偏好: {cats_str}</span>
                 </div>
                 <div class="up-chips">{up_names}</div>
+            </div>'''
+
+    # 直播信息（spec 7）：有直播间才渲染小节；直播中加徽标
+    live = profile.get("live", {})
+    live_section = ""
+    if live.get("has_room"):
+        live_status_badge = '<span class="live-badge">直播中</span>' if live.get("is_live") else ""
+        live_title = f'：{esc(live.get("room_title", ""))}' if live.get("room_title") else ""
+        live_section = f'''
+            <div class="section">
+                <h4>📡 直播 {live_status_badge}</h4>
+                <div class="detail">有直播间{live_title}</div>
             </div>'''
 
     # 追番
@@ -309,18 +339,62 @@ def generate_user_card(profile: dict) -> str:
                 <ol class="dm-list">{"".join(items)}</ol>
             </div>'''
 
+    # 跨视频足迹小节（web.py 渲染期注入 other_videos；无数据不渲染）
+    other_videos = profile.get("other_videos") or {}
+    ov_items = other_videos.get("items") or []
+    ov_more = other_videos.get("more", 0)
+    ov_section = ""
+    if ov_items:
+        ov_html = []
+        for it in ov_items:
+            title = it.get("title") or it.get("bvid", "")
+            dm_samples = it.get("danmaku_samples") or []
+            cmt_samples = it.get("comment_samples") or []
+            dm_count = it.get("danmaku_count", 0)
+            cmt_count = it.get("comment_count", 0)
+            legacy = it.get("legacy", False)   # 旧版本分析：弹幕/评论均未留存
+            dm_html = "".join(f"<li>{esc(c)}</li>" for c in dm_samples) or (
+                '<li class="ov-none">弹幕明细未留存（该视频为旧版本分析）</li>'
+                if legacy or dm_count else '<li class="ov-none">无弹幕样本</li>')
+            cmt_lis = []
+            for c in cmt_samples:
+                ts = c.get("ctime", 0)
+                date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
+                sub_mark = '<span class="dm-time">回复</span> ' if c.get("is_sub") else ""
+                cmt_lis.append(f'<li>{sub_mark}{esc(c.get("content", ""))} '
+                               f'<span class="dm-time">👍{c.get("like", 0)} {date}</span></li>')
+            cmt_html = "".join(cmt_lis) or (
+                '<li class="ov-none">评论未留存（该视频为旧版本分析）</li>'
+                if legacy else '<li class="ov-none">无评论</li>')
+            ov_html.append(f'''
+                <div class="ov-item">
+                    <div class="ov-head"><a class="ov-link" href="/video/{esc(it["bvid"])}">《{esc(title)}》</a>
+                        <span class="ov-note">弹幕 {dm_count:,} · 评论 {cmt_count:,}</span></div>
+                    <div class="ov-sub">💬 弹幕样本</div><ul class="ov-list">{dm_html}</ul>
+                    <div class="ov-sub">📝 评论样本</div><ul class="ov-list">{cmt_html}</ul>
+                </div>''')
+        ov_more_html = (f'<div class="ov-more">另有 {ov_more} 个已分析视频也出现过（可在对应视频报告中查看）</div>'
+                        if ov_more else "")
+        ov_section = f'''
+            <div class="section">
+                <h4>🔗 其他视频足迹</h4>
+                <div class="other-videos">{"".join(ov_html)}</div>
+                {ov_more_html}
+            </div>'''
+
     # 头像 (可点击跳转B站主页)
     profile_url = safe_url(f"https://space.bilibili.com/{uid}")
     avatar_html = f'<a href="{profile_url}" target="_blank"><img src="{safe_url(face)}" alt="{esc(name)}" loading="lazy" onerror="this.style.display=\'none\'"></a>' if face else f'<div class="avatar-text">{esc(name[0]) if name else "?"}</div>'
 
     return f'''
-    <div class="user-card" id="uid-{esc(uid)}" data-level="{esc(level)}" data-vip="{profile.get('vip_status',0)==1}" data-spam="{esc(spam_level)}" data-official="{profile.get('official_type',-1)>=0}">
+    <div class="user-card" id="uid-{esc(uid)}" data-level="{esc(level)}" data-vip="{'true' if profile.get('vip_status',0)==1 else 'false'}" data-spam="{esc(spam_level)}" data-official="{'true' if profile.get('official_type',-1)>=0 else 'false'}" data-is-up="{'true' if profile.get('archive_count',0)>0 else 'false'}" data-spam-score="{spam_score:.2f}" data-danmaku-count="{esc(dm_count)}" data-fans="{esc(follower)}">
         <div class="card-header">
             <div class="avatar">{avatar_html}</div>
             <div class="header-info">
                 <div class="name-line">
                     <a href="{profile_url}" target="_blank" class="username-link"><span class="username">{esc(name)}</span></a>
                     <span class="uid">UID:{esc(uid)}</span>
+                    <a class="tl-mini" href="/user/{esc(uid)}" title="查看该用户在已分析视频中的互动时间线">🕐 时间线</a>
                     <span class="level-badge">Lv.{esc(level)}</span>
                     { '<span class="vip-badge">大会员</span>' if profile.get('vip_status')==1 else '' }
                     { '<span class="risk-badge" title="该UID由CRC32反查（MITM）得出，存在碰撞误识别风险">可能误识别</span>' if profile.get('collision_risk') else '' }
@@ -340,12 +414,13 @@ def generate_user_card(profile: dict) -> str:
 
         <div class="card-body">
             <div class="section">
-                <h4>🎤 弹幕行为 <span class="spam-badge {spam_class}">{esc(spam_level)}风险</span></h4>
+                <h4>🎤 弹幕行为 <span class="spam-badge {spam_class}">{esc(spam_level)}风险 {spam_score:.2f}分</span>{method_badge}{conf_badge}</h4>
                 <div class="detail">共发送 {esc(dm_count)} 条弹幕{cringe_note}</div>
                 <ol class="dm-list">{dm_list}</ol>
                 {f'<div class="reason">判定: {esc(spam_reason)}</div>' if spam_reason else ''}
             </div>
             {cmt_section}
+            {ov_section}
             <div class="section">
                 <h4>👤 基础信息</h4>
                 <div class="info-grid">
@@ -354,8 +429,12 @@ def generate_user_card(profile: dict) -> str:
                     <span>活跃模式: {esc(act_type)}</span>
                     {f'<span>高峰时段: {esc(peak_hour)}:00</span>' if peak_hour is not None else ''}
                     {f'<span>活跃星期: {esc(peak_day)}</span>' if peak_day else ''}
+                    <span>投稿数: {esc(profile.get("archive_count", 0))}</span>
+                    {f'<span>动态获赞: {dyn_total_likes:,}</span>' if dyn_total_likes else ''}
+                    {f'<span>采集时间: {esc(collected_at)}</span>' if collected_at else ''}
                 </div>
             </div>
+            {live_section}
 
             {f'''<div class="section"><h4>📁 收藏夹 ({esc(fav.get("folder_count",0))}个)</h4><div class="samples">{''.join(f'<span class="sample">{esc(n)}</span>' for n in fav_names)}</div></div>''' if fav_names else ''}
 
