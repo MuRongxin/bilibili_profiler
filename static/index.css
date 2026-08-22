@@ -11,9 +11,6 @@
 .video-table th[data-sort]::after { content:' ⇅'; font-size:12px; }
 .idx-pager { display:flex; gap:12px; align-items:center; justify-content:center; padding:18px; }
 .idx-pager span { font-size:14px; color:#999; }
-/* 操作列按钮横排（不再竖直堆叠） */
-.idx-actions { display:flex; gap:8px; white-space:nowrap; }
-.idx-actions .filter-btn { padding:5px 12px; font-size:13px; }
 
 /* 跨视频重叠用户面板 */
 .xv-panel { margin-top:24px; background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); padding:20px 24px; }
@@ -29,6 +26,18 @@
 .search-input { padding:8px 14px; border:2px solid #e0e0e0; border-radius:25px; font-size:14px; width:220px; outline:none; }
 .search-input:focus { border-color:#00a1d6; }
 
-/* 删除按钮警示色（spec 9） */
-.btn-danger { border-color:#f44336 !important; color:#f44336 !important; }
-.btn-danger:hover:not(:disabled) { background:#f44336 !important; color:white !important; }
+/* 跨视频面板：视频条目可展开明细（弹幕/评论样本） */
+.xv-detail { margin:4px 0; }
+.xv-detail summary { cursor:pointer; list-style:none; }
+.xv-detail summary::before { content:'▸ '; color:#bbb; }
+.xv-detail[open] summary::before { content:'▾ '; }
+.xv-counts { font-size:12px; color:#999; margin-left:8px; }
+.xv-sec { font-size:12px; color:#999; margin:8px 0 2px; }
+.xv-list { margin:0 0 6px; padding-left:20px; font-size:13px; color:#555; line-height:1.7; }
+.xv-list li { word-break:break-all; }
+/* 与 report.css 同款小样式（首页不加载 report.css，此处复制） */
+.dm-time { color:#999; font-size:12px; }
+.ov-none { color:#bbb; }
+.problem-chip { display:inline-block; color:#fff; font-size:12px; border-radius:4px;
+    padding:1px 8px; margin-left:6px; vertical-align:1px; }
+

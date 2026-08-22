@@ -762,7 +762,11 @@ def _cross_video_overlaps() -> list[dict]:
     """首页跨视频重叠用户面板：在 >= CROSS_VIDEO_MIN_VIDEOS 个已分析视频中都发过弹幕的
     发送者（全局 UID 映射沉淀后此查询很便宜），找水军/情绪带节奏用户比单视频报告强。
 
-    返回 [{uid, name, video_count, total_dm, videos: [(bvid, title)]}]，按视频数/弹幕数降序。"""
+    每个视频附弹幕/评论明细样本（前端 <details> 展开查看「TA 在该视频说了什么」）：
+    弹幕按发送时间倒序、评论按点赞降序各取 MAX_FOOTPRINT_*_SAMPLES 条；旧版本分析
+    （danmaku 表无行）标注明细未留存。
+    返回 [{uid, name, video_count, total_dm, videos: [{bvid,title,dm_count,dm_samples,
+    cmt_count,cmt_samples,legacy}]}]，按视频数/弹幕数降序。"""
     with closing(get_db()) as conn:
         rows = conn.execute('''
             SELECT s.uid, u.name, COUNT(DISTINCT s.bvid) AS vcnt, SUM(s.danmaku_count) AS total_dm
@@ -775,19 +779,57 @@ def _cross_video_overlaps() -> list[dict]:
             return []
         uids = [r["uid"] for r in rows]
         qmarks = ",".join("?" * len(uids))
-        videos_by_uid: dict[int, list] = {}
+        # (uid, bvid) → 视频标题、该用户在该视频的 mid_hash 列表与弹幕计数
+        vinfo: dict[tuple[int, str], dict] = {}
         for r in conn.execute(f'''
-                SELECT s.uid, s.bvid, v.title FROM senders s
+                SELECT s.uid, s.bvid, s.mid_hash, s.danmaku_count, v.title FROM senders s
                 JOIN videos v ON v.bvid = s.bvid
-                WHERE s.uid IN ({qmarks}) GROUP BY s.uid, s.bvid
+                WHERE s.uid IN ({qmarks})
         ''', uids).fetchall():
-            videos_by_uid.setdefault(r["uid"], []).append((r["bvid"], r["title"] or r["bvid"]))
+            ent = vinfo.setdefault((r["uid"], r["bvid"]), {
+                "title": r["title"] or r["bvid"], "mid_hashes": [], "dm_count": 0})
+            if r["mid_hash"] not in ent["mid_hashes"]:
+                ent["mid_hashes"].append(r["mid_hash"])
+            ent["dm_count"] += r["danmaku_count"] or 0
+
+        # 明细样本：逐 (uid,bvid) 取弹幕/评论（50 用户×数视频，本地 SQLite 量级可控）
+        legacy_cache: dict[str, bool] = {}
+        videos_by_uid: dict[int, list] = {}
+        for (uid, bvid), ent in vinfo.items():
+            if bvid not in legacy_cache:
+                legacy_cache[bvid] = conn.execute(
+                    "SELECT 1 FROM danmaku WHERE bvid = ? LIMIT 1", (bvid,)).fetchone() is None
+            dm_samples: list[str] = []
+            for mh in ent["mid_hashes"]:
+                dm_samples.extend(r["content"] for r in conn.execute(
+                    "SELECT content FROM danmaku WHERE bvid = ? AND mid_hash = ? "
+                    "ORDER BY timestamp DESC LIMIT ?",
+                    (bvid, mh, MAX_FOOTPRINT_DANMAKU_SAMPLES)).fetchall())
+                if len(dm_samples) >= MAX_FOOTPRINT_DANMAKU_SAMPLES:
+                    break
+            cmt_count = conn.execute(
+                "SELECT COUNT(*) FROM comments WHERE bvid = ? AND uid = ?",
+                (bvid, uid)).fetchone()[0]
+            cmt_samples = [
+                {"content": r["content"], "like": r["like"], "problem": r["problem"] or ""}
+                for r in conn.execute(
+                    "SELECT content, like, problem FROM comments WHERE bvid = ? AND uid = ? "
+                    "ORDER BY like DESC, ctime DESC LIMIT ?",
+                    (bvid, uid, MAX_FOOTPRINT_COMMENT_SAMPLES)).fetchall()]
+            videos_by_uid.setdefault(uid, []).append({
+                "bvid": bvid, "title": ent["title"],
+                "dm_count": ent["dm_count"], "dm_samples": dm_samples[:MAX_FOOTPRINT_DANMAKU_SAMPLES],
+                "cmt_count": cmt_count, "cmt_samples": cmt_samples,
+                "legacy": legacy_cache[bvid],
+            })
     return [{
         "uid": r["uid"],
         "name": r["name"] or f"UID:{r['uid']}",
         "video_count": r["vcnt"],
         "total_dm": r["total_dm"] or 0,
-        "videos": videos_by_uid.get(r["uid"], []),
+        # 弹幕多的视频排前，展开列表一眼看到主战场
+        "videos": sorted(videos_by_uid.get(r["uid"], []),
+                         key=lambda v: -(v["dm_count"] + v["cmt_count"])),
     } for r in rows]
 
 
@@ -1110,27 +1152,45 @@ def index():
         <td>{r["dm_count"]:,}</td>
         <td>{r["profile_count"]}</td>
         <td>{r["spam_high"]} / {r["spam_mid"]}</td>
-        <td><div class="idx-actions"><button class="filter-btn" onclick="regenVideo('{esc(r["bvid"])}', this)">重新生成</button>
-            <button class="filter-btn btn-danger" onclick="deleteVideo('{esc(r["bvid"])}')">删除</button></div></td>
     </tr>''' for r in rows)
-    body = items or '<tr><td colspan="9" class="empty-note">暂无已分析视频，先运行 python run.py &lt;BV号&gt;</td></tr>'
+    body = items or '<tr><td colspan="8" class="empty-note">暂无已分析视频，先运行 python run.py &lt;BV号&gt;</td></tr>'
 
     # 跨视频重叠用户面板：在多个已分析视频中都出现过的发送者（水军/情绪带节奏视角）
     overlaps = _cross_video_overlaps()
     overlap_html = ""
     if overlaps:
+        # 每个视频一个 <details>：标题+弹幕/评论计数为摘要，展开可见 TA 在该视频的
+        # 弹幕/评论明细样本（含问题评论标注）；旧版本分析标注明细未留存
+        def _xv_video_block(v: dict) -> str:
+            dm_lis = "".join(f"<li>{esc(c)}</li>" for c in v["dm_samples"])
+            if not dm_lis:
+                dm_lis = ('<li class="ov-none">弹幕明细未留存（该视频为旧版本分析）</li>'
+                          if v["legacy"] and v["dm_count"] else '<li class="ov-none">无弹幕样本</li>')
+            cmt_lis = "".join(
+                f'<li>{esc(c["content"])} <span class="dm-time">👍{c["like"]:,}</span>'
+                f'{_problem_chip(c["problem"])}</li>' for c in v["cmt_samples"])
+            if not cmt_lis:
+                cmt_lis = ('<li class="ov-none">评论未留存（该视频为旧版本分析）</li>'
+                           if v["legacy"] else '<li class="ov-none">无评论</li>')
+            return f'''<details class="xv-detail">
+                <summary><a href="/video/{esc(v["bvid"])}">《{esc(v["title"])}》</a>
+                    <span class="xv-counts">弹幕 {v["dm_count"]:,} · 评论 {v["cmt_count"]:,}</span></summary>
+                <div class="xv-sec">💬 弹幕样本</div><ul class="xv-list">{dm_lis}</ul>
+                <div class="xv-sec">📝 评论样本</div><ul class="xv-list">{cmt_lis}</ul>
+            </details>'''
+
         rows_html = "".join(f'''<tr>
             <td><a href="/user/{esc(o["uid"])}">{esc(o["name"])}</a></td>
             <td>{o["video_count"]}</td>
             <td>{o["total_dm"]:,}</td>
-            <td class="xv-videos">{" ".join(f'<a href="/video/{esc(b)}">《{esc(t)}》</a>' for b, t in o["videos"])}</td>
+            <td class="xv-videos">{"".join(_xv_video_block(v) for v in o["videos"])}</td>
         </tr>''' for o in overlaps)
         overlap_html = f'''
     <div class="xv-panel">
         <h2>🔁 跨视频重叠用户（{len(overlaps)} 人）</h2>
-        <p class="xv-note">在 ≥ {CROSS_VIDEO_MIN_VIDEOS} 个已分析视频中都发过弹幕的发送者——跨视频重复出现的账号是水军/带节奏的重点嫌疑对象。</p>
+        <p class="xv-note">在 ≥ {CROSS_VIDEO_MIN_VIDEOS} 个已分析视频中都发过弹幕的发送者——跨视频重复出现的账号是水军/带节奏的重点嫌疑对象。点视频条目可展开 TA 在该视频里的弹幕/评论明细。</p>
         <table class="video-table xv-table">
-            <thead><tr><th>用户</th><th>涉及视频数</th><th>总弹幕数</th><th>出现的视频</th></tr></thead>
+            <thead><tr><th>用户</th><th>涉及视频数</th><th>总弹幕数</th><th>出现的视频（点条目展开明细）</th></tr></thead>
             <tbody>{rows_html}</tbody>
         </table>
     </div>'''
@@ -1152,7 +1212,7 @@ def index():
     <table class="video-table">
         <thead><tr><th>标题</th><th>BV号</th><th>时长</th><th>播放量</th>
             <th data-sort="time">分析时间</th><th data-sort="dm">弹幕数</th><th data-sort="profiles">画像人数</th>
-            <th>高/中风险</th><th>操作</th></tr></thead>
+            <th>高/中风险</th></tr></thead>
         <tbody id="videoTbody">{body}</tbody>
     </table>
     <div class="idx-pager">
