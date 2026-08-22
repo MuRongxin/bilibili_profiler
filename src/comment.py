@@ -43,6 +43,7 @@ def _parse_comment(r: dict, is_sub: bool) -> dict | None:
         "reply_count": 0 if is_sub else r.get("rcount", 0),
         "ctime": r.get("ctime", 0),
         "is_sub": is_sub,
+        "parent_rpid": r.get("parent", 0) if is_sub else 0,  # 直接父级 rpid（回复树缩进用）
         "location": (r.get("reply_control") or {}).get("location", ""),
     }
 

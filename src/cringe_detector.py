@@ -14,7 +14,8 @@ import json
 
 from openai import OpenAI
 
-from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, CRINGE_BATCH_SIZE
+from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, CRINGE_BATCH_SIZE,
+                    COMMENT_CRINGE_BATCH_SIZE, COMMENT_CRINGE_MAX_ITEMS)
 from storage import load_llm_cache, save_llm_cache
 
 # 问题弹幕类别（与 spec 一致；prompt 与聚合均引用，勿散落硬编码字符串）
@@ -78,6 +79,7 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
             "max_severity": int,     # 最高严重度 1-3
             "categories": [str],     # 涉及的问题弹幕类别
             "examples": [{content, category, severity, reason}],  # 至多5条代表原文
+            "items": [{content, category, severity, reason}],     # 全量命中（供误报重算聚合）
         }}
         未配置 Key / 全部批次失败 / 无问题弹幕时为相应子集或空 dict
     """
@@ -158,7 +160,8 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
         content = v["_content"]
         for mid_hash in content_senders.get(content, ()):
             ent = results.setdefault(mid_hash, {"count": 0, "max_severity": 0,
-                                                "categories": [], "examples": []})
+                                                "categories": [], "examples": [],
+                                                "items": []})
             ent["count"] += 1
             sev = v.get("severity", 1)
             # 归一化一次、两处复用：挡 bool/字符串/超界值，钳制到 1-3 的 int
@@ -167,11 +170,12 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
             cat = v["category"]
             if cat not in ent["categories"]:
                 ent["categories"].append(cat)
+            item = {"content": content, "category": cat,
+                    "severity": sev, "reason": v.get("reason", "")}
+            # items 存全量命中（误报标记后 web 端按内容重算聚合）；examples 仍是前5条代表原文
+            ent["items"].append(item)
             if len(ent["examples"]) < 5:
-                ent["examples"].append({
-                    "content": content, "category": cat,
-                    "severity": sev, "reason": v.get("reason", ""),
-                })
+                ent["examples"].append(item)
 
     if cache_key:
         if failed > 0:
@@ -181,4 +185,139 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
             save_llm_cache(cache_key, json.dumps(results, ensure_ascii=False))
 
     print(f"[问题弹幕] 检测完成: {len(verdicts)} 条问题弹幕，涉及 {len(results)} 个发送者")
+    return results
+
+
+# ========== 问题评论检测（同一 LLM 判定口径，对象为评论） ==========
+
+def _build_comment_prompt(batch: list[dict], start_idx: int, video_title: str) -> str:
+    """构建单批问题评论判定 prompt（编号为全局下标，便于跨批映射）"""
+    lines = [f'{start_idx + i}. {it["content"]}' for i, it in enumerate(batch)]
+    return f"""你是中文互联网内容审核专家。以下是B站视频《{video_title}》的评论列表（已按内容去重）。
+请逐条判定是否属于以下七类"问题评论"之一：
+- 中二抒情：咯噔文学、疼痛文学、过度深情、自我感动式抒情
+- 尬夸捧杀：无脑吹、饭圈式夸张应援、明显违心的吹捧
+- 引战阴阳：拉踩、对线、反串、阴阳怪气等攻击性内容
+- 人身攻击：辱骂、诅咒、攻击其他观众/UP主/视频角色
+- 恶意剧透：泄露剧情关键信息、结局、反转
+- 广告引流：打广告、推广、引流到其他平台或商品
+- 键政敏感：借题发挥的政治隐喻、键政引战
+正常玩梗、合理讨论、普通应援不算问题评论，宁漏勿冤。
+
+评论列表：
+{chr(10).join(lines)}
+
+请严格只输出一个 JSON 数组，每个元素对应一条判定（只输出判为问题评论的条目）：
+[{{"i": 编号, "category": "中二抒情|尬夸捧杀|引战阴阳|人身攻击|恶意剧透|广告引流|键政敏感", "severity": 1到3的整数, "reason": "10字内理由"}}]
+没有问题评论就输出 []。不要输出任何 JSON 之外的内容。"""
+
+
+def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int, dict]:
+    """
+    问题评论检测主入口（LLM 判定，与问题弹幕同口径）
+
+    Args:
+        comments: comment.collect_comment_data 返回的评论列表（含 rpid/content/like）
+
+    Returns:
+        {rpid: {"category": str, "severity": int, "reason": str}}
+        未配置 Key / 全部批次失败 / 无问题评论时为空 dict
+    """
+    if not LLM_API_KEY:
+        print("[问题评论] 未配置 LLM_API_KEY，跳过问题评论检测")
+        return {}
+    if not comments:
+        return {}
+
+    # 按内容去重（刷屏复制粘贴的评论只判定一次），内容 → rpid 集合用于回映
+    content_rpids: dict[str, list[int]] = {}
+    like_of: dict[str, int] = {}
+    for c in comments:
+        content = (c.get("content") or "").strip()
+        rpid = c.get("rpid")
+        if not content or not rpid:
+            continue
+        content_rpids.setdefault(content, []).append(rpid)
+        like_of[content] = max(like_of.get(content, 0), c.get("like", 0))
+    items = [{"content": c} for c in content_rpids]
+    # 评论量比弹幕更难压缩：按最高点赞降序截断，优先判定可见度高的评论
+    items.sort(key=lambda x: -like_of.get(x["content"], 0))
+    if len(items) > COMMENT_CRINGE_MAX_ITEMS:
+        print(f"[问题评论] 去重后 {len(items)} 条超出上限，按点赞截取前 {COMMENT_CRINGE_MAX_ITEMS} 条")
+        items = items[:COMMENT_CRINGE_MAX_ITEMS]
+    if not items:
+        return {}
+
+    # 判定结果缓存：同一视频去重内容集合未变 → 直接复用（重跑零 LLM 调用）
+    bvid = video_info.get("bvid", "")
+    cache_key = ""
+    if bvid:
+        digest = hashlib.sha256(
+            json.dumps(sorted(it["content"] for it in items), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:16]
+        cache_key = f"cmt:{bvid}:{digest}"
+        cached = load_llm_cache(cache_key)
+        if cached is not None:
+            try:
+                results = json.loads(cached)
+                if not isinstance(results, dict):
+                    raise ValueError("缓存结果不是 dict")
+                # 缓存的 rpid 键是字符串（JSON 对象键），转回 int
+                print(f"[问题评论] 缓存命中（{len(results)} 条问题评论），跳过 LLM 判定")
+                return {int(k): v for k, v in results.items()}
+            except (json.JSONDecodeError, ValueError, TypeError):
+                print("[问题评论] 警告: 缓存内容损坏，重新判定")
+
+    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    title = video_info.get("title", "未知视频")
+    results: dict[int, dict] = {}
+    batches = [items[i:i + COMMENT_CRINGE_BATCH_SIZE]
+               for i in range(0, len(items), COMMENT_CRINGE_BATCH_SIZE)]
+    failed = 0
+    for bi, batch in enumerate(batches, 1):
+        start_idx = (bi - 1) * COMMENT_CRINGE_BATCH_SIZE
+        print(f"[问题评论] 判定 {bi}/{len(batches)} 批（{len(batch)} 条，LLM请求中）...")
+        try:
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": _build_comment_prompt(batch, start_idx, title)}],
+                max_tokens=LLM_MAX_TOKENS,
+                temperature=0.3,  # 判定类任务低温，减少格式漂移
+            )
+            raw = resp.choices[0].message.content or ""
+        except Exception as e:
+            print(f"[问题评论] 警告: 批次 {bi} 请求失败（{e}），跳过该批")
+            failed += 1
+            continue
+        batch_verdicts = _parse_verdicts(raw)
+        if not batch_verdicts and raw.strip() not in ("", "[]"):
+            print(f"[问题评论] 警告: 批次 {bi} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
+        accepted = 0
+        for v in batch_verdicts:
+            idx = v.get("i")
+            if not (isinstance(idx, int) and 0 <= idx < len(items)
+                    and v.get("category") in PROBLEM_CATEGORIES):
+                continue
+            sev = v.get("severity", 1)
+            # 归一化：挡 bool/字符串/超界值，钳制到 1-3 的 int
+            sev = sev if isinstance(sev, int) and not isinstance(sev, bool) and 1 <= sev <= 3 else 1
+            verdict = {"category": v["category"], "severity": sev, "reason": v.get("reason", "")}
+            # 同一内容的所有 rpid 都标注（复制粘贴刷屏的评论同源同罪）
+            for rpid in content_rpids.get(items[idx]["content"], []):
+                results[rpid] = verdict
+            accepted += 1
+        print(f"[问题评论] 批次 {bi}: 采纳 {accepted} 条（解析 {len(batch_verdicts)} 条）")
+
+    if failed == len(batches):
+        print("[问题评论] 警告: 全部批次失败，问题评论检测降级为空")
+        return {}
+
+    if cache_key:
+        if failed > 0:
+            # 部分批次失败时结果不完整，不写缓存避免瞬态波动被冻结复用
+            print(f"[问题评论] {failed} 个批次失败，本次结果不写入缓存")
+        else:
+            save_llm_cache(cache_key, json.dumps(results, ensure_ascii=False))
+
+    print(f"[问题评论] 检测完成: {len(results)} 条问题评论")
     return results

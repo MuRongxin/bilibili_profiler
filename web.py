@@ -20,6 +20,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import Counter
 from datetime import datetime
 from contextlib import closing
 
@@ -31,14 +32,15 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      MAX_FOOTPRINT_VIDEOS, MAX_FOOTPRINT_DANMAKU_SAMPLES,
                      MAX_FOOTPRINT_COMMENT_SAMPLES,
                      HOT_COMMENT_MIN_REPLIES, HOT_COMMENT_MAX_SHOW,
-                     HOT_COMMENT_REPLY_SAMPLES,
-                     USER_TIMELINE_MAX_VIDEOS, USER_TIMELINE_SAMPLES)
+                     USER_TIMELINE_MAX_VIDEOS, USER_TIMELINE_SAMPLES,
+                     CROSS_VIDEO_MIN_VIDEOS, CROSS_VIDEO_MAX_USERS, DENSITY_BUCKETS,
+                     COMMENT_HEAT_REPLY_WEIGHT, PROBLEM_COMMENT_TOP_N, ATTACK_FOCUS_TOP_N)
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
 from storage import get_db, init_db
 from storage import (load_senders, load_global_uid_map, save_global_uid,
                      save_sender, save_user_data, has_user_data, load_video_info,
-                     delete_video_data)
+                     delete_video_data, toggle_false_positive, load_false_positives)
 from main import run_analysis
 from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
 from user_collector import collect_user_data
@@ -47,10 +49,21 @@ from spam_detector import batch_detect_spam
 from llm_analyzer import LLMAnalyzer
 from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats,
                     generate_chart_data, generate_cringe_board, sort_profiles_by_risk,
-                    up_wordcloud_data, PROBLEM_CATEGORY_COLORS)
+                    up_wordcloud_data, PROBLEM_CATEGORY_COLORS, _category_chips)
 
 app = Flask(__name__)
 PAGE_SIZE = 100  # 弹幕 API 默认/回退每页条数（可选 50/100/200，spec 3）
+
+# 报告页整页 HTML 内存缓存（按 bvid）：避免每次刷新重跑 _load_profiles/_attach_other_videos
+# 逐用户查询串；任何改动该视频数据的 job（手动分析/重新生成）完成或删除时失效
+_PAGE_CACHE: dict[str, str] = {}
+_PAGE_CACHE_LOCK = threading.Lock()
+
+
+def _invalidate_page_cache(bvid: str):
+    """使指定视频的报告页缓存失效（job 完成/删除时调用）"""
+    with _PAGE_CACHE_LOCK:
+        _PAGE_CACHE.pop(bvid, None)
 
 
 # ========== 手动勾选分析 job（spec B；状态存内存 dict，服务重启即失效——spec 已接受） ==========
@@ -230,6 +243,7 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
             update(done=i)
 
     update(finished=True, current="")
+    _invalidate_page_cache(bvid)   # 该视频画像已变化，报告页缓存失效
     print(f"[Job {job_id}] 完成: 成功 {len(JOBS[job_id]['results'])}/{len(mid_hashes)}")
 
 
@@ -245,11 +259,12 @@ def _load_profiles(bvid: str) -> list[dict]:
     """该视频已解析发送者的画像（senders JOIN users；同 uid 多 mid_hash 按 uid 去重）。
 
     附带注入渲染期键（不落库）：resolve_method/resolve_confidence 来自 senders 表
-    （卡片解析徽标 tooltip），collected_at 来自 users 表（基础信息采集时间）。
+    （卡片解析徽标 tooltip），collected_at 来自 users 表（基础信息采集时间），
+    school 在旧缓存画像缺省时从 data_json 回退提取（毕业院校徽标）。
     GROUP BY u.uid 下 method/confidence 取该 uid 任一行（同 uid 多 mid_hash 极少见，可接受）。"""
     conn = get_db()
     rows = conn.execute('''
-        SELECT u.profile_json, s.method, s.confidence, u.collected_at
+        SELECT u.profile_json, u.data_json, s.method, s.confidence, u.collected_at
         FROM senders s JOIN users u ON u.uid = s.uid
         WHERE s.bvid = ? AND s.uid IS NOT NULL
         GROUP BY u.uid
@@ -264,6 +279,12 @@ def _load_profiles(bvid: str) -> list[dict]:
         p["resolve_method"] = r["method"] or ""
         p["resolve_confidence"] = r["confidence"] or ""
         p["collected_at"] = r["collected_at"] or ""
+        # 毕业院校回退：本特性之前的缓存画像无 school 键，从采集原始数据 data_json 补
+        if not p.get("school"):
+            try:
+                p["school"] = json.loads(r["data_json"]).get("school", "")
+            except Exception:
+                pass
         profiles.append(p)
     return profiles
 
@@ -343,9 +364,9 @@ def _attach_other_videos(bvid: str, profiles: list[dict]):
                         break
                 cmt_samples = [
                     {"content": r["content"], "ctime": r["ctime"],
-                     "like": r["like"], "is_sub": r["is_sub"]}
+                     "like": r["like"], "is_sub": r["is_sub"], "problem": r["problem"]}
                     for r in conn.execute(
-                        "SELECT content, ctime, like, is_sub FROM comments "
+                        "SELECT content, ctime, like, is_sub, problem FROM comments "
                         "WHERE bvid = ? AND uid = ? ORDER BY like DESC, ctime DESC LIMIT ?",
                         (vb, uid, MAX_FOOTPRINT_COMMENT_SAMPLES)).fetchall()]
                 items.append({
@@ -418,6 +439,358 @@ def _danmaku_panel_stats(bvid: str) -> dict:
     }
 
 
+def _danmaku_density(bvid: str, duration) -> dict | None:
+    """概览页弹幕密度时间轴：按视频内时间分桶计数（一眼看到哪个片段弹幕爆发）。
+
+    桶数约每 10 秒一桶，上限 DENSITY_BUCKETS；无弹幕数据或时长未知返回 None（不渲染）。"""
+    duration = int(duration or 0)
+    if duration <= 0:
+        return None
+    with closing(get_db()) as conn:
+        rows = conn.execute("SELECT time FROM danmaku WHERE bvid = ?", (bvid,)).fetchall()
+    if not rows:
+        return None
+    buckets = min(DENSITY_BUCKETS, max(10, duration // 10))
+    size = duration / buckets
+    counts = [0] * buckets
+    for r in rows:
+        i = int(r["time"] // size)
+        counts[min(max(i, 0), buckets - 1)] += 1
+    labels = [_fmt_video_time(i * size) for i in range(buckets)]
+    # starts：每桶起始秒数（前端点击柱条跳转视频对应时段，P1-a）
+    return {"labels": labels, "data": counts, "starts": [int(i * size) for i in range(buckets)]}
+
+
+def _danmaku_attr_stats(bvid: str) -> dict | None:
+    """弹幕属性分布（mode/color 已入库）：滚动/顶部/底部占比 + 颜色 Top12。
+    滚动弹幕占比、颜色聚集度、顶/底弹幕对识别刷屏与水军有区分度。无数据返回 None。"""
+    with closing(get_db()) as conn:
+        modes = conn.execute(
+            "SELECT mode, COUNT(*) AS cnt FROM danmaku WHERE bvid = ? GROUP BY mode",
+            (bvid,)).fetchall()
+        if not modes:
+            return None
+        colors = conn.execute(
+            "SELECT color, COUNT(*) AS cnt FROM danmaku WHERE bvid = ? AND color != '' "
+            "GROUP BY color ORDER BY cnt DESC LIMIT 12", (bvid,)).fetchall()
+    mode_map = {"滚动": 0, "顶部": 0, "底部": 0, "其他": 0}
+    for r in modes:
+        if r["mode"] in (1, 2, 3):
+            mode_map["滚动"] += r["cnt"]
+        elif r["mode"] == 4:
+            mode_map["底部"] += r["cnt"]
+        elif r["mode"] == 5:
+            mode_map["顶部"] += r["cnt"]
+        else:
+            mode_map["其他"] += r["cnt"]
+    return {
+        "mode": {k: v for k, v in mode_map.items() if v},
+        "colors": [[r["color"], r["cnt"]] for r in colors],
+    }
+
+
+def _resolve_quality(bvid: str) -> dict | None:
+    """概览页「解析质量」区块：用户身份可信度——解析方式分布（评论验证/全局库/CRC32反查
+    等）、置信度分布、碰撞风险人数（CRC32 反查存在撞库误识别风险）。
+
+    报告结论可靠度判断依据：高置信+明文验证占比越高越可信；碰撞风险人数多需谨慎解读。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT method, confidence FROM senders WHERE bvid = ? AND uid IS NOT NULL",
+            (bvid,)).fetchall()
+        total_senders = conn.execute(
+            "SELECT COUNT(DISTINCT mid_hash) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
+    if not rows:
+        return None
+    methods: dict[str, int] = {}
+    confs: dict[str, int] = {}
+    collision = 0
+    for r in rows:
+        m = r["method"] or "未知"
+        methods[m] = methods.get(m, 0) + 1
+        c = r["confidence"] or "无"
+        confs[c] = confs.get(c, 0) + 1
+        if m == METHOD_CRC32_CRACK:
+            collision += 1
+    # 置信度按 高/中/低/无 固定序输出（图表颜色语义稳定）
+    conf_order = ["高", "中", "低", "无"]
+    return {
+        "method_labels": list(methods.keys()),
+        "method_data": list(methods.values()),
+        "conf_labels": [c for c in conf_order if c in confs],
+        "conf_data": [confs[c] for c in conf_order if c in confs],
+        "collision": collision,
+        "resolved": len(rows),
+        "total_senders": total_senders,
+    }
+
+
+# ========== 误报标记（P2-a）/ 争执焦点（P0-b）/ 问题评论榜（P1-b） ==========
+
+def _fp_btn(kind: str, target, marked: bool) -> str:
+    """误报标记按钮（P2-a）：点击切换标记，标记后该条不再计入聚合，可再点撤销"""
+    label = "撤销误报" if marked else "误报"
+    cls = "fp-btn fp-btn-marked" if marked else "fp-btn"
+    return (f'<button class="{cls}" data-kind="{esc(kind)}" data-target="{esc(str(target))}" '
+            f'onclick="fpToggle(this)" '
+            f'title="人工标记该条为 LLM 误报；标记后不计入聚合与疑似分，可撤销">{label}</button>')
+
+
+def _apply_danmaku_fp(profiles: list[dict], fp_dm: set[str]) -> list[str]:
+    """弹幕误报扣除（P2-a）：按内容把人工标记误报的问题弹幕从每个画像的 cringe 聚合中
+    剔除（count/max_severity/categories/examples 全部重算，风险排序随之降级）。
+
+    判定按内容去重（llm_cache 同源同罪），故误报粒度=内容，一次标记对所有发送者生效。
+    旧 llm_cache 结果无全量 items 时回退用 examples（≤5 条）重算，count 可能偏小，
+    --force 重跑后即为精确值。返回实际被扣除的误报内容列表（供榜单底部撤销入口）。"""
+    if not fp_dm:
+        return []
+    used: list[str] = []
+    for p in profiles:
+        cr = p.get("cringe") or {}
+        if not cr.get("count"):
+            continue
+        items = cr.get("items") or cr.get("examples") or []
+        kept = [it for it in items if it.get("content") not in fp_dm]
+        for it in items:
+            c = it.get("content")
+            if c in fp_dm and c not in used:
+                used.append(c)
+        if len(kept) == len(items):
+            continue
+        cr["count"] = len(kept)
+        cr["max_severity"] = max((it.get("severity", 1) for it in kept), default=0)
+        cats: list[str] = []
+        for it in kept:
+            if it.get("category") and it["category"] not in cats:
+                cats.append(it["category"])
+        cr["categories"] = cats
+        cr["examples"] = kept[:5]
+        cr["items"] = kept
+        p["cringe"] = cr
+    return used
+
+
+def _fp_dm_block(fp_contents: list[str]) -> str:
+    """问题弹幕榜底部：已人工标记误报的弹幕内容（不计入上方聚合），点撤销恢复"""
+    if not fp_contents:
+        return ""
+    items = "".join(f'<li>{esc(c)} {_fp_btn("dm", c, True)}</li>' for c in fp_contents)
+    return (f'<details class="fp-block"><summary>🚫 已标记误报 {len(fp_contents)} 条'
+            f'（不计入上方聚合，展开可撤销）</summary><ul class="fp-list">{items}</ul></details>')
+
+
+def _attack_focus(bvid: str, fp_cmt: set[str]) -> dict:
+    """争执焦点（P0-b）：问题回复按 parent_rpid 还原 A→B 攻击边，聚合挑事分/被攻击分。
+
+    只统计问题回复（problem 非空且 parent_rpid>0、父级在库、非自回）；已标记误报的不参与。
+    每侧各留至多 3 条代表原文（挑事者=其问题回复原文及攻击对象；被围攻者=其被攻击的原评
+    原文及攻击来源），供区块直接展示证据。
+    返回 {"attackers": [{uid,name,count,categories,examples}],
+           "victims": [{uid,name,count,examples}], "names": {uid: 昵称}}，
+    无攻击边时 attackers 为空列表。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute('''
+            SELECT c.rpid, c.uid AS attacker, c.uname AS aname, c.problem,
+                   c.content AS reply_content,
+                   p.uid AS victim, p.uname AS vname, p.content AS parent_content,
+                   ua.name AS a_dbname, uv.name AS v_dbname
+            FROM comments c
+            JOIN comments p ON p.bvid = c.bvid AND p.rpid = c.parent_rpid
+            LEFT JOIN users ua ON ua.uid = c.uid
+            LEFT JOIN users uv ON uv.uid = p.uid
+            WHERE c.bvid = ? AND c.problem != '' AND c.parent_rpid > 0 AND p.uid != c.uid
+            ORDER BY c.like DESC
+        ''', (bvid,)).fetchall()
+
+    def _nm(uname, dbname, uid) -> str:
+        return uname or dbname or f"UID:{uid}"
+
+    attackers: dict[int, dict] = {}
+    victims: dict[int, dict] = {}
+    for r in rows:
+        if str(r["rpid"]) in fp_cmt:
+            continue
+        a, v = r["attacker"], r["victim"]
+        a_name = _nm(r["aname"], r["a_dbname"], a)
+        v_name = _nm(r["vname"], r["v_dbname"], v)
+        ea = attackers.setdefault(a, {"uid": a, "name": a_name,
+                                      "count": 0, "victims": Counter(), "categories": [],
+                                      "examples": []})
+        ea["count"] += 1
+        ea["victims"][v] += 1
+        if r["problem"] not in ea["categories"]:
+            ea["categories"].append(r["problem"])
+        if len(ea["examples"]) < 3:
+            ea["examples"].append({"content": r["reply_content"], "target": v_name,
+                                   "category": r["problem"]})
+        ev = victims.setdefault(v, {"uid": v, "name": v_name,
+                                    "count": 0, "attackers": Counter(), "examples": []})
+        ev["count"] += 1
+        ev["attackers"][a] += 1
+        if len(ev["examples"]) < 3:
+            ev["examples"].append({"content": r["parent_content"], "target": a_name,
+                                   "category": r["problem"]})
+    names = {u: e["name"] for u, e in attackers.items()}
+    names.update({u: e["name"] for u, e in victims.items()})
+    return {
+        "attackers": sorted(attackers.values(), key=lambda e: -e["count"]),
+        "victims": sorted(victims.values(), key=lambda e: -e["count"]),
+        "names": names,
+    }
+
+
+def _truncate(text: str, limit: int = 80) -> str:
+    """原文摘录截断（争执焦点/楼中楼引用展示用）"""
+    text = (text or "").strip().replace("\n", " ")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _attack_focus_html(data: dict) -> str:
+    """争执焦点区块：左列挑事者（发起问题回复最多，附问题回复原文），
+    右列被围攻者（被问题回复命中最多，附被攻击的原评原文）"""
+    if not data or not data["attackers"]:
+        return ""
+    names = data["names"]
+
+    def _opp_text(counter: Counter) -> str:
+        return "、".join(f'{esc(names.get(u, f"UID:{u}"))}×{n}' for u, n in counter.most_common(3))
+
+    def _quotes(examples: list[dict], arrow: str) -> str:
+        return "".join(
+            f'<div class="af-quote">{arrow} {esc(e["target"])}：「{esc(_truncate(e["content"]))}」'
+            f'{_problem_chip(e["category"])}</div>'
+            for e in examples)
+
+    def _item(e: dict, badge: str, opp_label: str, opp: str, arrow: str) -> str:
+        return f'''<div class="af-item">
+            <div class="af-line">
+                <a href="/user/{e["uid"]}" title="查看用户互动时间线">{esc(e["name"])}</a>
+                <span class="hot-badge">{badge.format(e["count"])}</span>
+                {_category_chips(e.get("categories", []))}
+                <span class="af-targets">{opp_label} {opp}</span>
+            </div>{_quotes(e["examples"], arrow)}</div>'''
+
+    a_html = "".join(_item(e, "攻击 {} 次", "主要对象：", _opp_text(e["victims"]), "攻击")
+                     for e in data["attackers"][:ATTACK_FOCUS_TOP_N])
+    v_html = "".join(_item(e, "被攻击 {} 次", "主要来源：", _opp_text(e["attackers"]), "原评")
+                     for e in data["victims"][:ATTACK_FOCUS_TOP_N])
+    return f'''
+    <div class="cringe-board af-board">
+        <h3>⚔️ 争执焦点（谁攻击谁：问题回复按 parent_rpid 还原攻击边，附代表原文）</h3>
+        <div class="af-cols">
+            <div class="af-col"><h4>🗡 挑事者 Top{ATTACK_FOCUS_TOP_N}</h4>{a_html}</div>
+            <div class="af-col"><h4>🛡 被围攻者 Top{ATTACK_FOCUS_TOP_N}</h4>{v_html}</div>
+        </div>
+    </div>'''
+
+
+def _problem_comment_board(bvid: str, fp_cmt: set[str]) -> tuple[list[dict], list[dict]]:
+    """问题评论榜（P1-b）：全部问题评论按热度（点赞 + 回复数×权重）降序，高热度优先。
+
+    楼中楼评论（is_sub）附被回复的父评论原文/作者，供判断语境。
+    返回 (未标记误报的 Top N 条目, 已标记误报的条目)；后者供底部撤销入口。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute('''
+            SELECT c.rpid, c.uid, c.uname, c.content, c.ctime, c.like, c.reply_count,
+                   c.is_sub, c.problem, u.name AS db_name,
+                   p.content AS parent_content, p.uname AS parent_uname, pu.name AS parent_db_name,
+                   p.uid AS parent_uid
+            FROM comments c
+            LEFT JOIN users u ON u.uid = c.uid
+            LEFT JOIN comments p ON p.bvid = c.bvid AND p.rpid = c.parent_rpid
+            LEFT JOIN users pu ON pu.uid = p.uid
+            WHERE c.bvid = ? AND c.problem != ''
+        ''', (bvid,)).fetchall()
+    items, marked = [], []
+    for r in rows:
+        it = {
+            "rpid": r["rpid"], "uid": r["uid"],
+            "name": r["uname"] or r["db_name"] or f"UID:{r['uid']}",
+            "content": r["content"], "ctime": r["ctime"], "like": r["like"] or 0,
+            "reply_count": r["reply_count"] or 0, "is_sub": r["is_sub"],
+            "problem": r["problem"],
+            "heat": (r["like"] or 0) + (r["reply_count"] or 0) * COMMENT_HEAT_REPLY_WEIGHT,
+            # 楼中楼语境：被回复的父评论（父级未采集到时为空，前端不展示）
+            "parent_content": r["parent_content"] or "",
+            "parent_name": (r["parent_uname"] or r["parent_db_name"]
+                            or (f"UID:{r['parent_uid']}" if r["parent_uid"] else "")),
+        }
+        (marked if str(r["rpid"]) in fp_cmt else items).append(it)
+    items.sort(key=lambda x: -x["heat"])
+    marked.sort(key=lambda x: -x["heat"])
+    return items[:PROBLEM_COMMENT_TOP_N], marked
+
+
+def _problem_comment_board_html(items: list[dict], marked: list[dict], aid, up_mid: int) -> str:
+    """问题评论榜 HTML（高回复评论页顶部区块）"""
+    if not items and not marked:
+        return ""
+
+    def _row(it: dict, is_marked: bool) -> str:
+        date = datetime.fromtimestamp(it["ctime"]).strftime("%Y-%m-%d") if it["ctime"] else ""
+        sub_mark = '<span class="dm-time">回复</span> ' if it["is_sub"] else ""
+        origin = (f'<a class="hot-origin" href="https://www.bilibili.com/video/av{aid}#reply{it["rpid"]}" '
+                  f'target="_blank" rel="noopener">原文 ↗</a>') if aid else ""
+        # 楼中楼语境（fix）：子评论贴出被回复的父评论原文，便于判断攻击对象
+        parent_html = ""
+        if it["is_sub"] and it["parent_content"]:
+            parent_html = (f'<div class="pcb-parent">回复 @{esc(it["parent_name"])}：'
+                           f'「{esc(_truncate(it["parent_content"]))}」</div>')
+        return f'''<li class="pcb-item">
+            <a class="hot-author" href="/user/{esc(it["uid"])}"
+               title="查看该用户在已分析视频中的互动时间线">{esc(it["name"])}</a>{_role_badges(it["uid"], 0, up_mid)}
+            {_problem_chip(it["problem"], is_marked)}{_fp_btn("cmt", it["rpid"], is_marked)}
+            <span class="dm-time">热度 {it["heat"]:,}（👍{it["like"]:,} + 💬{it["reply_count"]:,}×{COMMENT_HEAT_REPLY_WEIGHT}）· {date}</span>
+            {origin}{parent_html}<br>{sub_mark}{esc(it["content"])}</li>'''
+
+    body = "".join(_row(it, False) for it in items)
+    marked_html = ""
+    if marked:
+        mrows = "".join(_row(it, True) for it in marked)
+        marked_html = (f'<details class="fp-block"><summary>🚫 已标记误报 {len(marked)} 条'
+                       f'（不计入榜单与聚合，展开可撤销）</summary><ul class="fp-list">{mrows}</ul></details>')
+    return f'''
+    <div class="cringe-board">
+        <h3>🔥 问题评论榜（按热度 = 点赞 + 回复数×{COMMENT_HEAT_REPLY_WEIGHT} 加权，最多 {PROBLEM_COMMENT_TOP_N} 条）</h3>
+        <ul class="pcb-list">{body}</ul>
+        {marked_html}
+    </div>'''
+
+
+def _cross_video_overlaps() -> list[dict]:
+    """首页跨视频重叠用户面板：在 >= CROSS_VIDEO_MIN_VIDEOS 个已分析视频中都发过弹幕的
+    发送者（全局 UID 映射沉淀后此查询很便宜），找水军/情绪带节奏用户比单视频报告强。
+
+    返回 [{uid, name, video_count, total_dm, videos: [(bvid, title)]}]，按视频数/弹幕数降序。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute('''
+            SELECT s.uid, u.name, COUNT(DISTINCT s.bvid) AS vcnt, SUM(s.danmaku_count) AS total_dm
+            FROM senders s LEFT JOIN users u ON u.uid = s.uid
+            WHERE s.uid IS NOT NULL
+            GROUP BY s.uid HAVING vcnt >= ?
+            ORDER BY vcnt DESC, total_dm DESC LIMIT ?
+        ''', (CROSS_VIDEO_MIN_VIDEOS, CROSS_VIDEO_MAX_USERS)).fetchall()
+        if not rows:
+            return []
+        uids = [r["uid"] for r in rows]
+        qmarks = ",".join("?" * len(uids))
+        videos_by_uid: dict[int, list] = {}
+        for r in conn.execute(f'''
+                SELECT s.uid, s.bvid, v.title FROM senders s
+                JOIN videos v ON v.bvid = s.bvid
+                WHERE s.uid IN ({qmarks}) GROUP BY s.uid, s.bvid
+        ''', uids).fetchall():
+            videos_by_uid.setdefault(r["uid"], []).append((r["bvid"], r["title"] or r["bvid"]))
+    return [{
+        "uid": r["uid"],
+        "name": r["name"] or f"UID:{r['uid']}",
+        "video_count": r["vcnt"],
+        "total_dm": r["total_dm"] or 0,
+        "videos": videos_by_uid.get(r["uid"], []),
+    } for r in rows]
+
+
 def _fmt_duration(sec) -> str:
     """秒 → mm:ss 或 h:mm:ss 时长文本（首页视频列表时长列）"""
     sec = int(sec or 0)
@@ -447,46 +820,137 @@ def _export_links(bvid: str) -> tuple[list[tuple[str, str]], list[tuple[str, str
 
 def _hot_comments(bvid: str, aid: int | None) -> dict:
     """高回复评论页数据（潜在争执热点）：回复数 >= HOT_COMMENT_MIN_REPLIES 的主评论，
-    按回复数降序，附点赞最高的子回复样本与作者昵称（users 表关联，未解析的评论者回退 UID）。
+    按回复数降序；子回复全量取出（不截断），附 parent_rpid 供前端构建回复树、
+    problem 供问题评论标注。
 
-    返回 {"legacy": bool, "items": [...], "total_replies": int}；legacy=True 表示该视频
-    评论回复数未留存（旧版本分析），页面显示对应空态。"""
+    昵称优先级：comments.uname（采集时落库）→ users.name（已分析用户）→ UID 回退。
+    附 up_mid（视频 UP 主 uid），供渲染层标注「UP主」；「楼主」按主评论 uid 标注。
+
+    返回 {"legacy": bool, "items": [...], "total_replies": int, "up_mid": int}；
+    legacy=True 表示该视频评论回复数未留存（旧版本分析），页面显示对应空态。"""
     with closing(get_db()) as conn:
         if conn.execute("SELECT 1 FROM comments WHERE bvid = ? LIMIT 1", (bvid,)).fetchone() is None:
-            return {"legacy": True, "items": [], "total_replies": 0}
+            return {"legacy": True, "items": [], "total_replies": 0, "up_mid": 0}
+        # 视频 UP 主 uid（标注用；解析失败回退 0 即不标注）
+        vrow = conn.execute("SELECT video_info_json FROM videos WHERE bvid = ?", (bvid,)).fetchone()
+        try:
+            up_mid = int((json.loads(vrow["video_info_json"]).get("owner") or {}).get("mid", 0)) if vrow else 0
+        except Exception:
+            up_mid = 0
         rows = conn.execute('''
-            SELECT c.rpid, c.uid, c.content, c.ctime, c.like, c.reply_count, u.name
+            SELECT c.rpid, c.uid, c.uname, c.content, c.ctime, c.like, c.reply_count, c.problem, u.name
             FROM comments c LEFT JOIN users u ON u.uid = c.uid
             WHERE c.bvid = ? AND c.is_sub = 0 AND c.reply_count >= ?
             ORDER BY c.reply_count DESC, c.like DESC
             LIMIT ?
         ''', (bvid, HOT_COMMENT_MIN_REPLIES, HOT_COMMENT_MAX_SHOW)).fetchall()
+
+        def _name(uname, db_name, uid) -> str:
+            return uname or db_name or f"UID:{uid}"
+
         items = []
         for r in rows:
+            # 完整回复树（不截断）：按发送时间升序，按 parent_rpid 嵌套缩进
             subs = conn.execute('''
-                SELECT c.uid, c.content, c.like, u.name
+                SELECT c.rpid, c.uid, c.uname, c.content, c.like, c.parent_rpid, c.problem, u.name
                 FROM comments c LEFT JOIN users u ON u.uid = c.uid
                 WHERE c.bvid = ? AND c.is_sub = 1 AND c.root_rpid = ?
-                ORDER BY c.like DESC LIMIT ?
-            ''', (bvid, r["rpid"], HOT_COMMENT_REPLY_SAMPLES)).fetchall()
+                ORDER BY c.ctime ASC
+            ''', (bvid, r["rpid"])).fetchall()
             items.append({
                 "rpid": r["rpid"],
                 "uid": r["uid"],
-                "name": r["name"] or f"UID:{r['uid']}",
+                "name": _name(r["uname"], r["name"], r["uid"]),
                 "content": r["content"],
                 "ctime": r["ctime"],
                 "like": r["like"],
+                "problem": r["problem"] or "",
                 "reply_count": r["reply_count"],
-                "subs": [{"uid": s["uid"], "name": s["name"] or f"UID:{s['uid']}",
-                          "content": s["content"], "like": s["like"]} for s in subs],
+                "subs": [{"rpid": s["rpid"], "uid": s["uid"],
+                          "name": _name(s["uname"], s["name"], s["uid"]),
+                          "content": s["content"], "like": s["like"],
+                          "parent_rpid": s["parent_rpid"],
+                          "problem": s["problem"] or ""} for s in subs],
             })
-    return {"legacy": False, "items": items,
+    return {"legacy": False, "items": items, "up_mid": up_mid,
             "total_replies": sum(i["reply_count"] for i in items)}
 
 
-def _hot_comments_html(bvid: str, aid: int | None) -> str:
-    """高回复评论标签页 HTML（服务端渲染，spec：单独成页的潜在争执热点）"""
+def _problem_chip(problem: str, marked: bool = False) -> str:
+    """问题评论标注（LLM 判定类别，分色 chip 与问题弹幕榜视觉一致）；
+    marked=True 表示已被人工标记误报（划线样式，不计入聚合）"""
+    if not problem:
+        return ""
+    color = PROBLEM_CATEGORY_COLORS.get(problem, "#999999")
+    cls = "problem-chip fp-chip-marked" if marked else "problem-chip"
+    tip = "已被人工标记为误报（不计入聚合，点右侧「撤销误报」恢复）" if marked else "LLM 判定的问题评论类别"
+    return (f'<span class="{cls}" style="background:{color}" '
+            f'title="{tip}">{esc(problem)}</span>')
+
+
+def _role_badges(uid: int, root_uid: int, up_mid: int) -> str:
+    """评论区身份标注：UP主（视频作者）/ 楼主（主评论作者，root_uid=0 时不标注）"""
+    badges = ""
+    if up_mid and uid == up_mid:
+        badges += '<span class="role-badge role-up">UP主</span>'
+    if root_uid and uid == root_uid:
+        badges += '<span class="role-badge role-op">楼主</span>'
+    return badges
+
+
+def _reply_tree_html(subs: list[dict], root_uid: int, up_mid: int, fp_cmt: set[str] = frozenset()) -> str:
+    """把扁平子回复列表按 parent_rpid 嵌套成回复树 HTML（<ul> 嵌套即缩进层级）。
+
+    楼主（root_uid）/UP主（up_mid）出现时加身份徽标；问题评论带误报标记按钮（P2-a）。
+    parent_rpid 指向的父级不在已采集集合内（补采截断/旧库无该字段为 0）时挂到主楼下，
+    保证不丢任何一条回复。"""
+    nodes = {s["rpid"]: s for s in subs}
+    children: dict[int, list[dict]] = {}
+    roots = []
+    for s in subs:
+        p = s["parent_rpid"]
+        if p and p in nodes:
+            children.setdefault(p, []).append(s)
+        else:
+            roots.append(s)   # 直接回复主楼（parent=0/=root）或父级缺失
+
+    def render(node: dict) -> str:
+        kids = "".join(render(ch) for ch in children.get(node["rpid"], []))
+        sub_ul = f"<ul>{kids}</ul>" if kids else ""
+        marked = str(node["rpid"]) in fp_cmt
+        fp = _fp_btn("cmt", node["rpid"], marked) if node["problem"] else ""
+        return (f'<li><div class="hot-reply"><span class="hot-sub-author">{esc(node["name"])}</span>'
+                f'{_role_badges(node["uid"], root_uid, up_mid)}'
+                f'：{esc(node["content"])} <span class="dm-time">👍{node["like"]:,}</span>'
+                f'{_problem_chip(node["problem"], marked)}{fp}</div>{sub_ul}</li>')
+
+    return "<ul class=\"hot-tree\">" + "".join(render(s) for s in roots) + "</ul>"
+
+
+def _cmt_war_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset()) -> str:
+    """「评论争执」标签页（独立成页，不与高回复评论混排）：
+    争执焦点（P0-b，谁攻击谁，附代表原文）+ 问题评论榜（P1-b，热度加权，楼中楼附父评原文）。"""
+    up_mid = 0
+    with closing(get_db()) as conn:
+        vrow = conn.execute("SELECT video_info_json FROM videos WHERE bvid = ?", (bvid,)).fetchone()
+    try:
+        up_mid = int((json.loads(vrow["video_info_json"]).get("owner") or {}).get("mid", 0)) if vrow else 0
+    except Exception:
+        up_mid = 0
+    body = (_attack_focus_html(_attack_focus(bvid, fp_cmt))
+            + _problem_comment_board_html(*_problem_comment_board(bvid, fp_cmt), aid, up_mid))
+    return body or '<p class="empty-note">本视频无问题评论命中</p>'
+
+
+def _hot_comments_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset()) -> str:
+    """高回复评论标签页 HTML（服务端渲染，spec：单独成页的潜在争执热点）
+
+    回复树完整展示不截断：默认折叠到固定高度，「展开/折叠」按钮切换（hotToggle）。
+    树内直接显示用户名（comments.uname 落库），楼主/UP主出现时分色标注；
+    问题评论带误报标记按钮（P2-a），已标记误报的不计入统计。
+    （争执焦点/问题评论榜已独立为「评论争执」标签页，见 _cmt_war_html）"""
     data = _hot_comments(bvid, aid)
+    up_mid = data.get("up_mid", 0)
     if data["legacy"]:
         return ('<p class="empty-note">该视频为旧版本分析，评论回复数未留存；'
                 '点「🔄 重新生成报告」重跑后可查看高回复评论</p>')
@@ -494,12 +958,23 @@ def _hot_comments_html(bvid: str, aid: int | None) -> str:
         return (f'<p class="empty-note">本视频没有回复数 ≥ {HOT_COMMENT_MIN_REPLIES} 的评论'
                 f'（阈值 HOT_COMMENT_MIN_REPLIES 可在 config.py 调整）</p>')
     items_html = []
+    problem_total = 0
     for it in data["items"]:
         date = datetime.fromtimestamp(it["ctime"]).strftime("%Y-%m-%d") if it["ctime"] else ""
-        subs_html = "".join(
-            f'<li><span class="hot-sub-author">{esc(s["name"])}</span>：{esc(s["content"])} '
-            f'<span class="dm-time">👍{s["like"]:,}</span></li>'
-            for s in it["subs"]) or '<li class="ov-none">暂无子回复样本</li>'
+        # 误报标记（P2-a）：已标记的不计入问题评论统计，chip 划线并带撤销按钮
+        it_marked = str(it["rpid"]) in fp_cmt
+        problem_total += (1 if it["problem"] and not it_marked else 0) + sum(
+            1 for s in it["subs"] if s["problem"] and str(s["rpid"]) not in fp_cmt)
+        if it["subs"]:
+            tree_html = _reply_tree_html(it["subs"], it["uid"], up_mid, fp_cmt)
+            subs_html = f'''
+                <div class="hot-subs collapsed">
+                    <div class="hot-sub-label">回复树（已采集 {len(it["subs"]):,} 条）</div>
+                    {tree_html}
+                </div>
+                <button class="hot-toggle" onclick="hotToggle(this)">展开全部回复 ▾</button>'''
+        else:
+            subs_html = '<div class="hot-subs"><div class="hot-sub-label ov-none">暂无子回复被采集</div></div>'
         origin = (f'<a class="hot-origin" href="https://www.bilibili.com/video/av{aid}#reply{it["rpid"]}" '
                   f'target="_blank" rel="noopener">去B站围观 ↗</a>') if aid else ""
         items_html.append(f'''
@@ -507,18 +982,21 @@ def _hot_comments_html(bvid: str, aid: int | None) -> str:
                 <div class="hot-head">
                     <a class="hot-author" href="/user/{esc(it["uid"])}"
                        title="查看该用户在已分析视频中的互动时间线">{esc(it["name"])}</a>
+                    {_role_badges(it["uid"], 0, up_mid)}
                     <span class="hot-badge">💬 {it["reply_count"]:,} 条回复</span>
                     <span class="dm-time">👍{it["like"]:,} · {date}</span>
+                    {_problem_chip(it["problem"], it_marked)}
+                    {_fp_btn("cmt", it["rpid"], it_marked) if it["problem"] else ""}
                     {origin}
                 </div>
                 <div class="hot-content">{esc(it["content"])}</div>
-                <div class="hot-subs"><div class="hot-sub-label">高赞回复</div>
-                    <ul class="ov-list">{subs_html}</ul></div>
+                {subs_html}
             </div>''')
+    problem_note = f' · 其中问题评论 {problem_total} 条已标注' if problem_total else ""
     return f'''
         <div class="hot-note">💥 回复数特别多的评论往往意味着争执：以下为该视频回复数 ≥
             {HOT_COMMENT_MIN_REPLIES} 的评论（按回复数降序，最多 {HOT_COMMENT_MAX_SHOW} 条）。</div>
-        <div class="hot-stats">共 {len(data["items"])} 条高回复评论 · 合计 {data["total_replies"]:,} 条回复</div>
+        <div class="hot-stats">共 {len(data["items"])} 条高回复评论 · 合计 {data["total_replies"]:,} 条回复{problem_note}</div>
         <div class="hot-list">{"".join(items_html)}</div>'''
 
 
@@ -632,10 +1110,30 @@ def index():
         <td>{r["dm_count"]:,}</td>
         <td>{r["profile_count"]}</td>
         <td>{r["spam_high"]} / {r["spam_mid"]}</td>
-        <td><button class="filter-btn" onclick="regenVideo('{esc(r["bvid"])}', this)">重新生成</button>
-            <button class="filter-btn btn-danger" onclick="deleteVideo('{esc(r["bvid"])}')">删除</button></td>
+        <td><div class="idx-actions"><button class="filter-btn" onclick="regenVideo('{esc(r["bvid"])}', this)">重新生成</button>
+            <button class="filter-btn btn-danger" onclick="deleteVideo('{esc(r["bvid"])}')">删除</button></div></td>
     </tr>''' for r in rows)
     body = items or '<tr><td colspan="9" class="empty-note">暂无已分析视频，先运行 python run.py &lt;BV号&gt;</td></tr>'
+
+    # 跨视频重叠用户面板：在多个已分析视频中都出现过的发送者（水军/情绪带节奏视角）
+    overlaps = _cross_video_overlaps()
+    overlap_html = ""
+    if overlaps:
+        rows_html = "".join(f'''<tr>
+            <td><a href="/user/{esc(o["uid"])}">{esc(o["name"])}</a></td>
+            <td>{o["video_count"]}</td>
+            <td>{o["total_dm"]:,}</td>
+            <td class="xv-videos">{" ".join(f'<a href="/video/{esc(b)}">《{esc(t)}》</a>' for b, t in o["videos"])}</td>
+        </tr>''' for o in overlaps)
+        overlap_html = f'''
+    <div class="xv-panel">
+        <h2>🔁 跨视频重叠用户（{len(overlaps)} 人）</h2>
+        <p class="xv-note">在 ≥ {CROSS_VIDEO_MIN_VIDEOS} 个已分析视频中都发过弹幕的发送者——跨视频重复出现的账号是水军/带节奏的重点嫌疑对象。</p>
+        <table class="video-table xv-table">
+            <thead><tr><th>用户</th><th>涉及视频数</th><th>总弹幕数</th><th>出现的视频</th></tr></thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+    </div>'''
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -662,6 +1160,7 @@ def index():
         <span id="idxPageInfo"></span>
         <button id="idxNext" class="pager-btn">下一页</button>
     </div>
+    {overlap_html}
 </div>
 <script src="/static/index.js"></script>
 </body>
@@ -670,7 +1169,15 @@ def index():
 
 @app.route("/video/<bvid>")
 def video_page(bvid: str):
-    """报告页：概览/用户画像/弹幕浏览器/问题弹幕榜 四个标签页（spec 4）"""
+    """报告页：概览/用户画像/弹幕浏览器/问题弹幕榜/评论争执榜/高回复评论 六个标签页。
+
+    整页 HTML 按 bvid 内存缓存（_PAGE_CACHE）：避免每次刷新重跑 _load_profiles/
+    _attach_other_videos 逐用户查询；job（手动分析/重新生成）完成或删除时失效。"""
+    with _PAGE_CACHE_LOCK:
+        cached_html = _PAGE_CACHE.get(bvid)
+    if cached_html is not None:
+        return cached_html
+
     row = _load_video_row(bvid)
     if row is None:
         abort(404)
@@ -682,13 +1189,25 @@ def video_page(bvid: str):
 
     profiles = _load_profiles(bvid)
     _attach_other_videos(bvid, profiles)   # 跨视频足迹（渲染期注入，不落库）
+    # 误报标记（P2-a）：弹幕侧按内容从 cringe 聚合扣除（用户疑似分随之降级）；
+    # 评论侧传入高回复页（争执焦点/问题评论榜/回复树渲染时剔除或划线）
+    fp = load_false_positives(bvid)
+    fp_dm = {t for k, t in fp if k == "dm"}
+    fp_cmt = {t for k, t in fp if k == "cmt"}
+    fp_dm_used = _apply_danmaku_fp(profiles, fp_dm)
     profiles = sort_profiles_by_risk(profiles)
     stats = generate_summary_stats(profiles)
     chart = generate_chart_data(profiles)
     cards_html = "".join(generate_user_card(p) for p in profiles) or '<p class="empty-note">暂无画像数据</p>'
-    hot_tab = _hot_comments_html(bvid, row["aid"])   # 高回复评论页（潜在争执热点）
-    board_html = generate_cringe_board(profiles) or '<p class="empty-note">本视频无问题弹幕命中</p>'
+    hot_tab = _hot_comments_html(bvid, row["aid"], fp_cmt)   # 高回复评论页（潜在争执热点）
+    cmtwar_tab = _cmt_war_html(bvid, row["aid"], fp_cmt)     # 评论争执页（争执焦点+问题评论榜）
+    board_html = (generate_cringe_board(profiles, fp_renderer=lambda c: _fp_btn("dm", c, False))
+                  or '<p class="empty-note">本视频无问题弹幕命中</p>')
+    board_html += _fp_dm_block(fp_dm_used)   # 已标记误报弹幕的撤销入口
     panel = _danmaku_panel_stats(bvid)
+    density = _danmaku_density(bvid, row["duration"])   # 概览页弹幕密度时间轴
+    rq = _resolve_quality(bvid)                          # 概览页解析质量区块
+    dm_attrs = _danmaku_attr_stats(bvid)                 # 弹幕属性分布（mode/color）
 
     # CSV/JSON 导出下载链接：默认只显示最新一组，历史导出收进 <details> 折叠块（spec 6）
     latest, history = _export_links(bvid)
@@ -708,8 +1227,8 @@ def video_page(bvid: str):
     coverage = video_info.get("danmaku_coverage")
     coverage_line = ""
     if coverage:
-        coverage_line = (f"<br>弹幕覆盖: 实时池 {coverage['realtime']:,} 条 + "
-                         f"历史快照去重后新增 {coverage['history_new']:,} 条 = 合并共 {coverage['merged']:,} 条")
+        coverage_line = (f" · 弹幕覆盖: 实时池 {coverage['realtime']:,} + "
+                         f"历史新增 {coverage['history_new']:,} = {coverage['merged']:,} 条")
 
     # 弹幕覆盖率说明条（spec 7）：明示数据边界——实时池容量有限、历史快照回溯窗口有限、
     # 已解析发送者为按兴趣分阈值入选的子集
@@ -723,6 +1242,28 @@ def video_page(bvid: str):
     region_canvas = ('<div class="chart-card"><h3>地域分布 Top10</h3><canvas id="regionChart"></canvas></div>'
                      if chart["region_labels"] else "")
 
+    # 弹幕密度时间轴（概览页，宽幅）：无全量弹幕数据（旧版本分析）或时长未知时不渲染；
+    # 点击柱条跳转视频对应时段（P1-a，前端 report.js onClick 处理）
+    density_canvas = ('<div class="chart-card chart-wide"><h3>弹幕密度时间轴'
+                      '<span class="chart-hint">（点击柱条跳转对应时段核验）</span></h3>'
+                      '<canvas id="densityChart"></canvas></div>' if density else "")
+
+    # 解析质量区块（概览页）：用户身份可信度——解析方式/置信度分布 + 碰撞风险人数
+    rq_block = ""
+    if rq:
+        collision_cls = "rq-danger" if rq["collision"] else "rq-ok"
+        rq_block = f'''
+        <div class="rq-block">
+            <h3>🔍 解析质量（用户身份可信度）</h3>
+            <div class="rq-summary">已解析发送者 <b>{rq["resolved"]:,}</b> / 全部发送者
+                <b>{rq["total_senders"]:,}</b> · 碰撞风险（CRC32反查）
+                <b class="{collision_cls}">{rq["collision"]} 人</b></div>
+            <div class="charts-grid rq-charts">
+                <div class="chart-card"><h3>解析方式分布</h3><canvas id="rqMethodChart"></canvas></div>
+                <div class="chart-card"><h3>置信度分布</h3><canvas id="rqConfChart"></canvas></div>
+            </div>
+        </div>'''
+
     # 弹幕浏览器标签页：统计面板服务端渲染；表格容器由 Task 6 前端填充
     if panel["total"] == 0:
         # 旧数据兼容（spec 3）：历史视频 danmaku 表无数据
@@ -731,6 +1272,18 @@ def video_page(bvid: str):
         top10_html = "、".join(
             f"""<a onclick="filterSender('{esc(t["mid_hash"])}')">{esc(t["name"])}({t["count"]})</a>"""
             for t in panel["top10"])
+        # 弹幕属性分布（mode/color 已入库）：颜色 Top12 色块并入「问题弹幕类别分布」卡片
+        # （同属内容特征维度，合并展示）；模式分布单独成卡
+        color_chips = ""
+        mode_card = ""
+        if dm_attrs:
+            if dm_attrs["colors"]:
+                color_chips = ('<h4 class="dm-sub-h">弹幕颜色 Top12</h4><div class="dm-color-chips">'
+                               + "".join(
+                                   f'<span class="dm-color-chip"><i style="background:{esc(c)}"></i>{esc(c)} ×{n:,}</span>'
+                                   for c, n in dm_attrs["colors"]) + '</div>')
+            if dm_attrs["mode"]:
+                mode_card = '<div class="chart-card"><h3>弹幕模式分布</h3><canvas id="dmModeChart"></canvas></div>'
         danmaku_tab = f'''
         <div class="dm-panel">
             <div class="stat-card"><div class="num">{panel["total"]:,}</div><div class="label">总弹幕数</div></div>
@@ -739,8 +1292,9 @@ def video_page(bvid: str):
             <div class="stat-card"><div class="num">{panel["resolved"]:,}</div><div class="label">已解析发送者</div></div>
         </div>
         <div class="charts-grid">
-            <div class="chart-card"><h3>问题弹幕类别分布</h3><canvas id="dmCatChart"></canvas></div>
+            <div class="chart-card"><h3>问题弹幕类别分布</h3><canvas id="dmCatChart"></canvas>{color_chips}</div>
             <div class="chart-card"><h3>发送者弹幕数 Top10（点击筛选）</h3><div class="top10-list">{top10_html}</div></div>
+            {mode_card}
         </div>
         <div class="dm-controls">
             <input id="dmSearch" class="search-input" placeholder="搜索弹幕内容...">
@@ -795,16 +1349,19 @@ def video_page(bvid: str):
         "categoryColors": PROBLEM_CATEGORY_COLORS,
         "upWordcloud": up_wordcloud_data(profiles),
         "bvid": bvid,
+        "density": density,
+        "resolveQuality": rq,
+        "dmMode": dm_attrs["mode"] if dm_attrs else None,
     }
 
-    return f'''<!DOCTYPE html>
+    html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{esc(title)} - B站弹幕用户画像分析</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/wordcloud@1.2.2/src/wordcloud2.min.js"></script>
+<script src="/static/chart.umd.min.js"></script>
+<script src="/static/wordcloud2.min.js"></script>
 <style>{REPORT_CSS}</style>
 <link rel="stylesheet" href="/static/report.css">
 </head>
@@ -813,19 +1370,12 @@ def video_page(bvid: str):
     <div class="header">
         <h1><a href="/" style="color:white;text-decoration:none">🎬 B站弹幕用户画像分析</a></h1>
         <div class="meta">
-            <strong>{esc(title)}</strong><br>
-            BV: {esc(bvid)} | 播放: {video_info.get('stat', {}).get('view', 0):,} |
-            弹幕: {video_info.get('stat', {}).get('danmaku', 0):,} |
-            评论: {video_info.get('stat', {}).get('reply', 0):,}<br>
-            分析用户数: {stats['total']} | 大会员: {stats['vip_count']} |
-            刷屏用户: {stats['spam_levels'].get('高', 0) + stats['spam_levels'].get('中', 0)} |
+            <strong>{esc(title)}</strong> · BV: {esc(bvid)} · 播放: {video_info.get('stat', {}).get('view', 0):,} ·
+            弹幕: {video_info.get('stat', {}).get('danmaku', 0):,} ·
+            评论: {video_info.get('stat', {}).get('reply', 0):,} ·
+            分析用户数: {stats['total']} · 大会员: {stats['vip_count']} ·
+            刷屏用户: {stats['spam_levels'].get('高', 0) + stats['spam_levels'].get('中', 0)} ·
             AI画像: {ai_count}{coverage_line}
-        </div>
-        <div style="margin-top:10px">{links}</div>
-        <div style="margin-top:10px">
-            <button class="filter-btn" onclick="reportRegen()">🔄 重新生成报告</button>
-            <button class="filter-btn btn-danger" onclick="reportDelete()">🗑 删除报告</button>
-            <span id="reportJobStatus" style="margin-left:10px"></span>
         </div>
     </div>
 
@@ -834,10 +1384,18 @@ def video_page(bvid: str):
         <button class="tab-btn" data-tab="users" onclick="switchTab('users')">用户画像</button>
         <button class="tab-btn" data-tab="danmaku" onclick="switchTab('danmaku')">弹幕浏览器</button>
         <button class="tab-btn" data-tab="cringe" onclick="switchTab('cringe')">问题弹幕榜</button>
+        <button class="tab-btn" data-tab="cmtwar" onclick="switchTab('cmtwar')">评论争执榜</button>
         <button class="tab-btn" data-tab="hot" onclick="switchTab('hot')">高回复评论</button>
     </div>
 
     <div id="tab-overview" class="tab-pane active">
+        <div class="ov-actions">
+            <a class="filter-btn" href="/">← 返回首页</a>
+            <button class="filter-btn" onclick="reportRegen()">🔄 重新生成报告</button>
+            <button class="filter-btn btn-danger" onclick="reportDelete()">🗑 删除报告</button>
+            <span class="ov-dl">{links}</span>
+            <span id="reportJobStatus"></span>
+        </div>
         {coverage_note}
         <div class="stats-grid">
             <div class="stat-card"><div class="num">{stats['total']}</div><div class="label">分析用户</div></div>
@@ -847,12 +1405,14 @@ def video_page(bvid: str):
             <div class="stat-card"><div class="num">{stats['spam_levels'].get('中', 0)}</div><div class="label">中度刷屏</div></div>
             <div class="stat-card"><div class="num">{ai_count}</div><div class="label">AI画像</div></div>
         </div>
+        {density_canvas}
         <div class="charts-grid">
             <div class="chart-card"><h3>用户等级分布</h3><canvas id="levelChart"></canvas></div>
             <div class="chart-card"><h3>刷屏风险分布</h3><canvas id="spamChart"></canvas></div>
             <div class="chart-card"><h3>用户标签 Top10</h3><canvas id="tagChart"></canvas></div>
             {region_canvas}
         </div>
+        {rq_block}
     </div>
 
     <div id="tab-users" class="tab-pane">
@@ -881,6 +1441,8 @@ def video_page(bvid: str):
 
     <div id="tab-cringe" class="tab-pane">{board_html}</div>
 
+    <div id="tab-cmtwar" class="tab-pane">{cmtwar_tab}</div>
+
     <div id="tab-hot" class="tab-pane">{hot_tab}</div>
 
     <div id="wc-popup" class="wc-popup"><canvas id="wc-popup-canvas" width="276" height="216"></canvas></div>
@@ -889,6 +1451,9 @@ def video_page(bvid: str):
 <script src="/static/report.js"></script>
 </body>
 </html>'''
+    with _PAGE_CACHE_LOCK:
+        _PAGE_CACHE[bvid] = html
+    return html
 
 
 @app.route("/user/<int:uid>")
@@ -1017,6 +1582,7 @@ def api_delete_video(bvid: str):
     if _has_running_job(bvid):
         return jsonify({"error": "该视频有正在运行的任务，请等待完成后再删除"}), 409
     counts = delete_video_data(bvid)
+    _invalidate_page_cache(bvid)
     removed_files = 0
     for ext in ("csv", "json"):
         for f in glob.glob(os.path.join(REPORT_DIR, f"report_{bvid}_*.{ext}")):
@@ -1037,6 +1603,8 @@ def _run_regen_job(job_id: str, bvid: str):
             JOBS[job_id]["errors"].append({"mid_hash": None, "error": str(e)})
             JOBS[job_id]["finished"] = True
         print(f"[RegenJob {job_id}] 失败: {e}")
+    finally:
+        _invalidate_page_cache(bvid)   # 无论成败都重取数据，报告页缓存失效
 
 
 @app.route("/api/video/<bvid>/regenerate", methods=["POST"])
@@ -1055,6 +1623,24 @@ def api_regenerate(bvid: str):
     return jsonify({"job_id": job_id})
 
 
+@app.route("/api/video/<bvid>/false_positive", methods=["POST"])
+def api_false_positive(bvid: str):
+    """误报标记切换（P2-a）：body {kind: dm|cmt, target: 弹幕内容或评论rpid字符串}。
+
+    幂等切换（已标记则撤销），返回 {"ok": true, "marked": bool}；报告页缓存即时失效。
+    llm_cache 不动——误报是人工覆盖层，跨 --force 重跑保留。"""
+    if _load_video_row(bvid) is None:
+        return jsonify({"error": "未知视频"}), 404
+    data = request.get_json(silent=True) or {}
+    kind = data.get("kind")
+    target = str(data.get("target") or "")
+    if kind not in ("dm", "cmt") or not target:
+        return jsonify({"error": "参数错误：kind 须为 dm/cmt，target 不能为空"}), 400
+    marked = toggle_false_positive(bvid, kind, target)
+    _invalidate_page_cache(bvid)
+    return jsonify({"ok": True, "marked": marked})
+
+
 @app.route("/api/video/<bvid>/danmaku")
 def api_danmaku(bvid: str):
     """弹幕 JSON API（spec 4）。
@@ -1065,7 +1651,7 @@ def api_danmaku(bvid: str):
     命中该发送者的问题弹幕类别）、spam（高/中/低/未分析）、analyzed=1（只看已解析用户）、
     sort（video_time/send_time/dup_count/sender_count）、order（asc/desc）、page、page_size（50/100/200，默认100）。
     返回 {rows: [...], total: int, page: int}；每行 content/dup_count/mid_hash/uid/name/
-    first_video_time/first_send_time/categories/spam_level。
+    first_video_time/first_send_time/categories/spam_level/mode/color。
     """
     # 数据库锁定/查询异常 → 500 JSON（spec 7），与下方主查询同一降级口径
     try:
@@ -1164,6 +1750,7 @@ def api_danmaku(bvid: str):
     rows_sql = f'''
         SELECT d.mid_hash, d.content, COUNT(*) AS dup_count,
                MIN(d.time) AS first_video_time, MIN(d.timestamp) AS first_send_time,
+               MIN(d.mode) AS mode, MIN(d.color) AS color,
                s.uid AS uid, u.name AS name, s.spam_level AS spam_level,
                sc.cnt AS sender_count
         {base_sql}
@@ -1195,6 +1782,8 @@ def api_danmaku(bvid: str):
             "categories": m.get("categories", []),
             "spam_level": r["spam_level"] or "未分析",
             "sender_count": r["sender_count"],
+            "mode": r["mode"] or 1,
+            "color": r["color"] or "",
         })
     return jsonify({"rows": rows, "total": total, "page": page, "page_size": page_size})
 
@@ -1297,6 +1886,17 @@ if __name__ == "__main__":
         sys.exit(0)
 
     init_db()
+
+    # 端口占用检测提前于 pidfile 写入：若先写 pidfile 再 app.run 撞端口失败，
+    # atexit 的 _clear_pid 会误删健康实例的 pidfile（--stop 随即失效）
+    import socket
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            print(f"[Web] 端口 {port} 已被占用，请先 python web.py --stop 或用 PROFILER_PORT 换端口")
+            sys.exit(1)
+
     _write_pid(port)
     atexit.register(lambda: _clear_pid(port))
 

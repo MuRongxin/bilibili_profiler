@@ -26,10 +26,13 @@
 
 /* 打印样式（spec 1）：展开全部标签页与用户卡片、隐藏交互控件，替代原"完整报告"汇总查看场景 */
 @media print {
-    .tab-bar, .filter-bar, .user-pager, .dm-controls, .dm-pager, .dm-error-bar, .fail-detail, .wc-popup { display:none !important; }
+    .tab-bar, .filter-bar, .user-pager, .dm-controls, .dm-pager, .dm-error-bar, .fail-detail, .wc-popup,
+    .ov-actions, .hot-toggle { display:none !important; }
     .tab-pane { display:block !important; page-break-before:always; }
     #tab-overview { page-break-before:avoid; }
     .user-card { display:block !important; break-inside:avoid; box-shadow:none; transform:none; }
+    .hot-subs.collapsed { max-height:none !important; overflow:visible !important; }
+    .hot-subs.collapsed::after { display:none; }
     body { background:white; }
 }
 
@@ -114,9 +117,6 @@
 .hot-origin:hover { text-decoration:underline; }
 
 /* 用户互动时间线页（/user/<uid>：近期在哪些视频上有互动，按最近互动倒序） */
-.tl-mini { font-size:12px; color:#00a1d6; text-decoration:none; margin-left:6px; border:1px solid #b3e5fc;
-    border-radius:10px; padding:1px 8px; }
-.tl-mini:hover { background:#e3f2fd; }
 .tl-stats { font-size:14px; color:#666; background:white; border-radius:10px;
     padding:12px 16px; margin-bottom:14px; box-shadow:0 2px 8px rgba(0,0,0,0.04); }
 .tl-list { display:flex; flex-direction:column; gap:12px; }
@@ -129,3 +129,93 @@
 .tl-sub { font-size:12px; color:#888; margin:6px 0 0; }
 .tl-time { font-size:12px; color:#aaa; }
 .tl-more { font-size:13px; color:#999; text-align:center; padding:8px; }
+
+/* 概览页操作条（返回首页/重新生成/删除/导出下载，自报告头部迁入） */
+.ov-actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+.ov-actions a.filter-btn { text-decoration:none; }
+.ov-dl { display:inline-flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.ov-dl .filter-btn { text-decoration:none; }
+#reportJobStatus { font-size:13px; color:#f57c00; }
+
+/* 弹幕密度时间轴独占整行（宽幅直方图）；图表高度不写死，随容器宽高比自适应 */
+.chart-wide { grid-column:1 / -1; }
+
+/* 解析质量区块（概览页：用户身份可信度） */
+.rq-block { background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); padding:14px 16px; }
+.rq-block > h3 { font-size:15px; color:#555; margin-bottom:6px; }
+.rq-summary { font-size:13px; color:#666; margin-bottom:10px; }
+.rq-charts { margin-bottom:0 !important; }
+.rq-danger { color:#d32f2f; }
+.rq-ok { color:#388e3c; }
+
+/* 高回复评论：完整回复树（嵌套缩进）+ 默认折叠/展开 */
+.hot-subs.collapsed { max-height:220px; overflow:hidden; position:relative; }
+.hot-subs.collapsed::after { content:''; position:absolute; left:0; right:0; bottom:0; height:48px;
+    background:linear-gradient(transparent, #fafafa); }
+.hot-toggle { margin-top:8px; padding:4px 16px; border:1px solid #e0e0e0; border-radius:16px;
+    background:white; color:#00a1d6; cursor:pointer; font-size:13px; }
+.hot-toggle:hover { border-color:#00a1d6; }
+.hot-tree, .hot-tree ul { list-style:none; margin:4px 0 0; padding-left:18px;
+    border-left:2px solid #e8f4fb; }
+.hot-tree { padding-left:4px; border-left:none; }
+.hot-reply { font-size:13px; color:#555; line-height:1.7; padding:3px 0; word-break:break-all; }
+
+/* 问题评论标注 chip（颜色由服务端按类别注入） */
+.problem-chip { display:inline-block; color:#fff; font-size:12px; border-radius:4px;
+    padding:1px 8px; margin-left:6px; vertical-align:1px; }
+
+/* 评论区身份标注：UP主 / 楼主 */
+.role-badge { display:inline-block; font-size:11px; border-radius:4px; padding:1px 6px;
+    margin-left:6px; vertical-align:1px; font-weight:600; }
+.role-up { background:#fb7299; color:#fff; }
+.role-op { background:#00a1d6; color:#fff; }
+
+/* 弹幕颜色 Top12 色块（弹幕浏览器统计面板） */
+.dm-color-chips { display:flex; flex-wrap:wrap; gap:8px; }
+.dm-color-chip { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:#666;
+    background:#f5f5f5; border-radius:8px; padding:4px 10px; }
+.dm-color-chip i { width:14px; height:14px; border-radius:4px; border:1px solid rgba(0,0,0,0.1); }
+.dm-table .dm-dot { display:inline-block; width:9px; height:9px; border-radius:50%;
+    margin-right:6px; vertical-align:1px; border:1px solid rgba(0,0,0,0.12); }
+
+/* ===== TODO 改进项：P0-b 争执焦点 / P1-b 问题评论榜 / P2-a 误报标记 / P1-a 密度跳转提示 ===== */
+
+/* 图表标题内的小字提示（如密度轴「点击柱条跳转」） */
+.chart-hint { font-size:12px; font-weight:400; color:#999; }
+
+/* 争执焦点（P0-b）：左右两列，列表式条目带代表原文 */
+.af-board .af-cols { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:20px; }
+.af-col h4 { margin:0 0 10px; font-size:15px; color:#555; }
+.af-item { padding:10px 0; border-bottom:1px solid #f0f0f0; }
+.af-item:last-child { border-bottom:none; }
+.af-line { display:flex; align-items:baseline; flex-wrap:wrap; gap:8px; }
+.af-line > a { font-weight:600; color:#00a1d6; text-decoration:none; }
+.af-line > a:hover { text-decoration:underline; }
+.af-targets { color:#888; font-size:12px; }
+.af-quote { font-size:13px; color:#666; background:#fafafa; border-left:3px solid #eee;
+    padding:4px 10px; margin:6px 0 0; border-radius:0 6px 6px 0; word-break:break-all; }
+
+/* 问题评论榜（P1-b）：条目列表 + 楼中楼父评引用 */
+.pcb-list { list-style:none; padding:0; margin:0; }
+.pcb-item { padding:10px 4px; border-bottom:1px solid #f0f0f0; font-size:14px;
+    color:#444; line-height:1.8; word-break:break-all; }
+.pcb-item:last-child { border-bottom:none; }
+.pcb-item .hot-author { font-size:14px; }
+.pcb-parent { font-size:13px; color:#888; background:#fafafa; border-left:3px solid #e0e0e0;
+    padding:4px 10px; margin:6px 0 2px; border-radius:0 6px 6px 0; word-break:break-all; }
+
+/* 误报标记（P2-a）：小按钮 + 已标记 chip 划线 */
+.fp-btn { font-size:11px; color:#999; background:#f5f5f5; border:1px solid #e0e0e0;
+    border-radius:4px; padding:1px 7px; margin-left:6px; cursor:pointer; vertical-align:1px; }
+.fp-btn:hover { color:#e64545; border-color:#e64545; }
+.fp-btn-marked { color:#e64545; border-color:#e64545; background:#fff5f5; }
+.fp-btn-marked:hover { color:#00a1d6; border-color:#00a1d6; }
+.fp-chip-marked { opacity:0.55; text-decoration:line-through; }
+.fp-block { margin-top:14px; font-size:13px; color:#888; }
+.fp-block summary { cursor:pointer; }
+.fp-list { list-style:none; padding:6px 0 0; }
+.fp-list li { padding:4px 0; border-bottom:1px dashed #f0f0f0; color:#999; }
+
+/* 弹幕浏览器：「刷屏」列不换行（fix）；卡片内小节标题 */
+.dm-table th:last-child, .dm-table td:last-child { white-space:nowrap; }
+.dm-sub-h { font-size:13px; color:#888; margin:14px 0 8px; font-weight:500; }

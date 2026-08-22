@@ -262,6 +262,7 @@ def analyze_profile(user_data: dict, danmaku_stats: dict, spam_stats: dict) -> d
         "face": user_data.get("face", ""),
         "sign": user_data.get("sign", ""),
         "sex": user_data.get("sex", ""),
+        "school": user_data.get("school", ""),   # 毕业院校（空间信息，可能为空）
         "level": level,
         # 来自评论区 IP 属地（阶段6由 comment_location_map 注入 user_data），无属地为 None
         "ip_location": user_data.get("ip_location"),

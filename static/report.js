@@ -16,7 +16,7 @@ function restoreTabFromHash() {
     if (m && document.querySelector('.tab-btn[data-tab="' + m[1] + '"]')) switchTab(m[1]);
 }
 
-// 概览图表
+// 概览图表（默认宽高比自适应，不写死高度）
 const chartData = PAGE_DATA.chart;
 new Chart(document.getElementById('levelChart'), {type:'bar',
     data:{labels:chartData.level_labels, datasets:[{label:'人数', data:chartData.level_data, backgroundColor:'#00a1d6', borderRadius:6}]},
@@ -33,6 +33,38 @@ if (chartData.region_labels.length) {
         options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
 }
 
+// 弹幕密度时间轴（概览页宽幅；无全量弹幕数据的旧视频无此 canvas）
+// 点击柱条跳转视频对应时段核验（P1-a）：starts 为每桶起始秒数
+const densityData = PAGE_DATA.density;
+const densityCanvas = document.getElementById('densityChart');
+if (densityCanvas && densityData) {
+    new Chart(densityCanvas, {type:'bar',
+        data:{labels:densityData.labels, datasets:[{label:'弹幕数', data:densityData.data, backgroundColor:'#00a1d6', borderRadius:2}]},
+        options:{responsive:true, aspectRatio:4,
+            onHover:(e, els) => { e.native.target.style.cursor = els.length ? 'pointer' : 'default'; },
+            onClick:(e, els) => {
+                if (!els.length) return;
+                const t = (densityData.starts || [])[els[0].index] || 0;
+                window.open('https://www.bilibili.com/video/' + PAGE_DATA.bvid + '?t=' + t, '_blank', 'noopener');
+            },
+            plugins:{legend:{display:false}, tooltip:{callbacks:{title: items => '视频时间 ' + items[0].label + '（点击跳转）'}}},
+            scales:{x:{ticks:{autoSkip:true, maxTicksLimit:20}}, y:{beginAtZero:true}}}});
+}
+
+// 解析质量区块（概览页）：解析方式分布 + 置信度分布
+const rqData = PAGE_DATA.resolveQuality;
+if (rqData && document.getElementById('rqMethodChart')) {
+    new Chart(document.getElementById('rqMethodChart'), {type:'doughnut',
+        data:{labels:rqData.method_labels, datasets:[{data:rqData.method_data,
+              backgroundColor:['#00a1d6','#66bb6a','#ff9f43','#ab47bc','#ef5350','#8d6e63','#90a4ae']}]},
+        options:{responsive:true}});
+    const confColors = {'高':'#4caf50','中':'#ff9800','低':'#f44336','无':'#bdbdbd'};
+    new Chart(document.getElementById('rqConfChart'), {type:'bar',
+        data:{labels:rqData.conf_labels, datasets:[{label:'人数', data:rqData.conf_data,
+              backgroundColor:rqData.conf_labels.map(c => confColors[c] || '#bdbdbd'), borderRadius:6}]},
+        options:{responsive:true, plugins:{legend:{display:false}}}});
+}
+
 // 问题弹幕类别分布小图（弹幕浏览器统计面板；无弹幕数据的旧视频无此 canvas）
 const dmCatData = PAGE_DATA.categories;
 const dmCatColors = PAGE_DATA.categoryColors;
@@ -43,6 +75,45 @@ if (dmCatCanvas) {
         data:{labels:catLabels, datasets:[{label:'命中人数', data:catLabels.map(k => dmCatData[k]),
               backgroundColor:catLabels.map(k => dmCatColors[k] || '#999'), borderRadius:6}]},
         options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
+}
+
+// 弹幕模式分布小图（弹幕浏览器统计面板；mode 已入库：滚动/顶部/底部/其他）
+const dmModeData = PAGE_DATA.dmMode;
+const dmModeCanvas = document.getElementById('dmModeChart');
+if (dmModeCanvas && dmModeData) {
+    new Chart(dmModeCanvas, {type:'doughnut',
+        data:{labels:Object.keys(dmModeData), datasets:[{data:Object.values(dmModeData),
+              backgroundColor:['#00a1d6','#fb7299','#ff9f43','#90a4ae']}]},
+        options:{responsive:true}});
+}
+
+// 高回复评论：回复树默认折叠到固定高度，展开/折叠切换
+function hotToggle(btn) {
+    const box = btn.previousElementSibling;
+    const collapsed = box.classList.toggle('collapsed');
+    btn.textContent = collapsed ? '展开全部回复 ▾' : '收起回复 ▴';
+}
+
+// 误报标记（P2-a）：问题弹幕（kind=dm，target=内容）/问题评论（kind=cmt，target=rpid）
+// 切换人工误报标记；标记后该条不再计入聚合与用户疑似分，可撤销
+function fpToggle(btn) {
+    const kind = btn.dataset.kind, target = btn.dataset.target;
+    const willMark = !btn.classList.contains('fp-btn-marked');
+    const shown = target.length > 50 ? target.slice(0, 50) + '…' : target;
+    const msg = willMark
+        ? '将该条' + (kind === 'dm' ? '弹幕内容' : '评论') + '标记为误报？标记后不再计入聚合。\n\n' + shown
+        : '撤销该条的误报标记？撤销后重新计入聚合。\n\n' + shown;
+    if (!confirm(msg)) return;
+    btn.disabled = true;
+    fetch('/api/video/' + encodeURIComponent(BVID) + '/false_positive', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({kind: kind, target: target})
+    }).then(r => r.json().then(j => ({ok: r.ok, j})))
+      .then(({ok, j}) => {
+          if (!ok) { alert(j.error || '标记失败'); btn.disabled = false; return; }
+          location.reload();   // 聚合已变（页缓存服务端已失效），整页刷新最简且一致
+      })
+      .catch(() => { alert('网络错误'); btn.disabled = false; });
 }
 
 // UP主悬停词云弹窗
@@ -177,7 +248,13 @@ function renderUserPager(pages) {
     pager.innerHTML = html;
 }
 
-function userPage(p) { userState.page = p; renderUserCards(); }
+function userPage(p) {
+    userState.page = p;
+    renderUserCards();
+    // 翻页后自动回到画像区顶部（fix：避免停在上次滚动位置，看不到新页开头）
+    const bar = document.querySelector('#tab-users .filter-bar');
+    (bar || document.getElementById('userGrid')).scrollIntoView({block: 'start'});
+}
 
 // 弹幕浏览器点击发送者跳转到用户画像卡片（锚点 id="uid-{uid}"，spec 4）
 // 分页感知：重置筛选/搜索后翻到目标卡片所在页，再滚动高亮
@@ -279,13 +356,15 @@ function loadDanmaku() {
                     ? '<a onclick="gotoUser(' + row.uid + ')">' + escHtml(row.name || row.uid) + '</a><br><span class="dm-time">UID:' + row.uid + '</span>'
                     : '<span class="dm-time">' + escHtml(row.mid_hash) + '</span>';
                 const dup = row.dup_count > 1 ? ' <span class="dm-time">×' + row.dup_count + '</span>' : '';
+                const dot = row.color ? '<span class="dm-dot" style="background:' + escHtml(row.color) +
+                    '" title="' + escHtml(row.color) + '"></span>' : '';
                 const cats = (row.categories || []).map(c =>
                     '<span style="display:inline-block;background:' + (dmCatColors[c] || '#999') +
                     ';color:#fff;font-size:12px;border-radius:4px;padding:1px 8px;margin:1px 2px;">' +
                     escHtml(c) + '</span>').join('');
                 const chk = '<input type="checkbox" class="dm-check" data-mid="' + escHtml(row.mid_hash) + '"' +
                     (dmSelected.has(row.mid_hash) ? ' checked' : '') + '>';
-                return '<tr><td>' + chk + '</td><td>' + escHtml(row.content) + dup + '</td><td>' + sender + '</td><td>' +
+                return '<tr><td>' + chk + '</td><td>' + dot + escHtml(row.content) + dup + '</td><td>' + sender + '</td><td>' +
                     fmtVideoTime(row.first_video_time) + '</td><td>' +
                     new Date(row.first_send_time * 1000).toLocaleString() + '</td><td>' + cats + '</td><td>' +
                     escHtml(row.spam_level) + '</td></tr>';

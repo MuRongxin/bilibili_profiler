@@ -19,9 +19,9 @@ REPORT_CSS = """
 body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#e8ecf1; color:#333; line-height:1.7; font-size:17px; }
 .container { max-width:1400px; margin:0 auto; padding:24px; }
 
-.header { background:linear-gradient(135deg,#00a1d6,#fb7299); color:white; padding:40px; border-radius:16px; margin-bottom:30px; box-shadow:0 10px 40px rgba(0,161,214,0.2); }
-.header h1 { font-size:30px; margin-bottom:10px; }
-.header .meta { opacity:0.9; font-size:15px; }
+.header { background:linear-gradient(135deg,#00a1d6,#fb7299); color:white; padding:22px 32px; border-radius:16px; margin-bottom:20px; box-shadow:0 10px 40px rgba(0,161,214,0.2); }
+.header h1 { font-size:26px; margin-bottom:6px; }
+.header .meta { opacity:0.9; font-size:14px; }
 
 .stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:15px; margin-bottom:30px; }
 .stat-card { background:white; padding:20px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); text-align:center; }
@@ -120,6 +120,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif
 /* UID 解析徽标与直播徽标（spec 7） */
 .method-badge { font-size:11px; background:#f0f0f0; color:#888; padding:2px 8px; border-radius:10px; margin-left:6px; cursor:help; }
 .live-badge { font-size:12px; background:#f44336; color:white; padding:2px 8px; border-radius:10px; }
+.school-badge { font-size:12px; background:#e8f5e9; color:#2e7d32; padding:2px 8px; border-radius:10px; }
 
 @media(max-width:768px){
 .user-grid { grid-template-columns:1fr; }
@@ -321,8 +322,13 @@ def generate_user_card(profile: dict) -> str:
     cringe = profile.get("cringe", {})
     cringe_note = (f'，其中问题弹幕 {cringe["count"]} 条（{_category_chips(cringe.get("categories", []))}）'
                    if cringe.get("count") else "")
+    # 问题评论直引标记（P0-a）：因问题评论达阈值并入画像的作者，弹幕行为行尾标注命中统计
+    cp = profile.get("comment_problem") or {}
+    cp_note = (f'，问题评论 {cp["hits"]} 条（最高严重度 {cp["max_severity"]}）'
+               if cp.get("hits") else "")
 
-    # 本视频评论小节（按点赞降序，至多10条，来自阶段6注入；is_sub 子评论加前缀标注）
+    # 本视频评论小节（按点赞降序，至多10条，来自阶段6注入；is_sub 子评论加前缀标注，
+    # problem 非空（LLM 问题评论判定）时尾部分色类别标注）
     comments = profile.get("comments", [])
     cmt_section = ""
     if comments:
@@ -331,8 +337,9 @@ def generate_user_card(profile: dict) -> str:
             ts = c.get("ctime", 0)
             date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
             sub_mark = '<span class="dm-time">回复</span> ' if c.get("is_sub") else ""
+            problem_chip = _category_chips([c["problem"]]) if c.get("problem") else ""
             items.append(f"<li>{sub_mark}{esc(c.get('content',''))} "
-                         f"<span class=\"dm-time\">👍{c.get('like',0)} {date}</span></li>")
+                         f"<span class=\"dm-time\">👍{c.get('like',0)} {date}</span>{problem_chip}</li>")
         cmt_section = f'''
             <div class="section">
                 <h4>💬 TA 在本视频的评论</h4>
@@ -361,8 +368,9 @@ def generate_user_card(profile: dict) -> str:
                 ts = c.get("ctime", 0)
                 date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
                 sub_mark = '<span class="dm-time">回复</span> ' if c.get("is_sub") else ""
+                problem_chip = _category_chips([c["problem"]]) if c.get("problem") else ""
                 cmt_lis.append(f'<li>{sub_mark}{esc(c.get("content", ""))} '
-                               f'<span class="dm-time">👍{c.get("like", 0)} {date}</span></li>')
+                               f'<span class="dm-time">👍{c.get("like", 0)} {date}</span>{problem_chip}</li>')
             cmt_html = "".join(cmt_lis) or (
                 '<li class="ov-none">评论未留存（该视频为旧版本分析）</li>'
                 if legacy else '<li class="ov-none">无评论</li>')
@@ -382,9 +390,9 @@ def generate_user_card(profile: dict) -> str:
                 {ov_more_html}
             </div>'''
 
-    # 头像 (可点击跳转B站主页)
+    # 头像 (可点击跳转B站主页；referrerpolicy="no-referrer" 防 hdslb 防盗链拦截导致头像空白)
     profile_url = safe_url(f"https://space.bilibili.com/{uid}")
-    avatar_html = f'<a href="{profile_url}" target="_blank"><img src="{safe_url(face)}" alt="{esc(name)}" loading="lazy" onerror="this.style.display=\'none\'"></a>' if face else f'<div class="avatar-text">{esc(name[0]) if name else "?"}</div>'
+    avatar_html = f'<a href="{profile_url}" target="_blank"><img src="{safe_url(face)}" alt="{esc(name)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display=\'none\'"></a>' if face else f'<div class="avatar-text">{esc(name[0]) if name else "?"}</div>'
 
     return f'''
     <div class="user-card" id="uid-{esc(uid)}" data-level="{esc(level)}" data-vip="{'true' if profile.get('vip_status',0)==1 else 'false'}" data-spam="{esc(spam_level)}" data-official="{'true' if profile.get('official_type',-1)>=0 else 'false'}" data-is-up="{'true' if profile.get('archive_count',0)>0 else 'false'}" data-spam-score="{spam_score:.2f}" data-danmaku-count="{esc(dm_count)}" data-fans="{esc(follower)}">
@@ -394,8 +402,8 @@ def generate_user_card(profile: dict) -> str:
                 <div class="name-line">
                     <a href="{profile_url}" target="_blank" class="username-link"><span class="username">{esc(name)}</span></a>
                     <span class="uid">UID:{esc(uid)}</span>
-                    <a class="tl-mini" href="/user/{esc(uid)}" title="查看该用户在已分析视频中的互动时间线">🕐 时间线</a>
                     <span class="level-badge">Lv.{esc(level)}</span>
+                    {f'<span class="school-badge" title="毕业院校（来自空间信息）">🎓 {esc(profile.get("school", ""))}</span>' if profile.get('school') else ''}
                     { '<span class="vip-badge">大会员</span>' if profile.get('vip_status')==1 else '' }
                     { '<span class="risk-badge" title="该UID由CRC32反查（MITM）得出，存在碰撞误识别风险">可能误识别</span>' if profile.get('collision_risk') else '' }
                 </div>
@@ -415,7 +423,7 @@ def generate_user_card(profile: dict) -> str:
         <div class="card-body">
             <div class="section">
                 <h4>🎤 弹幕行为 <span class="spam-badge {spam_class}">{esc(spam_level)}风险 {spam_score:.2f}分</span>{method_badge}{conf_badge}</h4>
-                <div class="detail">共发送 {esc(dm_count)} 条弹幕{cringe_note}</div>
+                <div class="detail">共发送 {esc(dm_count)} 条弹幕{cringe_note}{cp_note}</div>
                 <ol class="dm-list">{dm_list}</ol>
                 {f'<div class="reason">判定: {esc(spam_reason)}</div>' if spam_reason else ''}
             </div>
@@ -481,6 +489,9 @@ def sort_profiles_by_risk(profiles: list[dict]) -> list[dict]:
         risk_rank.get(p.get("danmaku", {}).get("spam_level", "低"), 2),
         -p.get("danmaku", {}).get("spam_score", 0.0),
         -p.get("cringe", {}).get("max_severity", 0),
+        # 问题评论直引作者（P0-a）：无弹幕问题记录时按问题评论严重度/命中数参与排序
+        -p.get("comment_problem", {}).get("max_severity", 0),
+        -p.get("comment_problem", {}).get("hits", 0),
         -p.get("danmaku", {}).get("count", 0),
     ))
 
@@ -517,8 +528,10 @@ def generate_chart_data(profiles: list[dict]) -> dict:
     return data
 
 
-def generate_cringe_board(profiles: list[dict]) -> str:
-    """问题弹幕榜：按发送者聚合（最高严重度、条数降序），无命中时返回空串"""
+def generate_cringe_board(profiles: list[dict], fp_renderer=None) -> str:
+    """问题弹幕榜：按发送者聚合（最高严重度、条数降序），无命中时返回空串。
+
+    fp_renderer: 可选回调 (弹幕内容) -> str，渲染每条代表原文的误报标记按钮（P2-a）。"""
     cringe_entries = [p for p in profiles if p.get("cringe", {}).get("count", 0) >= 1]
     cringe_entries.sort(key=lambda p: (p["cringe"].get("max_severity", 0), p["cringe"]["count"]),
                         reverse=True)
@@ -528,12 +541,13 @@ def generate_cringe_board(profiles: list[dict]) -> str:
     for p in cringe_entries:
         cr = p["cringe"]
         example = (cr.get("examples") or [{}])[0]
+        fp_html = fp_renderer(example.get("content", "")) if fp_renderer else ""
         rows.append(
             f'<tr><td><a href="https://space.bilibili.com/{esc(p.get("uid", 0))}" target="_blank" rel="noopener">{esc(p.get("name", "未知"))}</a></td>'
             f'<td>{esc(cr["count"])}</td>'
             f'<td>{_category_chips(cr.get("categories", []))}</td>'
             f'<td>{esc(cr.get("max_severity", 0))}</td>'
-            f'<td>{esc(example.get("content", ""))}<br>'
+            f'<td>{esc(example.get("content", ""))} {fp_html}<br>'
             f'<span class="cringe-reason">{esc(example.get("category", ""))}: {esc(example.get("reason", ""))}</span></td></tr>'
         )
     return f'''

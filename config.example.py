@@ -72,14 +72,20 @@ MAX_FOOTPRINT_VIDEOS = 5              # 每张卡片最多展示的其他视频�
 MAX_FOOTPRINT_DANMAKU_SAMPLES = 5     # 每个其他视频的弹幕样本条数
 MAX_FOOTPRINT_COMMENT_SAMPLES = 5     # 每个其他视频的评论样本条数
 
-# 高回复评论页（单独成页的潜在争执热点：回复数达阈值的评论独立展示）
+# 高回复评论页（单独成页的潜在争执热点：回复数达阈值的评论独立展示，回复树完整展示不截断）
 HOT_COMMENT_MIN_REPLIES = 20          # 入选门槛：主评论回复数 >= 该值
 HOT_COMMENT_MAX_SHOW = 50             # 页面最多展示的高回复评论条数
-HOT_COMMENT_REPLY_SAMPLES = 5         # 每条高回复评论下展示的子回复样本数
 
 # 用户互动时间线页（/user/<uid>：该用户在已分析视频中的弹幕/评论足迹，按最近互动倒序）
 USER_TIMELINE_MAX_VIDEOS = 50         # 时间线最多展示的视频数（超出显示「另有 N 个」）
 USER_TIMELINE_SAMPLES = 3             # 每个视频展示的弹幕/评论样本条数
+
+# 跨视频重叠分析（首页面板：在多个已分析视频中都出现过的发送者，找水军/带节奏用户）
+CROSS_VIDEO_MIN_VIDEOS = 2            # 入选门槛：出现过的已分析视频数 >= 该值
+CROSS_VIDEO_MAX_USERS = 50            # 面板最多展示的用户数
+
+# 概览页弹幕密度时间轴
+DENSITY_BUCKETS = 60                  # 按视频内时间分桶的桶数上限
 
 HISTORY_DANMAKU_ENABLED = True   # 是否采集全量历史弹幕（需登录）
 HISTORY_MAX_MONTHS = 24          # 历史弹幕最多回溯月数
@@ -99,6 +105,19 @@ SPAM_MEDIUM_THRESHOLD = (5, 0.5)   # (弹幕数, 重复率)
 MAX_ANALYZE_USERS_HARD_CAP = 300   # 动态定员安全上限（兴趣命中者超过时按兴趣分截断）
 LLM_DEEP_TOP_K = 20                # LLM 重点深掘人数（兴趣分 top K 单人单调用）
 CRINGE_BATCH_SIZE = 200            # 问题弹幕检测每批弹幕条数
+COMMENT_CRINGE_BATCH_SIZE = 100    # 问题评论检测每批条数（评论比弹幕长，批次减半）
+COMMENT_CRINGE_MAX_ITEMS = 2000    # 问题评论检测去重后最大条数（按点赞降序截断）
+
+# 问题评论作者直引画像：问题评论达阈值的作者凭明文 UID 直接并入画像名单（无需 mid_hash 破解）
+COMMENT_AUTHOR_MIN_SEVERITY = 2    # 入选条件一：问题评论最高严重度 >= 该值
+COMMENT_AUTHOR_MIN_HITS = 2        # 入选条件二：问题评论命中条数 >= 该值（两条件满足其一）
+
+# 问题评论榜（高回复评论页顶部：全部问题评论按热度加权排序，高热度优先展示）
+COMMENT_HEAT_REPLY_WEIGHT = 10     # 热度 = 点赞 + 回复数 × 该权重（回复比点赞更能体现争执烈度）
+PROBLEM_COMMENT_TOP_N = 30         # 榜单最多展示条数
+
+# 争执焦点区块（高回复评论页顶部：问题回复按 parent_rpid 还原「谁攻击谁」）
+ATTACK_FOCUS_TOP_N = 5             # 挑事者/被围攻者各展示的名额
 
 # ========== Web 报告配置 ==========
 WEB_AUTOSTART = True   # run.py/quick_test.py 分析完毕自动启动 web.py 并用浏览器打开报告页（False 关闭）

@@ -8,6 +8,7 @@
 """
 import sqlite3
 import json
+import time
 from contextlib import closing
 from datetime import datetime
 
@@ -92,17 +93,32 @@ def init_db():
             )
         ''')
 
-        # 全量弹幕表（Web 弹幕浏览器数据源；只存 5 列，mode/fontsize/color/pool/dmid 不入库）
+        # 全量弹幕表（Web 弹幕浏览器数据源；mode/color/pool/dmid 入库支撑弹幕属性统计）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS danmaku (
                 bvid TEXT NOT NULL,
                 mid_hash TEXT NOT NULL,
                 content TEXT NOT NULL,
                 time REAL NOT NULL,        -- 视频内出现时间(秒)
-                timestamp INTEGER NOT NULL -- 发送时间戳
+                timestamp INTEGER NOT NULL, -- 发送时间戳
+                mode INTEGER NOT NULL DEFAULT 1,   -- 弹幕模式（1-3滚动/4底部/5顶部）
+                color TEXT NOT NULL DEFAULT '',    -- 弹幕颜色（#rrggbb）
+                pool INTEGER NOT NULL DEFAULT 0,   -- 弹幕池
+                dmid INTEGER NOT NULL DEFAULT 0    -- 弹幕ID（历史合并去重键）
             )
         ''')
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_danmaku_bvid ON danmaku(bvid)")
+
+        # 旧库迁移：danmaku 表补 mode/color/pool/dmid 列（弹幕属性统计：滚动占比/颜色分布/顶底弹幕）
+        dm_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(danmaku)").fetchall()}
+        if "mode" not in dm_cols:
+            cursor.execute("ALTER TABLE danmaku ADD COLUMN mode INTEGER NOT NULL DEFAULT 1")
+        if "color" not in dm_cols:
+            cursor.execute("ALTER TABLE danmaku ADD COLUMN color TEXT NOT NULL DEFAULT ''")
+        if "pool" not in dm_cols:
+            cursor.execute("ALTER TABLE danmaku ADD COLUMN pool INTEGER NOT NULL DEFAULT 0")
+        if "dmid" not in dm_cols:
+            cursor.execute("ALTER TABLE danmaku ADD COLUMN dmid INTEGER NOT NULL DEFAULT 0")
 
         # 评论表（跨视频足迹 + 高回复评论页数据源；reply_count 只对主评论有意义，
         # root_rpid 记录子评论所属主评论的 rpid，供「高回复评论」页关联争议主楼与回复）
@@ -111,6 +127,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bvid TEXT NOT NULL,
                 uid INTEGER NOT NULL,
+                uname TEXT NOT NULL DEFAULT '',  -- 评论者昵称（高回复评论树直接显示用户名用）
                 rpid INTEGER NOT NULL DEFAULT 0,
                 content TEXT NOT NULL,
                 ctime INTEGER NOT NULL DEFAULT 0,   -- 评论发送时间戳
@@ -118,6 +135,8 @@ def init_db():
                 is_sub INTEGER NOT NULL DEFAULT 0,  -- 1=子评论 0=主评论
                 reply_count INTEGER NOT NULL DEFAULT 0,  -- 主评论的回复总数（rcount）
                 root_rpid INTEGER NOT NULL DEFAULT 0,    -- 子评论所属主评论 rpid
+                parent_rpid INTEGER NOT NULL DEFAULT 0,  -- 子评论的直接父级 rpid（回复树缩进用；0=直接回复主楼）
+                problem TEXT NOT NULL DEFAULT '',        -- LLM 问题评论类别（空=正常/未判定）
                 UNIQUE(bvid, rpid, uid)
             )
         ''')
@@ -130,6 +149,28 @@ def init_db():
             cursor.execute("ALTER TABLE comments ADD COLUMN reply_count INTEGER NOT NULL DEFAULT 0")
         if "root_rpid" not in comment_cols:
             cursor.execute("ALTER TABLE comments ADD COLUMN root_rpid INTEGER NOT NULL DEFAULT 0")
+        # 旧库迁移：comments 表补 parent_rpid（回复树缩进）与 problem（LLM 问题评论标注）列
+        if "parent_rpid" not in comment_cols:
+            cursor.execute("ALTER TABLE comments ADD COLUMN parent_rpid INTEGER NOT NULL DEFAULT 0")
+        if "problem" not in comment_cols:
+            cursor.execute("ALTER TABLE comments ADD COLUMN problem TEXT NOT NULL DEFAULT ''")
+        # 旧库迁移：comments 表补 uname（高回复评论树直接显示用户名）
+        if "uname" not in comment_cols:
+            cursor.execute("ALTER TABLE comments ADD COLUMN uname TEXT NOT NULL DEFAULT ''")
+
+        # 误报标记表（P2-a）：人工标注 LLM 误判的问题弹幕/评论。
+        # kind: dm=问题弹幕（target=弹幕内容，判定按内容去重故同内容同源同罪）
+        #       cmt=问题评论（target=rpid 字符串）
+        # 展示层加载后从聚合中扣除，可再点撤销；llm_cache 不动，标记跨重跑保留
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS false_positive (
+                bvid TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                target TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (bvid, kind, target)
+            )
+        ''')
 
         conn.commit()
 
@@ -264,15 +305,18 @@ def has_user_data(uid: int) -> bool:
 def save_danmaku(bvid: str, danmaku_list: list[dict]):
     """阶段2弹幕合并后批量落库：先删该 bvid 旧行再插入，幂等可重跑。
 
-    只存 bvid/mid_hash/content/time/timestamp 五列；Web API 直接 SQL 查询，无 load_danmaku。
+    存 bvid/mid_hash/content/time/timestamp/mode/color/pool/dmid 九列；
+    Web API 直接 SQL 查询，无 load_danmaku。
     """
-    rows = [(bvid, dm["mid_hash"], dm["content"], dm["time"], dm["timestamp"])
+    rows = [(bvid, dm["mid_hash"], dm["content"], dm["time"], dm["timestamp"],
+             dm.get("mode", 1), dm.get("color", ""), dm.get("pool", 0), dm.get("dmid", 0))
             for dm in danmaku_list]
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
         cursor.executemany(
-            "INSERT INTO danmaku (bvid, mid_hash, content, time, timestamp) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO danmaku (bvid, mid_hash, content, time, timestamp, mode, color, pool, dmid) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows)
         conn.commit()
 
@@ -282,21 +326,70 @@ def save_comments(bvid: str, comments: list[dict]):
 
     UNIQUE(bvid, rpid, uid) + INSERT OR IGNORE 幂等去重：同一次分析重复落库、
     --force 重采（清缓存后重采同一批评论）都不会产生重复行。
-    只存 8 列；uname/sign/avatar/location 等仅用于当次运行的内存流程，不入库。
+    只存基础列；sign/avatar/location 等仅用于当次运行的内存流程，不入库。
+    problem 列由 LLM 问题评论检测后经 update_comment_problems 回写。
+    uname 在冲突时回填（旧行无昵称时补上），其余列冲突不覆盖（首采快照为准）。
     """
-    rows = [(bvid, c["uid"], c.get("rpid", 0), c.get("content", ""),
+    rows = [(bvid, c["uid"], c.get("uname", ""), c.get("rpid", 0), c.get("content", ""),
              c.get("ctime", 0), c.get("like", 0), 1 if c.get("is_sub") else 0,
-             c.get("reply_count", 0), c.get("root_rpid", 0))
+             c.get("reply_count", 0), c.get("root_rpid", 0), c.get("parent_rpid", 0))
             for c in comments if c.get("uid") and c.get("content")]
     if not rows:
         return
     with closing(get_db()) as conn:
         conn.executemany(
-            "INSERT OR IGNORE INTO comments "
-            "(bvid, uid, rpid, content, ctime, like, is_sub, reply_count, root_rpid) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO comments "
+            "(bvid, uid, uname, rpid, content, ctime, like, is_sub, reply_count, root_rpid, parent_rpid) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(bvid, rpid, uid) DO UPDATE SET "
+            "uname = CASE WHEN excluded.uname != '' THEN excluded.uname ELSE comments.uname END",
             rows)
         conn.commit()
+
+
+def update_comment_problems(bvid: str, verdicts: dict):
+    """回写 LLM 问题评论判定：verdicts = {rpid: 类别}；先清该 bvid 旧标注再逐条 UPDATE。
+
+    幂等可重跑；rpid 在库中不存在（评论被删/未落库）时 UPDATE 命中 0 行，静默跳过。
+    """
+    with closing(get_db()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE comments SET problem = '' WHERE bvid = ?", (bvid,))
+        for rpid, category in verdicts.items():
+            cursor.execute("UPDATE comments SET problem = ? WHERE bvid = ? AND rpid = ?",
+                           (category, bvid, rpid))
+        conn.commit()
+
+
+# ========== 误报标记（P2-a：人工纠偏 LLM 判定，展示层扣除聚合，可撤销） ==========
+
+def toggle_false_positive(bvid: str, kind: str, target: str) -> bool:
+    """切换误报标记，返回切换后的状态（True=已标记）。kind: dm=弹幕内容 / cmt=评论rpid"""
+    with closing(get_db()) as conn:
+        cursor = conn.cursor()
+        row = cursor.execute(
+            "SELECT 1 FROM false_positive WHERE bvid = ? AND kind = ? AND target = ?",
+            (bvid, kind, target)).fetchone()
+        if row:
+            cursor.execute(
+                "DELETE FROM false_positive WHERE bvid = ? AND kind = ? AND target = ?",
+                (bvid, kind, target))
+            marked = False
+        else:
+            cursor.execute(
+                "INSERT INTO false_positive (bvid, kind, target, created_at) VALUES (?, ?, ?, ?)",
+                (bvid, kind, target, int(time.time())))
+            marked = True
+        conn.commit()
+    return marked
+
+
+def load_false_positives(bvid: str) -> set[tuple[str, str]]:
+    """加载该视频的全部误报标记：{(kind, target)}"""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT kind, target FROM false_positive WHERE bvid = ?", (bvid,)).fetchall()
+    return {(r["kind"], r["target"]) for r in rows}
 
 
 # ========== 缓存清理 ==========
@@ -323,9 +416,10 @@ def clear_video_cache(bvid: str):
         cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,))
-        # 该视频的问题弹幕判定缓存一并清除（key 前缀 cringe:{bvid}:）；
+        # 该视频的问题弹幕/问题评论判定缓存一并清除（key 前缀 cringe:/cmt: + {bvid}:）；
         # 深掘缓存 key 为 deep:{uid}:...，按用户跨视频复用，不清
         cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cringe:{bvid}:%",))
+        cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cmt:{bvid}:%",))
 
         for uid in uids:
             cursor.execute("SELECT 1 FROM senders WHERE uid = ? LIMIT 1", (uid,))
@@ -354,9 +448,13 @@ def delete_video_data(bvid: str) -> dict:
         counts["senders"] = cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,)).rowcount
         counts["danmaku"] = cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,)).rowcount
         counts["comments"] = cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,)).rowcount
+        counts["false_positive"] = cursor.execute(
+            "DELETE FROM false_positive WHERE bvid = ?", (bvid,)).rowcount
         counts["videos"] = cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,)).rowcount
         counts["cringe_cache"] = cursor.execute(
             "DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cringe:{bvid}:%",)).rowcount
+        counts["cmt_cache"] = cursor.execute(
+            "DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cmt:{bvid}:%",)).rowcount
         counts["deep_cache"] = 0
         for uid in uids:
             counts["deep_cache"] += cursor.execute(

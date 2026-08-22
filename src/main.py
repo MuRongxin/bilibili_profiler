@@ -11,18 +11,19 @@ import os
 import argparse
 from datetime import datetime
 
-from config import MAX_ANALYZE_USERS_HARD_CAP, LLM_API_KEY, HISTORY_DANMAKU_ENABLED, REPORT_DIR
+from config import (MAX_ANALYZE_USERS_HARD_CAP, LLM_API_KEY, HISTORY_DANMAKU_ENABLED, REPORT_DIR,
+                    COMMENT_AUTHOR_MIN_SEVERITY, COMMENT_AUTHOR_MIN_HITS)
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
-from storage import save_danmaku, save_comments
+from storage import save_danmaku, save_comments, update_comment_problems
 from auth import get_auth_client
 from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page, fetch_command_dms, build_command_uid_map
 from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map
-from uid_resolver import resolve_all_senders, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
+from uid_resolver import resolve_all_senders, calc_crc32, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
 from spam_detector import batch_detect_spam
-from cringe_detector import detect_cringe_danmaku
+from cringe_detector import detect_cringe_danmaku, detect_problem_comments
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
@@ -123,6 +124,42 @@ def _merge_history_danmaku(video_info: dict, danmaku_list: list[dict], client):
     return merged, group_by_sender(merged)
 
 
+def build_video_meta_uid_map(video_info: dict) -> dict[str, int]:
+    """视频元信息明文 UID 源（P2-b）：UP主本人 + 联合投稿 staff + 简介@提及
+    （desc_v2 中 type=1 的 biz_id 即被@用户 UID）。返回 {crc32_hex: uid}，
+    供阶段4并入交叉验证映射；这些用户不一定是弹幕发送者，只有 mid_hash 命中时才生效。"""
+    uids: set[int] = set()
+    owner_mid = (video_info.get("owner") or {}).get("mid")
+    if owner_mid:
+        uids.add(int(owner_mid))
+    for st in video_info.get("staff") or []:        # 联合投稿成员
+        if st.get("mid"):
+            uids.add(int(st["mid"]))
+    for d in video_info.get("desc_v2") or []:       # 简介里的 @提及
+        if d.get("type") == 1 and d.get("biz_id"):
+            uids.add(int(d["biz_id"]))
+    return {calc_crc32(u): u for u in uids}
+
+
+def select_problem_comment_authors(comments: list[dict], comment_problems: dict) -> dict[int, dict]:
+    """问题评论作者直引画像（P0-a）：严重度>=COMMENT_AUTHOR_MIN_SEVERITY 或
+    命中条数>=COMMENT_AUTHOR_MIN_HITS 的作者，凭评论明文 UID 直接进画像名单。
+
+    返回 {uid: {"hits": 命中条数, "max_severity": 最高严重度}}（未过阈值的不含）。"""
+    rpid_uid = {c.get("rpid"): c.get("uid") for c in comments if c.get("rpid") and c.get("uid")}
+    stats: dict[int, dict] = {}
+    for rpid, v in (comment_problems or {}).items():
+        uid = rpid_uid.get(rpid)
+        if not uid:
+            continue
+        st = stats.setdefault(uid, {"hits": 0, "max_severity": 0})
+        st["hits"] += 1
+        st["max_severity"] = max(st["max_severity"], v.get("severity", 1))
+    return {uid: st for uid, st in stats.items()
+            if st["max_severity"] >= COMMENT_AUTHOR_MIN_SEVERITY
+            or st["hits"] >= COMMENT_AUTHOR_MIN_HITS}
+
+
 def phase_comment(video_info: dict, client):
     """阶段3: 采集评论 + 充电名单（失败不影响后续流程）"""
     print("\n[Phase 3/6] 采集评论区数据...")
@@ -145,7 +182,7 @@ def phase_comment(video_info: dict, client):
 
 def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                   max_users: int | None = None, charge_uid_map: dict | None = None,
-                  command_uid_map: dict | None = None,
+                  command_uid_map: dict | None = None, meta_uid_map: dict | None = None,
                   spam_results: dict | None = None, cringe_results: dict | None = None):
     """阶段4: 解析发送者UID（数据库缓存 + 兴趣分驱动选人）
 
@@ -183,6 +220,15 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
             cmd_hit += 1
     if cmd_hit:
         print(f"[Phase 4] 互动弹幕: 补充 {cmd_hit} 条到交叉验证映射")
+    # 1.8 视频元信息明文UID合并（UP主/联合投稿staff/简介@提及；评论/充电/互动弹幕优先）
+    meta_hit = 0
+    for h, uid in (meta_uid_map or {}).items():
+        if h not in plain_uid_map:
+            plain_uid_map[h] = uid
+            method_map[h] = "视频信息"
+            meta_hit += 1
+    if meta_hit:
+        print(f"[Phase 4] 视频信息(UP主/staff/简介@): 补充 {meta_hit} 条到交叉验证映射")
     global_hit = 0
     for h, ent in global_map.items():
         if h not in plain_uid_map:
@@ -323,6 +369,21 @@ def phase_cringe(danmaku_list: list, sender_groups: dict, video_info: dict) -> d
         return {}
 
 
+def phase_comment_cringe(comments: list, video_info: dict) -> dict:
+    """阶段3.5: 问题评论检测（LLM，未配置 Key 或失败时返回空 dict 降级）
+
+    返回 {rpid: {category, severity, reason}}；结果由 run_analysis 回写 comments.problem
+    列并注入 uid_comments（用户卡片「TA 在本视频的评论」标注）。"""
+    if not comments:
+        return {}
+    print("\n[Phase 3.5] 问题评论检测（LLM）...")
+    try:
+        return detect_problem_comments(comments, video_info)
+    except Exception as e:
+        print(f"[Phase 3.5] 警告: 问题评论检测失败（{e}），降级跳过")
+        return {}
+
+
 def phase_collect_users(resolved: dict, client, max_users: int | None = None, force: bool = False):
     """阶段5: 深度采集用户数据（名单已由阶段4兴趣定员；max_users 为手动硬上限
     （--max-users 传入时），None 不截断；成功立即落库可断点续采；force=True 跳过缓存强制重采）"""
@@ -430,6 +491,9 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
             # 本视频评论（按点赞降序，至多10条）与问题弹幕聚合，供报告展示与 LLM 深掘证据包
             profile["comments"] = uid_comments.get(uid, [])[:10]
             profile["cringe"] = info.get("cringe", {})
+            # 问题评论直引标记（P0-a）：命中统计透传画像，供报告卡片标注与风险排序
+            if info.get("comment_problem"):
+                profile["comment_problem"] = info["comment_problem"]
             profiles.append(profile)
 
             # 保存到数据库
@@ -514,10 +578,25 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     except Exception as e:
         print(f"    警告: 评论落库失败（{e}），跨视频足迹将缺评论")
 
+    # 阶段3.5: 问题评论检测（LLM，可降级）：结果回写 comments.problem 列（web 端高回复
+    # 评论页标注）并就地注入 comment dict（uid_comments 共享同一批 dict 引用，阶段6画像
+    # 的「TA 在本视频的评论」随之带出标注）
+    comment_problems = phase_comment_cringe(comments, video_info)
+    if comment_problems:
+        try:
+            update_comment_problems(bvid, {rpid: v["category"] for rpid, v in comment_problems.items()})
+        except Exception as e:
+            print(f"    警告: 问题评论回写失败（{e}），web 端评论标注将缺失")
+        for c in comments:
+            v = comment_problems.get(c.get("rpid"))
+            if v:
+                c["problem"] = v["category"]
+
     # 阶段4: UID解析（兴趣分驱动选人）
     resolved = phase_resolve(bvid, sender_groups, comment_uid_map, client,
                              max_users=max_users, charge_uid_map=charge_uid_map,
                              command_uid_map=build_command_uid_map(command_dms),
+                             meta_uid_map=build_video_meta_uid_map(video_info),
                              spam_results=spam_results, cringe_results=cringe_results)
 
     # 合并刷屏/问题弹幕数据到resolved（阶段5置信度过滤与阶段6画像注入均从此处取）
@@ -527,6 +606,27 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
             resolved[mid_hash]["spam_score"] = spam_results[mid_hash]["spam_score"]
         if mid_hash in cringe_results:
             resolved[mid_hash]["cringe"] = cringe_results[mid_hash]
+
+    # 问题评论作者直引（P0-a）：评论自带明文 UID 无需破解，达阈值的作者以合成键
+    # cmt:{uid} 并入 resolved（danmaku_count=0，身份置信度"高"），并落 senders 表让
+    # web 端画像/跨视频足迹可见；已在解析名单中的 UID 跳过（避免同人双画像）
+    existing_uids = {info["uid"] for info in resolved.values() if info.get("uid")}
+    cmt_authors = select_problem_comment_authors(comments, comment_problems)
+    cmt_added = 0
+    for uid, st in cmt_authors.items():
+        if uid in existing_uids:
+            continue
+        key = f"cmt:{uid}"
+        resolved[key] = {"uid": uid, "confidence": "高", "method": "问题评论",
+                         "user_info": {}, "danmaku_count": 0, "contents": [],
+                         "spam_level": "低", "spam_score": 0.0, "collision_risk": False,
+                         "comment_problem": st}
+        save_sender(bvid=bvid, mid_hash=key, uid=uid, confidence="高", method="问题评论",
+                    danmaku_count=0, contents=[], spam_level="低", spam_score=0.0)
+        cmt_added += 1
+    if cmt_added:
+        print(f"[Phase 4+] 问题评论作者直引: {cmt_added} 人并入画像名单"
+              f"（严重度≥{COMMENT_AUTHOR_MIN_SEVERITY} 或 命中≥{COMMENT_AUTHOR_MIN_HITS} 条，共候选 {len(cmt_authors)} 人）")
 
     # 阶段5: 用户采集
     user_data_map = phase_collect_users(resolved, client, max_users=max_users, force=force)
