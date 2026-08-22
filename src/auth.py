@@ -18,7 +18,18 @@ from Crypto.Cipher import PKCS1_OAEP
 from Crypto.Hash import SHA256
 
 from api_client import BiliAPIClient
-from config import COOKIE_PATH, QRCODE_GEN_URL, QRCODE_POLL_URL, NAV_URL
+from config import COOKIE_PATH, COOKIES_DIR, QRCODE_GEN_URL, QRCODE_POLL_URL, NAV_URL
+
+# 账号名合法性（作为 cookies/<名字>.json 文件名，防路径注入）
+_ACCOUNT_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+
+def account_cookie_path(name: str) -> str:
+    """小号 cookie 路径：data/cookies/<名字>.json；主号为 None 时用 COOKIE_PATH"""
+    if not _ACCOUNT_NAME_RE.fullmatch(name or ""):
+        raise ValueError(f"账号名不合法（仅限字母/数字/-/_，≤32字符）: {name!r}")
+    os.makedirs(COOKIES_DIR, exist_ok=True)
+    return os.path.join(COOKIES_DIR, f"{name}.json")
 
 # B站 cookie 刷新用的 RSA 公钥
 REFRESH_PUBKEY = """-----BEGIN PUBLIC KEY-----
@@ -55,42 +66,44 @@ def poll_qrcode(qrcode_key: str, client: BiliAPIClient) -> dict:
     return client.get(QRCODE_POLL_URL, params={"qrcode_key": qrcode_key})
 
 
-def save_cookie(client: BiliAPIClient) -> None:
+def save_cookie(client: BiliAPIClient, path: str | None = None) -> None:
+    path = path or COOKIE_PATH
     cookie_dict = client.get_cookies_dict()
     # 同时保存 refresh_token
     if hasattr(client, "_refresh_token"):
         cookie_dict["_refresh_token"] = client._refresh_token
     # 原子写入：先写临时文件再 os.replace，避免中断留下截断的 JSON
-    dir_ = os.path.dirname(COOKIE_PATH) or "."
+    dir_ = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(cookie_dict, f, ensure_ascii=False, indent=2)
         # cookie 即账号凭证，收紧权限为仅当前用户可读写
         os.chmod(tmp, 0o600)
-        os.replace(tmp, COOKIE_PATH)
+        os.replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
-    print(f"[Auth] Cookie已保存到 {COOKIE_PATH}")
+    print(f"[Auth] Cookie已保存到 {path}")
 
 
-def load_cookie() -> dict | None:
-    if not os.path.exists(COOKIE_PATH):
+def load_cookie(path: str | None = None) -> dict | None:
+    path = path or COOKIE_PATH
+    if not os.path.exists(path):
         return None
     try:
-        with open(COOKIE_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, UnicodeDecodeError):
         # cookie 文件损坏（如上次写入被中断或编码异常），降级为重新登录而非崩溃
-        print(f"[Auth] 警告: Cookie文件损坏（{COOKIE_PATH}），请重新登录")
+        print(f"[Auth] 警告: Cookie文件损坏（{path}），请重新登录")
         return None
     if not isinstance(data, dict):
         # 合法 JSON 但不是 cookie dict（如被误写成数组/字符串），同样按损坏处理
-        print(f"[Auth] 警告: Cookie文件格式异常（{COOKIE_PATH}），请重新登录")
+        print(f"[Auth] 警告: Cookie文件格式异常（{path}），请重新登录")
         return None
     return data
 
@@ -128,8 +141,8 @@ def _get_correspond_path() -> str:
     return encrypted.hex()
 
 
-def _try_refresh_cookie(client: BiliAPIClient) -> bool:
-    """尝试刷新 cookie，返回是否成功"""
+def _try_refresh_cookie(client: BiliAPIClient, path: str | None = None) -> bool:
+    """尝试刷新 cookie，返回是否成功；path 为小号 cookie 路径（默认主号）"""
     refresh_token = getattr(client, "_refresh_token", None)
     if not refresh_token:
         return False
@@ -186,7 +199,7 @@ def _try_refresh_cookie(client: BiliAPIClient) -> bool:
         )
 
         client._refresh_token = new_refresh_token or refresh_token
-        save_cookie(client)
+        save_cookie(client, path)
         print("[Auth] Cookie刷新成功!")
         return True
 
@@ -266,3 +279,29 @@ def login_by_qrcode() -> BiliAPIClient:
 
 def get_auth_client() -> BiliAPIClient:
     return login_by_qrcode()
+
+
+def load_extra_clients() -> list[tuple[str, BiliAPIClient]]:
+    """发现并校验小号池（data/cookies/*.json，由 python login.py <名字> 扫码写入）。
+
+    每个小号独立的 BiliAPIClient（限速/冷却/自适应降速天然隔离）；失效小号尝试
+    刷新一次，仍失败则跳过并提示重扫。返回 [(账号名, client), ...]，无小号为空列表。
+    """
+    import glob as _glob
+    clients: list[tuple[str, BiliAPIClient]] = []
+    for path in sorted(_glob.glob(os.path.join(COOKIES_DIR, "*.json"))):
+        name = os.path.splitext(os.path.basename(path))[0]
+        cookie_dict = load_cookie(path)
+        if not cookie_dict or not cookie_dict.get("SESSDATA"):
+            print(f"[Auth] 小号 {name}: cookie 缺失/无效（python login.py {name} 重扫），跳过")
+            continue
+        refresh_token = cookie_dict.pop("_refresh_token", None)
+        client = BiliAPIClient()
+        client.update_cookies(cookie_dict)
+        if refresh_token:
+            client._refresh_token = refresh_token
+        if verify_cookie(client) or (_try_refresh_cookie(client, path) and verify_cookie(client)):
+            clients.append((name, client))
+        else:
+            print(f"[Auth] 小号 {name}: cookie 已失效（python login.py {name} 重扫），跳过")
+    return clients

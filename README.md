@@ -58,6 +58,8 @@ python run.py --batch videos.txt
 
 首次运行会提示扫码登录，请使用B站APP扫描终端显示的二维码。
 
+可选小号池（分摊账号维度风控压力）：`python login.py alt1` 扫码登录小号（存 `data/cookies/alt1.json`），`run.py` 阶段5用户采集自动发现并按 uid 轮转分摊，触发风控的号当场剔除、换号重试。
+
 ## 断点续采机制
 
 - 已解析的发送者（senders）与已采集的用户数据（users）持久化在 `data/profiler.db`。
@@ -70,7 +72,7 @@ python run.py --batch videos.txt
 - **Web 报告**：`python web.py` 后访问 http://127.0.0.1:8000；后台运行时用 `python web.py --stop` 停止并释放端口
 - **数据导出**：`data/reports/report_{BV号}_{时间}.csv` / `.json`（与分析运行同时间戳）
 - **数据库**：`data/profiler.db`（支持中断恢复）
-- **Cookie**：`data/cookie.json`（自动管理登录态）
+- **Cookie**：`data/cookie.json`（主号登录态）+ `data/cookies/*.json`（可选小号池，自动管理）
 
 ## 技术架构
 

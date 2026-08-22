@@ -54,9 +54,10 @@ from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summa
 app = Flask(__name__)
 PAGE_SIZE = 100  # 弹幕 API 默认/回退每页条数（可选 50/100/200，spec 3）
 
-# 报告页整页 HTML 内存缓存（按 bvid）：避免每次刷新重跑 _load_profiles/_attach_other_videos
-# 逐用户查询串；任何改动该视频数据的 job（手动分析/重新生成）完成或删除时失效
-_PAGE_CACHE: dict[str, str] = {}
+# 报告页整页 HTML 内存缓存：bvid → (数据指纹, HTML)。避免每次刷新重跑
+# _load_profiles/_attach_other_videos 逐用户查询串；job 完成/删除/误报标记时主动失效，
+# 指纹比对兜底外部进程（CLI run.py）写入的数据变化
+_PAGE_CACHE: dict[str, tuple[tuple, str]] = {}
 _PAGE_CACHE_LOCK = threading.Lock()
 
 
@@ -64,6 +65,27 @@ def _invalidate_page_cache(bvid: str):
     """使指定视频的报告页缓存失效（job 完成/删除时调用）"""
     with _PAGE_CACHE_LOCK:
         _PAGE_CACHE.pop(bvid, None)
+
+
+def _page_fingerprint(bvid: str) -> tuple:
+    """报告页数据指纹：覆盖 senders/users/comments/danmaku/false_positive 五张表的
+    量与最新写入时间。全部走 bvid 索引的 COUNT/MAX/SUM 聚合，本地 SQLite 毫秒级。
+    外部进程（run.py 分析、--force 重跑）落库后指纹即变，下次访问自动重渲染，
+    不依赖进程内主动失效（_invalidate_page_cache 仍保留作为即时手段）。"""
+    with closing(get_db()) as conn:
+        s_cnt, s_uid_cnt = conn.execute(
+            "SELECT COUNT(*), COUNT(uid) FROM senders WHERE bvid = ?", (bvid,)).fetchone()
+        u_cnt, u_max = conn.execute(
+            "SELECT COUNT(*), MAX(u.collected_at) FROM senders s "
+            "JOIN users u ON u.uid = s.uid WHERE s.bvid = ?", (bvid,)).fetchone()
+        c_cnt, c_prob = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(problem)), 0) FROM comments WHERE bvid = ?",
+            (bvid,)).fetchone()
+        d_cnt = conn.execute(
+            "SELECT COUNT(*) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
+        f_cnt = conn.execute(
+            "SELECT COUNT(*) FROM false_positive WHERE bvid = ?", (bvid,)).fetchone()[0]
+    return (s_cnt, s_uid_cnt, u_cnt, u_max, c_cnt, c_prob, d_cnt, f_cnt)
 
 
 # ========== 手动勾选分析 job（spec B；状态存内存 dict，服务重启即失效——spec 已接受） ==========
@@ -1232,11 +1254,13 @@ def video_page(bvid: str):
     """报告页：概览/用户画像/弹幕浏览器/问题弹幕榜/评论争执榜/高回复评论 六个标签页。
 
     整页 HTML 按 bvid 内存缓存（_PAGE_CACHE）：避免每次刷新重跑 _load_profiles/
-    _attach_other_videos 逐用户查询；job（手动分析/重新生成）完成或删除时失效。"""
+    _attach_other_videos 逐用户查询；job（手动分析/重新生成）完成或删除时主动失效，
+    且每次请求比对数据指纹，外部进程（run.py）落库导致的变化也能检出。"""
+    page_fp = _page_fingerprint(bvid)
     with _PAGE_CACHE_LOCK:
-        cached_html = _PAGE_CACHE.get(bvid)
-    if cached_html is not None:
-        return cached_html
+        cached = _PAGE_CACHE.get(bvid)
+    if cached is not None and cached[0] == page_fp:
+        return cached[1]
 
     row = _load_video_row(bvid)
     if row is None:
@@ -1512,7 +1536,7 @@ def video_page(bvid: str):
 </body>
 </html>'''
     with _PAGE_CACHE_LOCK:
-        _PAGE_CACHE[bvid] = html
+        _PAGE_CACHE[bvid] = (page_fp, html)
     return html
 
 

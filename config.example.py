@@ -10,6 +10,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "profiler.db")
 COOKIE_PATH = os.path.join(DATA_DIR, "cookie.json")
+# 小号池目录：python login.py <名字> 扫码后存为 cookies/<名字>.json，run.py 自动发现
+COOKIES_DIR = os.path.join(DATA_DIR, "cookies")
 REPORT_DIR = os.path.join(DATA_DIR, "reports")
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -54,11 +56,18 @@ DEFAULT_HEADERS = {
 
 BILI_TICKET_ENABLED = True  # 申请bili_ticket降低风控概率
 
-REQUEST_DELAY = 0.6          # 基础请求间隔（秒）
-REQUEST_DELAY_LONG = 1.0     # 高风险API间隔（秒）
+# 请求间隔为区间值：每次请求在区间内随机取时长，消除固定节奏的机器人特征
+REQUEST_DELAY = (0.8, 1.6)       # 基础请求间隔区间（秒）
+REQUEST_DELAY_LONG = (2.0, 4.0)  # 高风险API间隔区间（秒）
 MAX_RETRY = 3                # 最大重试次数
 RETRY_BACKOFF = 2.0          # 重试退避基数（秒）
 RISK_COOLDOWN = 600          # 触发-412风控后的长冷却秒数
+
+# 自适应降速：触发风控（-412/HTTP412/重签无效的-352/-403）时间隔倍率上调，
+# 连续成功请求后缓慢回落；"撞一次墙就老实一点"，避免冷却结束又原速撞墙
+ADAPTIVE_THROTTLE_FACTOR = 1.5   # 触发风控后间隔倍率增幅（×该值）
+ADAPTIVE_THROTTLE_MAX = 5.0      # 间隔倍率上限
+ADAPTIVE_THROTTLE_DECAY = 0.99   # 每次业务成功请求后倍率衰减（约40次成功回落一半）
 
 # ========== 破解配置 ==========
 MITM_MAX_UID = 10_000_000_000   # MITM 反查覆盖上限：全部 ≤10 位 UID（16位随机长UID不可解）
@@ -101,8 +110,12 @@ MAX_UP_SAMPLE = 20        # summarize_followings 深度分析的UP主采样上�
 
 # ========== 画像配置 ==========
 SPAM_HIGH_THRESHOLD = (10, 0.7)    # (弹幕数, 重复率)
-SPAM_MEDIUM_THRESHOLD = (5, 0.5)   # (弹幕数, 重复率)
-MAX_ANALYZE_USERS_HARD_CAP = 300   # 动态定员安全上限（兴趣命中者超过时按兴趣分截断）
+SPAM_MEDIUM_THRESHOLD = (3, 0.5)   # (弹幕数, 重复率)：>2 条且半数重复即中风险
+# 动态定员（兴趣命中者全进，仅超上限才按兴趣分截断）：上限随视频发送者规模浮动——
+# 小视频保底 FLOOR，大视频按独立发送者数 × RATIO 上浮，HARD_CAP 为防爆绝对天花板
+ANALYZE_USERS_FLOOR = 300        # 保底名额（小视频的默认上限）
+ANALYZE_USERS_RATIO = 0.05       # 上限 = max(FLOOR, 独立发送者数 × 该比例)
+MAX_ANALYZE_USERS_HARD_CAP = 1000  # 绝对上限（保险丝；采集成本与风控暴露的硬约束）
 LLM_DEEP_TOP_K = 20                # LLM 重点深掘人数（兴趣分 top K 单人单调用）
 CRINGE_BATCH_SIZE = 200            # 问题弹幕检测每批弹幕条数
 COMMENT_CRINGE_BATCH_SIZE = 100    # 问题评论检测每批条数（评论比弹幕长，批次减半）

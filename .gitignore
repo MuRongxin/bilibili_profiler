@@ -33,3 +33,6 @@ Thumbs.db
 # LLM 分析中间数据（含用户画像）
 data/analysis_input.json
 data/analysis_prompt.txt
+
+# 小号池（账号凭证）
+data/cookies/

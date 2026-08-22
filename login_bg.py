@@ -2,6 +2,10 @@
 """
 B站扫码登录后台轮询（非交互式）
 持续轮询二维码状态，直到登录成功或超时。
+
+用法:
+    python login_bg.py          # 主号（data/cookie.json）
+    python login_bg.py alt1     # 小号 alt1（data/cookies/alt1.json）
 """
 import sys
 import os
@@ -12,15 +16,24 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 # 强制行缓冲：输出被重定向/管道时也能实时看到进度（默认块缓冲会长时间无输出）
 sys.stdout.reconfigure(line_buffering=True)
 
-from auth import get_qrcode, poll_qrcode, save_cookie, verify_cookie, load_cookie, COOKIE_PATH
+from auth import (get_qrcode, poll_qrcode, save_cookie, verify_cookie, load_cookie,
+                  account_cookie_path, COOKIE_PATH)
 from api_client import BiliAPIClient
 
 
 def main():
+    # 位置参数即账号名：python login_bg.py alt1 → data/cookies/alt1.json
+    name = sys.argv[1] if len(sys.argv) > 1 else ""
+    try:
+        cookie_path = account_cookie_path(name) if name else COOKIE_PATH
+    except ValueError as e:
+        print(f"错误: {e}")
+        sys.exit(1)
+
     client = BiliAPIClient()
-    
+
     # 检查已有cookie
-    cookie_dict = load_cookie()
+    cookie_dict = load_cookie(cookie_path)
     if cookie_dict:
         # _refresh_token 是本地保存的伪 cookie，需先弹出，避免注入 session 发给B站
         refresh_token = cookie_dict.pop("_refresh_token", None)
@@ -59,8 +72,8 @@ def main():
             if refresh_token:
                 client._refresh_token = refresh_token
             print("\n[Login] 登录成功!")
-            save_cookie(client)
-            print(f"[Login] Cookie已保存: {COOKIE_PATH}")
+            save_cookie(client, cookie_path)
+            print(f"[Login] Cookie已保存: {cookie_path}")
             return
         elif code == 86101:
             if last_status != 86101:

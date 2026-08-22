@@ -11,13 +11,14 @@ import os
 import argparse
 from datetime import datetime
 
-from config import (MAX_ANALYZE_USERS_HARD_CAP, LLM_API_KEY, HISTORY_DANMAKU_ENABLED, REPORT_DIR,
+from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USERS_RATIO,
+                    LLM_API_KEY, HISTORY_DANMAKU_ENABLED, REPORT_DIR,
                     COMMENT_AUTHOR_MIN_SEVERITY, COMMENT_AUTHOR_MIN_HITS)
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
 from storage import save_danmaku, save_comments, update_comment_problems
-from auth import get_auth_client
+from auth import get_auth_client, load_extra_clients
 from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page, fetch_command_dms, build_command_uid_map
 from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map
@@ -187,7 +188,8 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     """阶段4: 解析发送者UID（数据库缓存 + 兴趣分驱动选人）
 
     选人规则（阈值制动态定员，spec 3）：spam_level∈{高,中} 或 问题弹幕≥1 条的发送者
-    全部进入解析名单；max_users 为 None 时用 MAX_ANALYZE_USERS_HARD_CAP 兜底截断，
+    全部进入解析名单；上限随发送者规模浮动（保底 ANALYZE_USERS_FLOOR、按
+    独立发送者数×ANALYZE_USERS_RATIO 上浮、MAX_ANALYZE_USERS_HARD_CAP 封顶），
     显式传入 max_users（--max-users）时作为手动硬上限优先。
     """
     print("\n[Phase 4/6] 解析发送者UID...")
@@ -267,7 +269,9 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
             or cringe_results.get(h, {}).get("count", 0) >= 1]
     must.sort(key=interest_key, reverse=True)
 
-    cap = max_users if max_users is not None else MAX_ANALYZE_USERS_HARD_CAP
+    cap = max_users if max_users is not None else min(
+        MAX_ANALYZE_USERS_HARD_CAP,
+        max(ANALYZE_USERS_FLOOR, int(len(sender_groups) * ANALYZE_USERS_RATIO)))
     to_resolve_hashes = must[:cap]
     print(f"[Phase 4] 兴趣命中 {len(must)} 人（中/高刷屏或问题弹幕），"
           f"截取 {len(to_resolve_hashes)} 人解析（上限 {cap}）")
@@ -384,9 +388,14 @@ def phase_comment_cringe(comments: list, video_info: dict) -> dict:
         return {}
 
 
-def phase_collect_users(resolved: dict, client, max_users: int | None = None, force: bool = False):
+def phase_collect_users(resolved: dict, client, max_users: int | None = None, force: bool = False,
+                        extra_clients: list | None = None):
     """阶段5: 深度采集用户数据（名单已由阶段4兴趣定员；max_users 为手动硬上限
-    （--max-users 传入时），None 不截断；成功立即落库可断点续采；force=True 跳过缓存强制重采）"""
+    （--max-users 传入时），None 不截断；成功立即落库可断点续采；force=True 跳过缓存强制重采）
+
+    账号池（extra_clients）：主号+小号按 uid 轮转分摊采集——每个 uid 的全部接口由
+    同一账号连续打完（行为更像真人），各号限速/冷却独立，分摊账号维度风控压力；
+    某号触发风控当场剔除，该 uid 换号重试，全部不可用才按失败跳过。"""
     print("\n[Phase 5/6] 深度采集用户信息...")
 
     # 筛选需要采集的用户（有UID且置信度 acceptable）
@@ -421,6 +430,11 @@ def phase_collect_users(resolved: dict, client, max_users: int | None = None, fo
     user_data_map = {}
     processed = set()
 
+    # 账号池轮转状态：pool[0] 恒为主号；healthy 标记某号是否已被风控剔除
+    pool = [("主号", client)] + list(extra_clients or [])
+    healthy = [True] * len(pool)
+    rr = 0
+
     for idx, (mid_hash, uid) in enumerate(uids_to_collect, 1):
         print(f"\n  [{idx}/{total}] 采集 UID:{uid}...")
 
@@ -433,19 +447,44 @@ def phase_collect_users(resolved: dict, client, max_users: int | None = None, fo
                 processed.add(uid)
                 continue
 
-        try:
-            data = collect_user_data(uid, client)
+        # 选一个健康账号采集；触发风控则剔除该号并换号重试，非风控错误不换号
+        tried: set[int] = set()
+        data = {"error": "无可用账号"}
+        while True:
+            ci = -1
+            for _ in range(len(pool)):
+                cand = rr
+                rr = (rr + 1) % len(pool)
+                if healthy[cand] and cand not in tried:
+                    ci = cand
+                    break
+            if ci < 0:
+                break
+            tried.add(ci)
+            cname, cclient = pool[ci]
+            if len(pool) > 1:
+                print(f"  [账号:{cname}] 采集中...")
+            try:
+                data = collect_user_data(uid, cclient)
+            except Exception as e:
+                data = {"error": str(e)}
             if "error" not in data:
-                user_data_map[uid] = data
-                processed.add(uid)
-                # 立即落库：Ctrl+C 中断后已采集数据不丢失，重跑时命中上方缓存跳过。
-                # profile 暂存空 dict，阶段6分析后以 INSERT OR REPLACE 覆盖
-                save_user_data(uid, data.get("name", ""), data.get("level", 0), data, {})
-            else:
-                # 失败不落库，重跑时会重新采集
-                print(f"  [失败] {data['error']}")
-        except Exception as e:
-            print(f"  [异常] {e}")
+                break
+            if "风控" in data["error"] or "412" in data["error"]:
+                healthy[ci] = False
+                print(f"  [账号:{cname}] 触发风控，本视频剩余采集剔除该号")
+                continue
+            break
+
+        if "error" not in data:
+            user_data_map[uid] = data
+            processed.add(uid)
+            # 立即落库：Ctrl+C 中断后已采集数据不丢失，重跑时命中上方缓存跳过。
+            # profile 暂存空 dict，阶段6分析后以 INSERT OR REPLACE 覆盖
+            save_user_data(uid, data.get("name", ""), data.get("level", 0), data, {})
+        else:
+            # 失败不落库，重跑时会重新采集
+            print(f"  [失败] {data['error']}")
 
     print(f"\n[Phase 5] 采集完成: {len(processed)}/{total}")
     return user_data_map
@@ -544,6 +583,13 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     # 阶段1: 登录
     client = phase_login()
 
+    # 小号池（data/cookies/*.json，python login.py <名字> 写入）：仅供阶段5用户采集
+    # 轮转分摊账号维度风控压力；其余阶段仍走主号
+    extra_clients = load_extra_clients()
+    if extra_clients:
+        names = "、".join(n for n, _ in extra_clients)
+        print(f"[Main] 小号池: {len(extra_clients)} 个可用（{names}），阶段5采集将轮转分摊")
+
     # --force: 登录成功后清除该视频的全部缓存，后续阶段全部重新采集
     # （放在登录后，避免登录失败/取消时缓存已清但新数据未采）
     if force:
@@ -628,8 +674,9 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         print(f"[Phase 4+] 问题评论作者直引: {cmt_added} 人并入画像名单"
               f"（严重度≥{COMMENT_AUTHOR_MIN_SEVERITY} 或 命中≥{COMMENT_AUTHOR_MIN_HITS} 条，共候选 {len(cmt_authors)} 人）")
 
-    # 阶段5: 用户采集
-    user_data_map = phase_collect_users(resolved, client, max_users=max_users, force=force)
+    # 阶段5: 用户采集（小号池轮转分摊）
+    user_data_map = phase_collect_users(resolved, client, max_users=max_users, force=force,
+                                        extra_clients=extra_clients)
 
     # 阶段6: 画像分析（评论IP属地/本视频评论/问题弹幕在此贯通进画像）
     profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups,

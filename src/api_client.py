@@ -8,7 +8,9 @@ import hmac
 import threading
 import requests
 from urllib.parse import quote
-from config import DEFAULT_HEADERS, REQUEST_DELAY, REQUEST_DELAY_LONG, MAX_RETRY, RETRY_BACKOFF, RISK_COOLDOWN, NAV_URL, BILI_TICKET_ENABLED
+from config import (DEFAULT_HEADERS, REQUEST_DELAY, REQUEST_DELAY_LONG, MAX_RETRY,
+                    RETRY_BACKOFF, RISK_COOLDOWN, NAV_URL, BILI_TICKET_ENABLED,
+                    ADAPTIVE_THROTTLE_FACTOR, ADAPTIVE_THROTTLE_MAX, ADAPTIVE_THROTTLE_DECAY)
 
 
 # WBI 密钥混淆数组（来自 biliscope）
@@ -35,6 +37,9 @@ class BiliAPIClient:
         self._last_request_time = 0
         # -412 风控全局冷却截止时刻（时间戳），所有线程共享；0 表示无冷却
         self._risk_cooldown_until = 0.0
+        # 自适应降速倍率：触发风控时 ×ADAPTIVE_THROTTLE_FACTOR（上限 ADAPTIVE_THROTTLE_MAX），
+        # 业务成功请求缓慢衰减回 1.0；进程内共享（多线程读写 float 靠 GIL 即可，启发式允许竞态）
+        self._throttle = 1.0
         # RLock：_get_wbi_key/_ensure_buvid3 在持有锁的请求路径中可能嵌套发请求
         self._lock = threading.RLock()
         self._wbi_key = None
@@ -131,6 +136,17 @@ class BiliAPIClient:
         except Exception:
             pass  # 非必需，失败不影响主流程
 
+    def _penalize_throttle(self, what: str):
+        """触发风控：上调请求间隔倍率（撞一次墙就老实一点）"""
+        old = self._throttle
+        self._throttle = min(self._throttle * ADAPTIVE_THROTTLE_FACTOR, ADAPTIVE_THROTTLE_MAX)
+        if self._throttle > old:
+            print(f"[API] {what}，自适应降速: 请求间隔倍率 {old:.2f} → {self._throttle:.2f}")
+
+    def _reward_throttle(self):
+        """业务成功请求：倍率缓慢衰减回 1.0（约40次成功回落一半）"""
+        self._throttle = max(1.0, self._throttle * ADAPTIVE_THROTTLE_DECAY)
+
     def _sleep_if_needed(self, url: str):
         # -412 全局冷却：本方法在 _request_locked 的锁内执行，
         # 冷却等待会阻塞其他线程拿锁，即所有请求一起暂停（全局冷却的预期语义）
@@ -139,8 +155,9 @@ class BiliAPIClient:
             if remaining > 1:
                 print(f"[API] 风控冷却中，等待 {remaining:.0f} 秒...")
             time.sleep(remaining)
-        delay = REQUEST_DELAY_LONG if self._is_risk_api(url) else REQUEST_DELAY
-        delay += random.uniform(0.1, 0.4)
+        # 区间内随机取间隔（消除固定节奏特征），再乘自适应倍率
+        lo, hi = REQUEST_DELAY_LONG if self._is_risk_api(url) else REQUEST_DELAY
+        delay = random.uniform(lo, hi) * self._throttle
         elapsed = time.time() - self._last_request_time
         if elapsed < delay:
             time.sleep(delay - elapsed)
@@ -177,6 +194,7 @@ class BiliAPIClient:
                         wait = RISK_COOLDOWN + random.uniform(0, 60)
                         # 记录全局冷却截止时刻，其他线程在 _sleep_if_needed 中一起等待
                         self._risk_cooldown_until = time.time() + wait
+                        self._penalize_throttle("触发风控-412")
                         print(f"[API] 触发风控-412，冷却 {wait:.0f} 秒后重试...")
                         time.sleep(wait)
                         continue
@@ -197,11 +215,14 @@ class BiliAPIClient:
                             wait = RISK_COOLDOWN + random.uniform(0, 60)
                             # 记录全局冷却截止时刻，其他线程在 _sleep_if_needed 中一起等待
                             self._risk_cooldown_until = time.time() + wait
+                            self._penalize_throttle(f"重签后仍 {data.get('code')}")
                             print(f"[API] 重签后仍 {data.get('code')}，判定为风控，冷却 {wait:.0f} 秒后重试...")
                             time.sleep(wait)
                         params = self._sign_wbi(dict(params))
                         continue
                     return {"code": data["code"], "message": "WBI签名失效/风控拦截，重试已耗尽"}
+                # 业务成功（非风控码）：自适应倍率缓慢回落
+                self._reward_throttle()
                 return data
             except (requests.Timeout, requests.ConnectionError, ValueError) as e:
                 # ValueError 含 resp.json() 解析失败（风控 HTML 错误页等非 JSON 响应）
@@ -218,6 +239,7 @@ class BiliAPIClient:
                         wait = RISK_COOLDOWN + random.uniform(0, 60)
                         # 记录全局冷却截止时刻，其他线程在 _sleep_if_needed 中一起等待
                         self._risk_cooldown_until = time.time() + wait
+                        self._penalize_throttle("触发风控HTTP412")
                         print(f"[API] 触发风控HTTP412，冷却 {wait:.0f} 秒后重试...")
                         time.sleep(wait)
                         continue
@@ -240,7 +262,10 @@ class BiliAPIClient:
             try:
                 resp = self._request_locked("POST", url, data=data, params=params, **kwargs)
                 resp.raise_for_status()
-                return resp.json()
+                data = resp.json()
+                # POST 成功：自适应倍率缓慢回落（post 不做风控码处理，沿用原降级语义）
+                self._reward_throttle()
+                return data
             except (requests.Timeout, requests.ConnectionError, ValueError) as e:
                 # ValueError 含 resp.json() 解析失败（非 JSON 响应）
                 if attempt < MAX_RETRY - 1:
@@ -267,6 +292,8 @@ class BiliAPIClient:
             try:
                 resp = self._request_locked("GET", url, params=params, **kwargs)
                 resp.raise_for_status()
+                # 原始响应成功：自适应倍率缓慢回落
+                self._reward_throttle()
                 return resp
             except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
                 last_exc = e
