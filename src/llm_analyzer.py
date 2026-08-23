@@ -1,10 +1,8 @@
 """
 通用 LLM 分析器 — 兼容所有 OpenAI 协议的 API（仅保留重点深掘；全员粗筛已砍，省 token）
 
-通过环境变量切换厂商，零代码改动:
-    export LLM_API_KEY="sk-xxx"
-    export LLM_BASE_URL="https://api.xiaomimimo.com/v1"
-    export LLM_MODEL="mimo-v2.5-pro"
+两套厂商配置（config.py），环境变量切换，零代码改动:
+    export LLM_PROVIDER="mimo"      # 小米 MiMo（mimo-v2.5）；缺省 deepseek
 """
 import hashlib
 import json
@@ -54,8 +52,9 @@ class LLMAnalyzer:
         """重点人员单人深掘 prompt：证据包（弹幕原文/评论/问题弹幕判定/刷屏分析/四维度数据）"""
         title = video_info.get("title", "未知视频")
         evidence = self._build_evidence(p, video_info)
-        return f"""你是一位资深网络行为分析师。请对以下这位B站用户做**单人深度行为画像**。
-他/她曾在视频《{title}》中发送弹幕，是本视频中值得重点关注的人物（刷屏得分高或存在问题弹幕）。
+        return f"""你是一位熟悉二次元游戏（二游）社区生态的资深网络行为分析师。请对以下这位B站用户做**单人深度行为画像**。
+他/她曾在二游视频《{title}》中发送弹幕，是本视频中值得重点关注的人物（刷屏得分高或存在问题弹幕）。
+评估时注意社区语境：发癫文学、角色应援、强度/剧情吐槽是二游社区的正常行为；重点关注拉踩引战、人身攻击、恶意带节奏等对社区氛围有实质破坏的行为。
 
 ## 证据包（JSON）
 {json.dumps(evidence, ensure_ascii=False, indent=2)}
@@ -100,7 +99,7 @@ class LLMAnalyzer:
             digest = hashlib.sha256(
                 json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode("utf-8")
             ).hexdigest()[:16]
-            cache_key = f"deep:{uid}:{digest}"
+            cache_key = f"deep:{uid}:v2:{LLM_MODEL}:{digest}"
             cached = load_llm_cache(cache_key)
             if cached:
                 results[uid] = cached

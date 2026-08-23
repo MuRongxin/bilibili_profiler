@@ -172,6 +172,16 @@ def init_db():
             )
         ''')
 
+        # 头像缓存表：为争执焦点关系图等展示层补采头像（uid 未进 users 表的用户）。
+        # 行存在即表示已查过（face 可能为空串：封号/无头像），避免每次渲染重复请求
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS face_cache (
+                uid INTEGER PRIMARY KEY,
+                face TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            )
+        ''')
+
         conn.commit()
 
         # 清理旧版本的 progress 表（断点续采已改为纯 senders/users 缓存机制）
@@ -390,6 +400,46 @@ def load_false_positives(bvid: str) -> set[tuple[str, str]]:
         rows = conn.execute(
             "SELECT kind, target FROM false_positive WHERE bvid = ?", (bvid,)).fetchall()
     return {(r["kind"], r["target"]) for r in rows}
+
+
+# ========== 头像缓存（face_cache，争执焦点关系图节点用） ==========
+
+def load_faces(uids: list[int]) -> dict[int, str]:
+    """查询 uid 列表的头像缓存。返回 {uid: face_url}（只含非空头像）；
+    无行的 uid 表示从未查过（供补采筛选），有行但 face 为空表示查过但没有头像。"""
+    if not uids:
+        return {}
+    out: dict[int, str] = {}
+    with closing(get_db()) as conn:
+        for i in range(0, len(uids), 500):
+            chunk = uids[i:i + 500]
+            qm = ",".join("?" * len(chunk))
+            for r in conn.execute(f"SELECT uid, face FROM face_cache WHERE uid IN ({qm})", chunk):
+                if r["face"]:
+                    out[r["uid"]] = r["face"]
+    return out
+
+
+def load_face_cached_uids(uids: list[int]) -> set[int]:
+    """返回其中已查过（face_cache 有行，无论 face 是否为空）的 uid 集合"""
+    if not uids:
+        return set()
+    out: set[int] = set()
+    with closing(get_db()) as conn:
+        for i in range(0, len(uids), 500):
+            chunk = uids[i:i + 500]
+            qm = ",".join("?" * len(chunk))
+            for r in conn.execute(f"SELECT uid FROM face_cache WHERE uid IN ({qm})", chunk):
+                out.add(r["uid"])
+    return out
+
+
+def save_face(uid: int, face: str):
+    """写入头像缓存（face 可为空串表示查过无头像）"""
+    with closing(get_db()) as conn:
+        conn.execute("INSERT OR REPLACE INTO face_cache (uid, face, created_at) VALUES (?, ?, ?)",
+                     (uid, face or "", int(time.time())))
+        conn.commit()
 
 
 # ========== 缓存清理 ==========

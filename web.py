@@ -13,6 +13,7 @@ import sys
 import os
 import json
 import glob
+import re
 import argparse
 import atexit
 import signal
@@ -34,19 +35,22 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      HOT_COMMENT_MIN_REPLIES, HOT_COMMENT_MAX_SHOW,
                      USER_TIMELINE_MAX_VIDEOS, USER_TIMELINE_SAMPLES,
                      CROSS_VIDEO_MIN_VIDEOS, CROSS_VIDEO_MAX_USERS, DENSITY_BUCKETS,
-                     COMMENT_HEAT_REPLY_WEIGHT, PROBLEM_COMMENT_TOP_N, ATTACK_FOCUS_TOP_N)
+                     COMMENT_HEAT_REPLY_WEIGHT, PROBLEM_COMMENT_TOP_N,
+                     ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_MAX_N, USER_CARD_URL)
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
 from storage import get_db, init_db
 from storage import (load_senders, load_global_uid_map, save_global_uid,
                      save_sender, save_user_data, has_user_data, load_video_info,
-                     delete_video_data, toggle_false_positive, load_false_positives)
+                     delete_video_data, toggle_false_positive, load_false_positives,
+                     load_faces, load_face_cached_uids, save_face)
 from main import run_analysis
 from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from spam_detector import batch_detect_spam
 from llm_analyzer import LLMAnalyzer
+from up_analyzer import _tokenize
 from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats,
                     generate_chart_data, generate_cringe_board, sort_profiles_by_risk,
                     up_wordcloud_data, PROBLEM_CATEGORY_COLORS, _category_chips)
@@ -68,7 +72,7 @@ def _invalidate_page_cache(bvid: str):
 
 
 def _page_fingerprint(bvid: str) -> tuple:
-    """报告页数据指纹：覆盖 senders/users/comments/danmaku/false_positive 五张表的
+    """报告页数据指纹：覆盖 senders/users/comments/danmaku/false_positive/face_cache 六张表的
     量与最新写入时间。全部走 bvid 索引的 COUNT/MAX/SUM 聚合，本地 SQLite 毫秒级。
     外部进程（run.py 分析、--force 重跑）落库后指纹即变，下次访问自动重渲染，
     不依赖进程内主动失效（_invalidate_page_cache 仍保留作为即时手段）。"""
@@ -85,7 +89,8 @@ def _page_fingerprint(bvid: str) -> tuple:
             "SELECT COUNT(*) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
         f_cnt = conn.execute(
             "SELECT COUNT(*) FROM false_positive WHERE bvid = ?", (bvid,)).fetchone()[0]
-    return (s_cnt, s_uid_cnt, u_cnt, u_max, c_cnt, c_prob, d_cnt, f_cnt)
+        face_cnt = conn.execute("SELECT COUNT(*) FROM face_cache").fetchone()[0]
+    return (s_cnt, s_uid_cnt, u_cnt, u_max, c_cnt, c_prob, d_cnt, f_cnt, face_cnt)
 
 
 # ========== 手动勾选分析 job（spec B；状态存内存 dict，服务重启即失效——spec 已接受） ==========
@@ -602,15 +607,80 @@ def _fp_dm_block(fp_contents: list[str]) -> str:
             f'（不计入上方聚合，展开可撤销）</summary><ul class="fp-list">{items}</ul></details>')
 
 
+# ========== 头像后台补采（争执焦点关系图：face_cache 缺失的 uid 异步补齐） ==========
+
+_FACE_BACKFILL_RUNNING: set[int] = set()   # 在采 uid，防并发重复补采
+_FACE_BACKFILL_LOCK = threading.Lock()
+
+
+def _backfill_faces(uids: list[int]):
+    """后台线程：逐个补采头像（名片接口很轻量），走 BiliAPIClient 限速；
+    Cookie 失效/触发风控即整体放弃本次，下次渲染再试"""
+    with _FACE_BACKFILL_LOCK:
+        todo = [u for u in uids if u not in _FACE_BACKFILL_RUNNING]
+        _FACE_BACKFILL_RUNNING.update(todo)
+    if not todo:
+        return
+    try:
+        client = _get_client()
+    except Exception as e:
+        print(f"[Face] 补采放弃（无可用登录态）: {e}")
+        with _FACE_BACKFILL_LOCK:
+            _FACE_BACKFILL_RUNNING.difference_update(todo)
+        return
+
+    def work():
+        try:
+            for uid in todo:
+                data = client.get(USER_CARD_URL, params={"mid": uid, "photo": "false"})
+                if data.get("code") == -412:
+                    print(f"[Face] 触发风控，停止本次补采（剩 {len(todo) - todo.index(uid)} 个下次再采）")
+                    break
+                face = ((data.get("data") or {}).get("card") or {}).get("face", "")
+                save_face(uid, face)   # 空串也落库：标记查过，避免每次渲染重复请求
+            print(f"[Face] 头像补采完成 {len(todo)} 个")
+        finally:
+            with _FACE_BACKFILL_LOCK:
+                _FACE_BACKFILL_RUNNING.difference_update(todo)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _faces_for(uids: list[int]) -> dict[int, str]:
+    """节点头像汇总：face_cache 优先，users.data_json 兜底（已采集用户），
+    两侧都缺的触发后台补采（本次渲染先缺省，下次刷新带上）"""
+    faces = load_faces(uids)
+    miss_cache = [u for u in uids if u not in faces]
+    if miss_cache:
+        with closing(get_db()) as conn:
+            for i in range(0, len(miss_cache), 500):
+                chunk = miss_cache[i:i + 500]
+                qm = ",".join("?" * len(chunk))
+                for r in conn.execute(
+                        f"SELECT uid, data_json FROM users WHERE uid IN ({qm})", chunk):
+                    try:
+                        f = json.loads(r["data_json"]).get("face", "")
+                        if f:
+                            faces[r["uid"]] = f
+                    except Exception:
+                        pass
+    cached = load_face_cached_uids(uids)
+    need = [u for u in uids if u not in faces and u not in cached]
+    if need:
+        _backfill_faces(need)
+    return faces
+
+
 def _attack_focus(bvid: str, fp_cmt: set[str]) -> dict:
     """争执焦点（P0-b）：问题回复按 parent_rpid 还原 A→B 攻击边，聚合挑事分/被攻击分。
 
     只统计问题回复（problem 非空且 parent_rpid>0、父级在库、非自回）；已标记误报的不参与。
-    每侧各留至多 3 条代表原文（挑事者=其问题回复原文及攻击对象；被围攻者=其被攻击的原评
-    原文及攻击来源），供区块直接展示证据。
+    每侧各留至多 3 条代表原文（挑事者=其问题回复原文及攻击对象；被围攻者=受害原评+攻击者
+    及其攻击原文成对，能直接看出谁攻击了ta、攻击了什么）。
+    展示名额随攻击边数浮动（保底 ATTACK_FOCUS_TOP_N，每10条攻击边+1，封顶 ATTACK_FOCUS_MAX_N）。
     返回 {"attackers": [{uid,name,count,categories,examples}],
-           "victims": [{uid,name,count,examples}], "names": {uid: 昵称}}，
-    无攻击边时 attackers 为空列表。"""
+           "victims": [{uid,name,count,examples}], "names": {uid: 昵称},
+           "top_n": 动态名额, "edges": 攻击边数}，无攻击边时 attackers 为空列表。"""
     with closing(get_db()) as conn:
         rows = conn.execute('''
             SELECT c.rpid, c.uid AS attacker, c.uname AS aname, c.problem,
@@ -630,9 +700,11 @@ def _attack_focus(bvid: str, fp_cmt: set[str]) -> dict:
 
     attackers: dict[int, dict] = {}
     victims: dict[int, dict] = {}
+    edge_cnt = 0
     for r in rows:
         if str(r["rpid"]) in fp_cmt:
             continue
+        edge_cnt += 1
         a, v = r["attacker"], r["victim"]
         a_name = _nm(r["aname"], r["a_dbname"], a)
         v_name = _nm(r["vname"], r["v_dbname"], v)
@@ -651,14 +723,23 @@ def _attack_focus(bvid: str, fp_cmt: set[str]) -> dict:
         ev["count"] += 1
         ev["attackers"][a] += 1
         if len(ev["examples"]) < 3:
-            ev["examples"].append({"content": r["parent_content"], "target": a_name,
-                                   "category": r["problem"]})
+            # 被围攻者证据要成对：自己的原评 + 攻击者的攻击原文（单放原评看不出"被谁攻击了什么"）
+            ev["examples"].append({"parent": r["parent_content"], "attack": r["reply_content"],
+                                   "attacker": a_name, "category": r["problem"]})
     names = {u: e["name"] for u, e in attackers.items()}
     names.update({u: e["name"] for u, e in victims.items()})
+    # 头像（关系图节点用）：face_cache + users.data_json 双源汇总，缺的异步补采
+    uids = list(set(attackers) | set(victims))
+    faces = _faces_for(uids)
+    # 展示名额随攻击边数浮动：保底 ATTACK_FOCUS_TOP_N，每 10 条攻击边 +1，封顶 ATTACK_FOCUS_MAX_N
+    top_n = min(ATTACK_FOCUS_MAX_N, max(ATTACK_FOCUS_TOP_N, 5 + edge_cnt // 10))
     return {
         "attackers": sorted(attackers.values(), key=lambda e: -e["count"]),
         "victims": sorted(victims.values(), key=lambda e: -e["count"]),
         "names": names,
+        "faces": faces,
+        "top_n": top_n,
+        "edges": edge_cnt,
     }
 
 
@@ -684,8 +765,18 @@ def _attack_focus_html(data: dict) -> str:
             f'{_problem_chip(e["category"])}</div>'
             for e in examples)
 
+    def _victim_quotes(examples: list[dict]) -> str:
+        """被围攻者证据成对展示：受害原评 + 攻击者及其攻击原文（看出谁攻击了ta、攻击了什么）"""
+        out = []
+        for e in examples:
+            out.append(
+                f'<div class="af-quote">原评：「{esc(_truncate(e["parent"]))}」</div>'
+                f'<div class="af-quote af-quote-atk">⚔ {esc(e["attacker"])} 攻击：'
+                f'「{esc(_truncate(e["attack"]))}」{_problem_chip(e["category"])}</div>')
+        return "".join(out)
+
     def _item(e: dict, badge: str, opp_label: str, opp: str, arrow: str) -> str:
-        return f'''<div class="af-item">
+        return f'''<div class="af-item" data-side="a" data-uid="{e["uid"]}">
             <div class="af-line">
                 <a href="/user/{e["uid"]}" title="查看用户互动时间线">{esc(e["name"])}</a>
                 <span class="hot-badge">{badge.format(e["count"])}</span>
@@ -693,16 +784,45 @@ def _attack_focus_html(data: dict) -> str:
                 <span class="af-targets">{opp_label} {opp}</span>
             </div>{_quotes(e["examples"], arrow)}</div>'''
 
+    def _victim_item(e: dict) -> str:
+        return f'''<div class="af-item" data-side="v" data-uid="{e["uid"]}">
+            <div class="af-line">
+                <a href="/user/{e["uid"]}" title="查看用户互动时间线">{esc(e["name"])}</a>
+                <span class="hot-badge">被攻击 {e["count"]} 次</span>
+                <span class="af-targets">主要来源： {_opp_text(e["attackers"])}</span>
+            </div>{_victim_quotes(e["examples"])}</div>'''
+
+    top_n = data.get("top_n", ATTACK_FOCUS_TOP_N)
+    shown_attackers = data["attackers"][:top_n]
+    shown_victims = data["victims"][:top_n]
+    # 关系图画布数据（P3-a 重做为二分图）：仅保留两侧都上榜的配对；
+    # links 带权重（攻击次数），nodes 带阵营/计数，供 SVG 画布渲染节点与边
+    shown_v_uids = {e["uid"] for e in shown_victims}
+    names = data["names"]
+    faces = data.get("faces", {})
+    graph_nodes = ([{"id": e["uid"], "name": e["name"], "side": "a", "n": e["count"],
+                     "face": faces.get(e["uid"], "")} for e in shown_attackers]
+                   + [{"id": e["uid"], "name": e["name"], "side": "v", "n": e["count"],
+                       "face": faces.get(e["uid"], "")} for e in shown_victims])
+    graph_links = [{"s": e["uid"], "t": v, "w": n}
+                   for e in shown_attackers
+                   for v, n in e["victims"].most_common() if v in shown_v_uids]
+    graph = {"nodes": graph_nodes, "links": graph_links}
+    graph_html = ""
+    if graph_links:
+        graph_html = (f'<div class="af-graph" data-af-graph=\'{json.dumps(graph, ensure_ascii=False)}\'>'
+                      f'</div>')
     a_html = "".join(_item(e, "攻击 {} 次", "主要对象：", _opp_text(e["victims"]), "攻击")
-                     for e in data["attackers"][:ATTACK_FOCUS_TOP_N])
-    v_html = "".join(_item(e, "被攻击 {} 次", "主要来源：", _opp_text(e["attackers"]), "原评")
-                     for e in data["victims"][:ATTACK_FOCUS_TOP_N])
+                     for e in shown_attackers)
+    v_html = "".join(_victim_item(e) for e in shown_victims)
     return f'''
     <div class="cringe-board af-board">
-        <h3>⚔️ 争执焦点（谁攻击谁：问题回复按 parent_rpid 还原攻击边，附代表原文）</h3>
+        <h3>⚔️ 争执焦点（谁攻击谁：问题回复按 parent_rpid 还原攻击边 {data.get("edges", 0)} 条；
+            环状画布：被围攻者居中、挑事者环绕，箭头线指向受害者，节点大小/线粗映射攻击次数，悬停节点高亮其关系，点击定位到下方明细）</h3>
+        {graph_html}
         <div class="af-cols">
-            <div class="af-col"><h4>🗡 挑事者 Top{ATTACK_FOCUS_TOP_N}</h4>{a_html}</div>
-            <div class="af-col"><h4>🛡 被围攻者 Top{ATTACK_FOCUS_TOP_N}</h4>{v_html}</div>
+            <div class="af-col"><h4>🗡 挑事者 Top{top_n}</h4>{a_html}</div>
+            <div class="af-col"><h4>🛡 被围攻者 Top{top_n}</h4>{v_html}</div>
         </div>
     </div>'''
 
@@ -991,9 +1111,15 @@ def _reply_tree_html(subs: list[dict], root_uid: int, up_mid: int, fp_cmt: set[s
     return "<ul class=\"hot-tree\">" + "".join(render(s) for s in roots) + "</ul>"
 
 
+def _attack_focus_tab_html(bvid: str, fp_cmt: set[str] = frozenset()) -> str:
+    """「争执焦点」标签页（独立成页，不与问题评论榜混排——连线需要宽敞的两列排布）"""
+    return _attack_focus_html(_attack_focus(bvid, fp_cmt)) \
+        or '<p class="empty-note">本视频无问题评论攻击边</p>'
+
+
 def _cmt_war_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset()) -> str:
-    """「评论争执」标签页（独立成页，不与高回复评论混排）：
-    争执焦点（P0-b，谁攻击谁，附代表原文）+ 问题评论榜（P1-b，热度加权，楼中楼附父评原文）。"""
+    """「问题评论榜」标签页（独立成页）：全部问题评论按热度加权排序，楼中楼附父评原文。
+    （争执焦点已独立为「争执焦点」标签页，见 _attack_focus_tab_html）"""
     up_mid = 0
     with closing(get_db()) as conn:
         vrow = conn.execute("SELECT video_info_json FROM videos WHERE bvid = ?", (bvid,)).fetchone()
@@ -1001,9 +1127,30 @@ def _cmt_war_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset()) ->
         up_mid = int((json.loads(vrow["video_info_json"]).get("owner") or {}).get("mid", 0)) if vrow else 0
     except Exception:
         up_mid = 0
-    body = (_attack_focus_html(_attack_focus(bvid, fp_cmt))
-            + _problem_comment_board_html(*_problem_comment_board(bvid, fp_cmt), aid, up_mid))
-    return body or '<p class="empty-note">本视频无问题评论命中</p>'
+    return _problem_comment_board_html(*_problem_comment_board(bvid, fp_cmt), aid, up_mid) \
+        or '<p class="empty-note">本视频无问题评论命中</p>'
+
+
+def _group_wordcloud(texts: list[str], top: int = 30) -> list[list]:
+    """评论组词云数据：简单分词（2+连续中文字）词频 Top N；过滤只出现1次的噪声，
+    全部只出现一次时退化为 Top N（保证有内容可看）。返回 [[词, 次数], ...]"""
+    cnt: Counter = Counter()
+    for t in texts:
+        t = (t or "").strip()
+        # 楼中楼原文带「回复 @xx :」前缀，先剥离避免「回复」成为噪声高频词
+        t = re.sub(r"^回复\s*@[^\s:：]+\s*[:：]", "", t)
+        # 剥离B站表情占位符（[笑哭]/[给心心]/[装扮名_xxx] 等方括号段），否则分词产出
+        # 「笑哭」「应援装扮」这类表情噪声词压过真实话题词
+        t = re.sub(r"\[[^\[\]]{1,30}\]", " ", t)
+        # 剥离正文中的 @提及（含「回复 @xx :」前缀以外的裸 @昵称），昵称不是话题
+        t = re.sub(r"@[^\s@:：，,\[\]]+", " ", t)
+        cnt.update(w for w in _tokenize(t) if w != "回复")
+    words = [(w, c) for w, c in cnt.most_common() if c >= 2][:top]
+    if len(words) < 8:
+        # 高频词太少的组用词频1的词补齐到至少8个，避免词云只有一两个词
+        seen = {w for w, _ in words}
+        words += [(w, c) for w, c in cnt.most_common() if c < 2 and w not in seen][:8 - len(words)]
+    return [[w, c] for w, c in words]
 
 
 def _hot_comments_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset()) -> str:
@@ -1012,7 +1159,7 @@ def _hot_comments_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset(
     回复树完整展示不截断：默认折叠到固定高度，「展开/折叠」按钮切换（hotToggle）。
     树内直接显示用户名（comments.uname 落库），楼主/UP主出现时分色标注；
     问题评论带误报标记按钮（P2-a），已标记误报的不计入统计。
-    （争执焦点/问题评论榜已独立为「评论争执」标签页，见 _cmt_war_html）"""
+    （争执焦点/问题评论榜已各自独立成页，见 _attack_focus_tab_html / _cmt_war_html）"""
     data = _hot_comments(bvid, aid)
     up_mid = data.get("up_mid", 0)
     if data["legacy"]:
@@ -1041,8 +1188,11 @@ def _hot_comments_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset(
             subs_html = '<div class="hot-subs"><div class="hot-sub-label ov-none">暂无子回复被采集</div></div>'
         origin = (f'<a class="hot-origin" href="https://www.bilibili.com/video/av{aid}#reply{it["rpid"]}" '
                   f'target="_blank" rel="noopener">去B站围观 ↗</a>') if aid else ""
+        # 评论组讨论主题词云（主楼+全部回复的词频，悬停静止弹窗用；分词只产出纯中文词，JSON 注入单引号属性安全）
+        wc = _group_wordcloud([it["content"]] + [s["content"] for s in it["subs"]])
+        wc_attr = f" data-wc='{json.dumps(wc, ensure_ascii=False)}'" if wc else ""
         items_html.append(f'''
-            <div class="hot-item">
+            <div class="hot-item"{wc_attr}>
                 <div class="hot-head">
                     <a class="hot-author" href="/user/{esc(it["uid"])}"
                        title="查看该用户在已分析视频中的互动时间线">{esc(it["name"])}</a>
@@ -1059,7 +1209,8 @@ def _hot_comments_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset(
     problem_note = f' · 其中问题评论 {problem_total} 条已标注' if problem_total else ""
     return f'''
         <div class="hot-note">💥 回复数特别多的评论往往意味着争执：以下为该视频回复数 ≥
-            {HOT_COMMENT_MIN_REPLIES} 的评论（按回复数降序，最多 {HOT_COMMENT_MAX_SHOW} 条）。</div>
+            {HOT_COMMENT_MIN_REPLIES} 的评论（按回复数降序，最多 {HOT_COMMENT_MAX_SHOW} 条）。
+            悬停在某个评论组上静止片刻，可弹出该组讨论主题词云。</div>
         <div class="hot-stats">共 {len(data["items"])} 条高回复评论 · 合计 {data["total_replies"]:,} 条回复{problem_note}</div>
         <div class="hot-list">{"".join(items_html)}</div>'''
 
@@ -1251,7 +1402,7 @@ def index():
 
 @app.route("/video/<bvid>")
 def video_page(bvid: str):
-    """报告页：概览/用户画像/弹幕浏览器/问题弹幕榜/评论争执榜/高回复评论 六个标签页。
+    """报告页：概览/用户画像/弹幕浏览器/问题弹幕榜/争执焦点/问题评论榜/高回复评论 七个标签页。
 
     整页 HTML 按 bvid 内存缓存（_PAGE_CACHE）：避免每次刷新重跑 _load_profiles/
     _attach_other_videos 逐用户查询；job（手动分析/重新生成）完成或删除时主动失效，
@@ -1284,7 +1435,8 @@ def video_page(bvid: str):
     chart = generate_chart_data(profiles)
     cards_html = "".join(generate_user_card(p) for p in profiles) or '<p class="empty-note">暂无画像数据</p>'
     hot_tab = _hot_comments_html(bvid, row["aid"], fp_cmt)   # 高回复评论页（潜在争执热点）
-    cmtwar_tab = _cmt_war_html(bvid, row["aid"], fp_cmt)     # 评论争执页（争执焦点+问题评论榜）
+    attack_tab = _attack_focus_tab_html(bvid, fp_cmt)        # 争执焦点页（谁攻击谁+连线）
+    cmtwar_tab = _cmt_war_html(bvid, row["aid"], fp_cmt)     # 问题评论榜（热度加权）
     board_html = (generate_cringe_board(profiles, fp_renderer=lambda c: _fp_btn("dm", c, False))
                   or '<p class="empty-note">本视频无问题弹幕命中</p>')
     board_html += _fp_dm_block(fp_dm_used)   # 已标记误报弹幕的撤销入口
@@ -1468,7 +1620,8 @@ def video_page(bvid: str):
         <button class="tab-btn" data-tab="users" onclick="switchTab('users')">用户画像</button>
         <button class="tab-btn" data-tab="danmaku" onclick="switchTab('danmaku')">弹幕浏览器</button>
         <button class="tab-btn" data-tab="cringe" onclick="switchTab('cringe')">问题弹幕榜</button>
-        <button class="tab-btn" data-tab="cmtwar" onclick="switchTab('cmtwar')">评论争执榜</button>
+        <button class="tab-btn" data-tab="attack" onclick="switchTab('attack')">争执焦点</button>
+        <button class="tab-btn" data-tab="cmtwar" onclick="switchTab('cmtwar')">问题评论榜</button>
         <button class="tab-btn" data-tab="hot" onclick="switchTab('hot')">高回复评论</button>
     </div>
 
@@ -1524,6 +1677,8 @@ def video_page(bvid: str):
     <div id="tab-danmaku" class="tab-pane">{danmaku_tab}</div>
 
     <div id="tab-cringe" class="tab-pane">{board_html}</div>
+
+    <div id="tab-attack" class="tab-pane">{attack_tab}</div>
 
     <div id="tab-cmtwar" class="tab-pane">{cmtwar_tab}</div>
 

@@ -8,6 +8,8 @@ function switchTab(name) {
     document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
     // 标签页写入 URL hash（spec 5）：刷新/分享链接可回到同一标签页
     if (location.hash !== '#tab=' + name) history.replaceState(null, '', '#tab=' + name);
+    // 争执焦点连线（隐藏时坐标为0，切到该标签页可见后重算）
+    if (name === 'attack') requestAnimationFrame(drawAfEdges);
 }
 
 // 从 URL hash 还原标签页（仅接受存在的标签名）
@@ -137,6 +139,240 @@ document.querySelectorAll('.up-chip').forEach(chip => {
             rotateRatio: 0, backgroundColor: '#ffffff', shape: 'circle', clearCanvas: true});
     });
     chip.addEventListener('mouseleave', function() { popup.style.display = 'none'; });
+});
+
+// 高回复评论组：鼠标在组内悬停静止 600ms 弹出该组讨论主题词云（data-wc 词频由服务端注入）
+let hotWcTimer = null;
+document.querySelectorAll('.hot-item[data-wc]').forEach(item => {
+    item.addEventListener('mousemove', function(e) {
+        popup.style.display = 'none';   // 移动中不打扰，静止才弹
+        clearTimeout(hotWcTimer);
+        const raw = this.dataset.wc;
+        hotWcTimer = setTimeout(() => {
+            let data;
+            try { data = JSON.parse(raw); } catch { return; }
+            if (!data || !data.length) return;
+            const maxW = Math.max(...data.map(d => d[1]));
+            const minW = Math.min(...data.map(d => d[1]));
+            // 基准字号 22：词少或权重相同时也要可读（旧基准 10 会缩成看不清的小字）
+            const scaled = data.map(d => [d[0], 22 + (d[1] - minW) / Math.max(maxW - minW, 1) * 38]);
+            WordCloud(popupCanvas, {list: scaled, gridSize: 10, weightFactor: 1, fontFamily: 'sans-serif',
+                color: () => ['#00a1d6','#fb7299','#ff9f43','#6c5ce7','#2e7d32'][Math.floor(Math.random()*5)],
+                rotateRatio: 0, backgroundColor: '#ffffff', shape: 'circle', clearCanvas: true});
+            popup.style.left = Math.min(e.clientX + 12, window.innerWidth - 320) + 'px';
+            popup.style.top = Math.min(e.clientY + 12, window.innerHeight - 260) + 'px';
+            popup.style.display = 'block';
+        }, 600);
+    });
+    item.addEventListener('mouseleave', function() {
+        clearTimeout(hotWcTimer);
+        popup.style.display = 'none';
+    });
+});
+
+// ===== 争执焦点：关系图画布（环状放射：被围攻者居中，挑事者环绕四周，箭头指向受害者） =====
+function drawAfEdges() {
+    const box = document.querySelector('.af-graph');
+    if (!box) return;
+    let g;
+    try { g = JSON.parse(box.dataset.afGraph || '{}'); } catch { return; }
+    box.innerHTML = '';
+    if (!g.nodes || !g.links || !g.links.length) return;
+    const W = box.clientWidth || 800;
+    if (W === 0) return;   // 标签页未显示（宽度为0），等可见时再画
+    const attackers = g.nodes.filter(n => n.side === 'a');
+    const victims = g.nodes.filter(n => n.side === 'v');
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const maxN = Math.max(...g.nodes.map(n => n.n), 1);
+    const maxW = Math.max(...g.links.map(l => l.w), 1);
+    const rOf = n => 8 + 10 * Math.sqrt(n.n / maxN);
+    // 每个挑事者一个颜色，其连出的边/箭头同色
+    const PALETTE = ['#e53935', '#fb8c00', '#8e24aa', '#3949ab', '#00897b', '#7cb342',
+                     '#c0ca33', '#6d4c41', '#d81b60', '#00acc1', '#5e35b1', '#f4511e',
+                     '#43a047', '#1e88e5', '#757575', '#c2185b'];
+    const aColor = {};
+    attackers.forEach((n, i) => { aColor[String(n.id)] = PALETTE[i % PALETTE.length]; });
+
+    // 环状布局（连线交叉最小化）：连通分量锚定法——
+    // 外圈：无边攻击者占接缝顶部，随后各分量（hub受害组/1:1对）的攻击者连续占位；
+    // 内圈：无边受害者同样占顶部，有边受害者锚定到其攻击者弧的环状中心（组内微偏移）。
+    // 每个分量的边全部落在自己的楔块内，分量间不交叉（实测交叉数 0，旧排布 11）
+    const R = Math.max(170, attackers.length * 15);
+    const Ri = Math.min(Math.max(46, victims.length * 9), R * 0.6);
+    const cx = W / 2, cy = R + 76;
+    const H = cy + R + 76;
+    const svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('width', W);
+    svg.setAttribute('height', H);
+    const byId = {};
+    g.nodes.forEach(n => { byId[String(n.id) + n.side] = n; });  // 同一人可能两侧都出现，按 side 区分
+    // 并查集求连通分量（有边节点）
+    const parent = {};
+    g.nodes.forEach(n => { parent[String(n.id) + n.side] = String(n.id) + n.side; });
+    const find = k => { while (parent[k] !== k) { parent[k] = parent[parent[k]]; k = parent[k]; } return k; };
+    const linked = new Set();
+    g.links.forEach(l => {
+        const ka = String(l.s) + 'a', kv = String(l.t) + 'v';
+        if (byId[ka] && byId[kv]) { parent[find(ka)] = find(kv); linked.add(ka); linked.add(kv); }
+    });
+    const comps = {};
+    g.nodes.forEach(n => {
+        const key = String(n.id) + n.side;
+        if (linked.has(key)) (comps[find(key)] = comps[find(key)] || []).push(n);
+    });
+    const compList = Object.values(comps).sort((a, b) =>
+        b.reduce((s, n) => s + n.n, 0) - a.reduce((s, n) => s + n.n, 0));   // 大的分量先排
+    // 外圈定位
+    const aOrder = attackers.filter(n => !linked.has(String(n.id) + 'a'));
+    compList.forEach(comp =>
+        comp.filter(n => n.side === 'a').sort((x, y) => y.n - x.n).forEach(n => aOrder.push(n)));
+    const stepA = 2 * Math.PI / attackers.length;
+    aOrder.forEach((n, i) => {
+        n.ang = -Math.PI / 2 + i * stepA;
+        n.x = cx + R * Math.cos(n.ang);
+        n.y = cy + R * Math.sin(n.ang);
+    });
+    // 内圈定位：无边受害者占顶部；有边的锚定分量中心 + 组内微偏移；标签内外交错防重叠
+    const stepV = 2 * Math.PI / victims.length;
+    victims.filter(n => !linked.has(String(n.id) + 'v')).forEach((n, i) => {
+        n.ang = -Math.PI / 2 + i * stepV;
+        n.labIn = i % 2 === 1;
+    });
+    compList.forEach(comp => {
+        const vs = comp.filter(n => n.side === 'v').sort((x, y) => y.n - x.n);
+        if (!vs.length) return;
+        let sx = 0, sy = 0;
+        comp.filter(n => n.side === 'a').forEach(n => { sx += Math.cos(n.ang); sy += Math.sin(n.ang); });
+        const center = Math.atan2(sy, sx);
+        vs.forEach((n, i) => {
+            n.ang = center + (i - (vs.length - 1) / 2) * stepV * 0.5;
+            n.labIn = i % 2 === 1;
+        });
+    });
+    victims.forEach(n => {
+        n.x = cx + Ri * Math.cos(n.ang);
+        n.y = cy + Ri * Math.sin(n.ang);
+    });
+
+    // 箭头 marker 按攻击者颜色各建一个
+    const defs = document.createElementNS(svgNS, 'defs');
+    const markerIds = {};
+    const markerFor = color => {
+        if (!markerIds[color]) {
+            const id = 'af-arr-' + color.slice(1);
+            const m = document.createElementNS(svgNS, 'marker');
+            m.setAttribute('id', id);
+            m.setAttribute('viewBox', '0 0 10 10');
+            m.setAttribute('refX', '9'); m.setAttribute('refY', '5');
+            m.setAttribute('markerWidth', '6'); m.setAttribute('markerHeight', '6');
+            m.setAttribute('orient', 'auto');
+            const tri = document.createElementNS(svgNS, 'path');
+            tri.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z');
+            tri.setAttribute('fill', color);
+            m.appendChild(tri);
+            defs.appendChild(m);
+            markerIds[color] = id;
+        }
+        return markerIds[color];
+    };
+    svg.appendChild(defs);
+
+    // 边：攻击者→受害者带箭头曲线；指向同一受害者的平行边交替向两侧弯曲，减少重叠
+    const perTarget = {};
+    g.links.forEach(l => {
+        const a = byId[String(l.s) + 'a'], v = byId[String(l.t) + 'v'];
+        if (!a || !v) return;
+        const idx = (perTarget[l.t] = (perTarget[l.t] || 0) + 1) - 1;
+        const dx = v.x - a.x, dy = v.y - a.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const ux = dx / len, uy = dy / len;
+        const color = aColor[String(l.s)] || '#e53935';
+        // 起点=攻击者节点边缘，终点=受害者节点边缘再退 8px 给箭头留位
+        const sx = a.x + ux * rOf(a), sy = a.y + uy * rOf(a);
+        const ex = v.x - ux * (rOf(v) + 8), ey = v.y - uy * (rOf(v) + 8);
+        const off = (idx % 2 ? 1 : -1) * Math.ceil(idx / 2) * 14;   // 交替两侧、逐条加宽
+        const qx = (sx + ex) / 2 - uy * off, qy = (sy + ey) / 2 + ux * off;
+        const p = document.createElementNS(svgNS, 'path');
+        p.setAttribute('d', `M ${sx} ${sy} Q ${qx} ${qy} ${ex} ${ey}`);
+        p.setAttribute('class', 'af-edge');
+        p.style.stroke = color;
+        p.style.strokeWidth = (1 + 3 * l.w / maxW).toFixed(1);
+        p.setAttribute('marker-end', `url(#${markerFor(color)})`);
+        p.dataset.uids = `${l.s},${l.t}`;
+        svg.appendChild(p);
+    });
+
+    // 节点：圆点+名字×次数；攻击者标签放外圈外侧，受害者标签沿径向放内圈外侧
+    g.nodes.forEach(n => {
+        const gEl = document.createElementNS(svgNS, 'g');
+        gEl.setAttribute('class', 'af-node');
+        const c = document.createElementNS(svgNS, 'circle');
+        c.setAttribute('cx', n.x); c.setAttribute('cy', n.y);
+        c.setAttribute('r', rOf(n).toFixed(1));
+        c.setAttribute('class', n.side === 'a' ? 'af-node-a' : 'af-node-v');
+        if (n.side === 'a') c.style.fill = aColor[String(n.id)];   // 挑事者节点与边同色
+        const t = document.createElementNS(svgNS, 'text');
+        const maxLen = n.side === 'a' ? 10 : 8;   // 受害者标签更短，内圈位置紧张
+        const label = n.name.length > maxLen ? n.name.slice(0, maxLen) + '…' : n.name;
+        const cos = Math.cos(n.ang), sin = Math.sin(n.ang);
+        // 攻击者标签放外圈外侧；受害者标签内外交错 + 白色光晕描边（内圈节点密，防互相压字）
+        const lr = n.side === 'a' ? R + rOf(n) + 12
+                                  : Ri + (n.labIn ? -(rOf(n) + 20) : rOf(n) + 12);
+        t.setAttribute('x', cx + lr * cos);
+        t.setAttribute('y', cy + lr * sin + 4);
+        t.setAttribute('text-anchor', cos > 0.3 ? 'start' : (cos < -0.3 ? 'end' : 'middle'));
+        t.setAttribute('class', n.side === 'a' ? 'af-lab' : 'af-lab af-lab-v');
+        t.textContent = `${label} ×${n.n}`;
+        gEl.appendChild(c);
+        // 头像节点：有 face 的用圆形裁剪头像盖在色点上（加载失败移除图片，回退为色点）
+        if (n.face) {
+            const img = document.createElementNS(svgNS, 'image');
+            const ir = rOf(n) - 1.5;
+            img.setAttribute('x', n.x - ir); img.setAttribute('y', n.y - ir);
+            img.setAttribute('width', 2 * ir); img.setAttribute('height', 2 * ir);
+            img.setAttribute('href', n.face);
+            img.setAttribute('referrerpolicy', 'no-referrer');
+            img.style.clipPath = 'circle(50% at 50% 50%)';
+            img.addEventListener('error', () => img.remove());
+            gEl.appendChild(img);
+        }
+        gEl.appendChild(t);
+        gEl.addEventListener('mouseenter', () => {
+            // side 感知：悬停攻击者只高亮"ta发出的"边（s=uid），悬停受害者只高亮"指向ta的"边（t=uid）；
+            // 同一人两侧都出现时不再把对侧的边一起点亮（旧实现用 includes 会带出别人的边）
+            const pos = n.side === 'a' ? 0 : 1;
+            svg.querySelectorAll('.af-edge').forEach(p =>
+                p.classList.toggle('af-edge-hot',
+                    (p.dataset.uids || '').split(',')[pos] === String(n.id)));
+        });
+        gEl.addEventListener('mouseleave', () =>
+            svg.querySelectorAll('.af-edge.af-edge-hot').forEach(p => p.classList.remove('af-edge-hot')));
+        gEl.addEventListener('click', () => {
+            const item = document.querySelector(`.af-item[data-side="${n.side}"][data-uid="${n.id}"]`);
+            if (item) {
+                item.scrollIntoView({behavior: 'smooth', block: 'center'});
+                item.classList.add('af-flash');
+                setTimeout(() => item.classList.remove('af-flash'), 1200);
+            }
+        });
+        svg.appendChild(gEl);
+    });
+    box.appendChild(svg);
+    // 明细列表的挑事者条目前缀同色圆点：图与列表颜色互参
+    attackers.forEach(n => {
+        const item = document.querySelector(`.af-item[data-side="a"][data-uid="${n.id}"]`);
+        const line = item && item.querySelector('.af-line');
+        if (line && !line.querySelector('.af-dot')) {
+            const dot = document.createElement('span');
+            dot.className = 'af-dot';
+            dot.style.background = aColor[String(n.id)];
+            line.prepend(dot);
+        }
+    });
+}
+
+window.addEventListener('resize', () => {
+    if (document.querySelector('#tab-attack.active')) drawAfEdges();
 });
 
 // ===== 用户画像：筛选 + 搜索防抖 + 排序 + 前端分页（全部读卡片 data-* 属性，不再做 DOM 位置解析） =====

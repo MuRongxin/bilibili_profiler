@@ -1,8 +1,8 @@
 """
 问题弹幕检测（LLM 判定）
 
-对合并去重后的全部弹幕按批喂给 LLM，判定七类问题弹幕：
-中二抒情 / 尬夸捧杀 / 引战阴阳 / 人身攻击 / 恶意剧透 / 广告引流 / 键政敏感。
+对合并去重后的全部弹幕按批喂给 LLM，判定八类问题弹幕：
+中二抒情 / 尬夸捧杀 / 引战阴阳 / 人身攻击 / 恶意剧透 / 广告引流 / 键政敏感 / 批评吐槽。
 按发送者聚合输出，驱动兴趣分选人与报告问题弹幕榜。
 未配置 LLM_API_KEY 或全部批次失败时返回空 dict（降级不中断）。
 
@@ -18,8 +18,8 @@ from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, CRINGE
                     COMMENT_CRINGE_BATCH_SIZE, COMMENT_CRINGE_MAX_ITEMS)
 from storage import load_llm_cache, save_llm_cache
 
-# 问题弹幕类别（与 spec 一致；prompt 与聚合均引用，勿散落硬编码字符串）
-PROBLEM_CATEGORIES = ["中二抒情", "尬夸捧杀", "引战阴阳", "人身攻击", "恶意剧透", "广告引流", "键政敏感"]
+# 问题弹幕类别（prompt 与聚合均引用，勿散落硬编码字符串）
+PROBLEM_CATEGORIES = ["中二抒情", "尬夸捧杀", "引战阴阳", "人身攻击", "恶意剧透", "广告引流", "键政敏感", "批评吐槽"]
 
 
 def _dedup_contents(danmaku_list: list[dict]) -> list[dict]:
@@ -34,25 +34,37 @@ def _dedup_contents(danmaku_list: list[dict]) -> list[dict]:
     return items
 
 
-def _build_prompt(batch: list[dict], start_idx: int, video_title: str) -> str:
+def _video_context(video_info: dict) -> str:
+    """视频语境行：标题 + 简介截断，帮助 LLM 锚定游戏/社区语境（二游判定防现实语境误读）"""
+    title = video_info.get("title", "未知视频")
+    desc = (video_info.get("desc") or "").strip().replace("\n", " ")[:100]
+    ctx = f"视频《{title}》"
+    if desc:
+        ctx += f"（简介：{desc}）"
+    return ctx
+
+
+def _build_prompt(batch: list[dict], start_idx: int, video_info: dict) -> str:
     """构建单批问题弹幕判定 prompt（编号为全局下标，便于跨批映射）"""
     lines = [f'{start_idx + i}. {it["content"]}（出现{it["count"]}次）' for i, it in enumerate(batch)]
-    return f"""你是中文互联网内容审核专家。以下是B站视频《{video_title}》的弹幕列表（已按内容去重）。
-请逐条判定是否属于以下七类"问题弹幕"之一：
-- 中二抒情：咯噔文学、疼痛文学、过度深情、自我感动式抒情
-- 尬夸捧杀：无脑吹、饭圈式夸张应援、明显违心的吹捧
-- 引战阴阳：拉踩、对线、反串、阴阳怪气等攻击性内容
-- 人身攻击：辱骂、诅咒、攻击其他观众/UP主/视频角色
-- 恶意剧透：泄露剧情关键信息、结局、反转
-- 广告引流：打广告、推广、引流到其他平台或商品
-- 键政敏感：借题发挥的政治隐喻、键政引战
+    return f"""你是熟悉二次元游戏（原神、鸣潮等二游）社区生态的内容审核专家。以下是B站{_video_context(video_info)}的弹幕列表（已按内容去重）。
+语境提示：这是二游视频，游戏世界观名词、剧情设定、角色名、卡池/强度讨论、社区黑话都属于游戏语境，不要按现实语境过度解读。
+请逐条判定是否属于以下八类"问题弹幕"之一：
+- 中二抒情：咯噔文学、疼痛文学、自我感动式过度抒情。发癫文学、"XX我老婆"等二游常见发电行为属正常玩梗，不算
+- 尬夸捧杀：无脑吹、饭圈式夸张应援、明显违心的吹捧；对角色/剧情/演出的正常夸赞不算
+- 引战阴阳：拉踩其他游戏/角色/阵营/玩家群体、对线、反串、阴阳怪气等攻击性内容
+- 人身攻击：辱骂、诅咒、攻击其他观众/UP主/声优；只针对游戏内容本身的批评归「批评吐槽」类
+- 恶意剧透：泄露剧情关键信息、结局、反转，或未实装角色/卡池的内鬼爆料
+- 广告引流：打广告、推广、引流到其他平台或商品（含代练、卖号、私服）
+- 键政敏感：把游戏内容借题引申到现实政治人物、事件、意识形态的键政引战；游戏世界观内的国家/战争/政变等设定讨论不算，歌词/台词/梗中引用的符号性词汇也不算。例：「至冬解体」是游戏国家设定联想、「火焰和钢铁--镰刀与锤子」是歌词接龙，都不算键政敏感
+- 批评吐槽：对游戏剧情、角色强度、运营策划的批评、锐评、吐槽（对事不对人；含辱骂或攻击玩家/UP主的归人身攻击；此类严重度一般给1）
 正常玩梗、合理讨论、普通应援不算问题弹幕，宁漏勿冤。
 
 弹幕列表：
 {chr(10).join(lines)}
 
 请严格只输出一个 JSON 数组，每个元素对应一条判定（只输出判为问题弹幕的条目）：
-[{{"i": 编号, "category": "中二抒情|尬夸捧杀|引战阴阳|人身攻击|恶意剧透|广告引流|键政敏感", "severity": 1到3的整数, "reason": "10字内理由"}}]
+[{{"i": 编号, "category": "中二抒情|尬夸捧杀|引战阴阳|人身攻击|恶意剧透|广告引流|键政敏感|批评吐槽", "severity": 1到3的整数, "reason": "10字内理由"}}]
 没有问题弹幕就输出 []。不要输出任何 JSON 之外的内容。"""
 
 
@@ -100,7 +112,7 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
         digest = hashlib.sha256(
             json.dumps(hash_items, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
-        cache_key = f"cringe:{bvid}:{digest}"
+        cache_key = f"cringe:{bvid}:v3:{LLM_MODEL}:{digest}"
         cached = load_llm_cache(cache_key)
         if cached is not None:
             try:
@@ -119,7 +131,6 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
             content_senders.setdefault((c or "").strip(), set()).add(mid_hash)
 
     client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-    title = video_info.get("title", "未知视频")
     verdicts = []
     batches = [items[i:i + CRINGE_BATCH_SIZE] for i in range(0, len(items), CRINGE_BATCH_SIZE)]
     failed = 0
@@ -129,7 +140,7 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
         try:
             resp = client.chat.completions.create(
                 model=LLM_MODEL,
-                messages=[{"role": "user", "content": _build_prompt(batch, start_idx, title)}],
+                messages=[{"role": "user", "content": _build_prompt(batch, start_idx, video_info)}],
                 max_tokens=LLM_MAX_TOKENS,
                 temperature=0.3,  # 判定类任务低温，减少格式漂移
             )
@@ -190,25 +201,27 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
 
 # ========== 问题评论检测（同一 LLM 判定口径，对象为评论） ==========
 
-def _build_comment_prompt(batch: list[dict], start_idx: int, video_title: str) -> str:
+def _build_comment_prompt(batch: list[dict], start_idx: int, video_info: dict) -> str:
     """构建单批问题评论判定 prompt（编号为全局下标，便于跨批映射）"""
     lines = [f'{start_idx + i}. {it["content"]}' for i, it in enumerate(batch)]
-    return f"""你是中文互联网内容审核专家。以下是B站视频《{video_title}》的评论列表（已按内容去重）。
-请逐条判定是否属于以下七类"问题评论"之一：
-- 中二抒情：咯噔文学、疼痛文学、过度深情、自我感动式抒情
-- 尬夸捧杀：无脑吹、饭圈式夸张应援、明显违心的吹捧
-- 引战阴阳：拉踩、对线、反串、阴阳怪气等攻击性内容
-- 人身攻击：辱骂、诅咒、攻击其他观众/UP主/视频角色
-- 恶意剧透：泄露剧情关键信息、结局、反转
-- 广告引流：打广告、推广、引流到其他平台或商品
-- 键政敏感：借题发挥的政治隐喻、键政引战
-正常玩梗、合理讨论、普通应援不算问题评论，宁漏勿冤。
+    return f"""你是熟悉二次元游戏（原神、鸣潮等二游）社区生态的内容审核专家。以下是B站{_video_context(video_info)}的评论列表（已按内容去重）。
+语境提示：这是二游视频，游戏世界观名词、剧情设定、角色名、卡池/强度讨论、社区黑话都属于游戏语境，不要按现实语境过度解读。
+请逐条判定是否属于以下八类"问题评论"之一：
+- 中二抒情：咯噔文学、疼痛文学、自我感动式过度抒情。发癫文学、"XX我老婆"等二游常见发电行为属正常玩梗，不算
+- 尬夸捧杀：无脑吹、饭圈式夸张应援、明显违心的吹捧；对角色/剧情/演出的正常夸赞不算
+- 引战阴阳：拉踩其他游戏/角色/阵营/玩家群体、对线、反串、阴阳怪气等攻击性内容
+- 人身攻击：辱骂、诅咒、攻击其他观众/UP主/声优；只针对游戏内容本身的批评归「批评吐槽」类
+- 恶意剧透：泄露剧情关键信息、结局、反转，或未实装角色/卡池的内鬼爆料
+- 广告引流：打广告、推广、引流到其他平台或商品（含代练、卖号、私服）
+- 键政敏感：把游戏内容借题引申到现实政治人物、事件、意识形态的键政引战；游戏世界观内的国家/战争/政变等设定讨论不算，歌词/台词/梗中引用的符号性词汇也不算。例：「至冬解体」是游戏国家设定联想、「火焰和钢铁--镰刀与锤子」是歌词接龙，都不算键政敏感
+- 批评吐槽：对游戏剧情、角色强度、运营策划的批评、锐评、吐槽（对事不对人；含辱骂或攻击玩家/UP主的归人身攻击；此类严重度一般给1）
+正常玩梗、合理讨论不算问题评论，宁漏勿冤。
 
 评论列表：
 {chr(10).join(lines)}
 
 请严格只输出一个 JSON 数组，每个元素对应一条判定（只输出判为问题评论的条目）：
-[{{"i": 编号, "category": "中二抒情|尬夸捧杀|引战阴阳|人身攻击|恶意剧透|广告引流|键政敏感", "severity": 1到3的整数, "reason": "10字内理由"}}]
+[{{"i": 编号, "category": "中二抒情|尬夸捧杀|引战阴阳|人身攻击|恶意剧透|广告引流|键政敏感|批评吐槽", "severity": 1到3的整数, "reason": "10字内理由"}}]
 没有问题评论就输出 []。不要输出任何 JSON 之外的内容。"""
 
 
@@ -255,7 +268,7 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
         digest = hashlib.sha256(
             json.dumps(sorted(it["content"] for it in items), ensure_ascii=False).encode("utf-8")
         ).hexdigest()[:16]
-        cache_key = f"cmt:{bvid}:{digest}"
+        cache_key = f"cmt:{bvid}:v3:{LLM_MODEL}:{digest}"
         cached = load_llm_cache(cache_key)
         if cached is not None:
             try:
@@ -269,7 +282,6 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
                 print("[问题评论] 警告: 缓存内容损坏，重新判定")
 
     client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-    title = video_info.get("title", "未知视频")
     results: dict[int, dict] = {}
     batches = [items[i:i + COMMENT_CRINGE_BATCH_SIZE]
                for i in range(0, len(items), COMMENT_CRINGE_BATCH_SIZE)]
@@ -280,7 +292,7 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
         try:
             resp = client.chat.completions.create(
                 model=LLM_MODEL,
-                messages=[{"role": "user", "content": _build_comment_prompt(batch, start_idx, title)}],
+                messages=[{"role": "user", "content": _build_comment_prompt(batch, start_idx, video_info)}],
                 max_tokens=LLM_MAX_TOKENS,
                 temperature=0.3,  # 判定类任务低温，减少格式漂移
             )

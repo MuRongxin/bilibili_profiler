@@ -136,7 +136,7 @@ def esc(s):
     return _html.escape(str(s) if s is not None else "", quote=True)
 
 
-# 问题弹幕类别分色（问题弹幕榜标签底色；七类与 cringe_detector.PROBLEM_CATEGORIES 对齐）
+# 问题弹幕类别分色（问题弹幕榜标签底色；与 cringe_detector.PROBLEM_CATEGORIES 对齐）
 PROBLEM_CATEGORY_COLORS = {
     "中二抒情": "#9c6ade",
     "尬夸捧杀": "#f06292",
@@ -145,6 +145,7 @@ PROBLEM_CATEGORY_COLORS = {
     "恶意剧透": "#fb8c00",
     "广告引流": "#8d6e63",
     "键政敏感": "#546e7a",
+    "批评吐槽": "#42a5f5",
 }
 
 

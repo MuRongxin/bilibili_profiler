@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-**B站弹幕发送者用户画像分析系统**：输入视频 BV 号，采集该视频的全部弹幕（实时弹幕池 + 历史快照），先做本地刷屏检测 + LLM 问题弹幕检测（七类：中二抒情/尬夸捧杀/引战阴阳/人身攻击/恶意剧透/广告引流/键政敏感，结果按 llm_cache 缓存）+ LLM 问题评论检测（同七类口径，回写 comments.problem 列，`cmt:{bvid}:*` 缓存），按兴趣分（中/高刷屏或问题弹幕命中）阈值制动态定员，再破解入选发送者的匿名 `mid_hash`（MITM 中间相遇 CRC32 反查 + 评论/充电名单/互动弹幕/视频元信息（UP主/联合投稿staff/简介@提及 desc_v2）明文 UID 交叉验证 + 全局映射库）；问题评论达阈值（严重度≥COMMENT_AUTHOR_MIN_SEVERITY 或 命中≥COMMENT_AUTHOR_MIN_HITS 条）的作者凭明文 UID 以合成键 `cmt:{uid}` 直引画像名单（senders 表 method="问题评论"、danmaku_count=0），对每个发送者做四维度深度画像（主页信息、互动足迹、社交关系、行为模式），可选调用 LLM 对兴趣分 top K 重点深掘生成 AI 画像（llm_cache 缓存，全员粗筛已砍），最终输出交互式 Web 报告（根目录 `web.py`，Flask 本地服务 127.0.0.1:8000，六标签页：概览/用户画像/弹幕浏览器/问题弹幕榜/评论争执榜（「争执焦点」问题回复按 parent_rpid 还原 A→B 攻击边、挑事者/被围攻者双榜附代表原文 + 「问题评论榜」全部问题评论按 点赞+回复数×权重 热度降序、楼中楼附父评原文）/高回复评论（潜在争执热点：回复数达阈值的评论单独成页，完整回复树按 parent_rpid 嵌套缩进、默认折叠可展开，评论者直接显示用户名（comments.uname），楼主/UP主身份徽标，问题评论分色标注），原"完整报告"标签页已移除、由 @media print 打印样式替代；概览页含操作条（返回首页/重新生成/删除/导出下载）、弹幕密度时间轴（按视频内时间分桶直方图，点击柱条跳转视频对应时段核验）、解析质量区块（解析方式/置信度分布 + 碰撞风险人数）；问题弹幕/问题评论条目带「误报」人工纠偏按钮（false_positive 表持久化，弹幕按内容、评论按 rpid，标记后不计入聚合与用户疑似分、可撤销，跨重跑保留，删除报告时清除）；首页含跨视频重叠用户面板（≥2 个已分析视频都出现过的发送者，视频条目可展开查看该用户在其中的弹幕/评论明细样本）；用户卡片含「其他视频足迹」区块（该用户在其他已分析视频中的弹幕与评论样本）与毕业院校徽标（school），并可经高回复评论作者进入「用户互动时间线」页（/user/<uid>，该用户在全部已分析视频中的弹幕/评论按最近互动倒序）；标签页/弹幕筛选状态写入 URL 可分享；弹幕浏览器支持勾选 mid_hash 手动触发强制分析（后台 job：UID解析+采集+画像+LLM深掘，失败明细透出可重试）；报告页操作条支持删除报告/重新生成（后台完整重跑流水线）；报告页整页 HTML 按 bvid 内存缓存（_PAGE_CACHE 存数据指纹+HTML，job 完成/删除/误报标记时主动失效，且每请求比对五表聚合指纹、外部进程 run.py 落库变化也能检出自动重渲染）；Chart.js 与 wordcloud2 已本地化到 static/（离线可用）；run.py/quick_test.py 分析完毕自动启动 web.py 并打开报告页（WEB_AUTOSTART 可关）；静态单文件 HTML 已完全移除）。
+**B站弹幕发送者用户画像分析系统**：输入视频 BV 号，采集该视频的全部弹幕（实时弹幕池 + 历史快照），先做本地刷屏检测 + LLM 问题弹幕检测（八类：中二抒情/尬夸捧杀/引战阴阳/人身攻击/恶意剧透/广告引流/键政敏感/批评吐槽，二游社区语境口径，结果按 llm_cache 缓存）+ LLM 问题评论检测（同八类口径，回写 comments.problem 列，`cmt:{bvid}:*` 缓存），按兴趣分（中/高刷屏或问题弹幕命中）阈值制动态定员，再破解入选发送者的匿名 `mid_hash`（MITM 中间相遇 CRC32 反查 + 评论/充电名单/互动弹幕/视频元信息（UP主/联合投稿staff/简介@提及 desc_v2）明文 UID 交叉验证 + 全局映射库）；问题评论达阈值（严重度≥COMMENT_AUTHOR_MIN_SEVERITY 或 命中≥COMMENT_AUTHOR_MIN_HITS 条）的作者凭明文 UID 以合成键 `cmt:{uid}` 直引画像名单（senders 表 method="问题评论"、danmaku_count=0），对每个发送者做四维度深度画像（主页信息、互动足迹、社交关系、行为模式），可选调用 LLM 对兴趣分 top K 重点深掘生成 AI 画像（llm_cache 缓存，全员粗筛已砍），最终输出交互式 Web 报告（根目录 `web.py`，Flask 本地服务 127.0.0.1:8000，七标签页：概览/用户画像/弹幕浏览器/问题弹幕榜/争执焦点（问题回复按 parent_rpid 还原 A→B 攻击边、挑事者/被围攻者双榜附代表原文（被围攻者成对展示受害原评+攻击者攻击原文；名额随攻击边数动态浮动：保底 ATTACK_FOCUS_TOP_N=5、每10边+1、封顶 ATTACK_FOCUS_MAX_N=20；顶部关系图画布（环状放射：被围攻者居中、挑事者环绕四周，SVG 箭头线指向受害者、随攻击者分色，节点大小/线粗映射攻击次数，平行边交替弯曲防重叠，悬停节点高亮其关系边，点击节点定位到下方明细条目）））/问题评论榜（全部问题评论按 点赞+回复数×权重 热度降序、楼中楼附父评原文）/高回复评论（潜在争执热点：回复数达阈值的评论单独成页，完整回复树按 parent_rpid 嵌套缩进、默认折叠可展开，评论者直接显示用户名（comments.uname），楼主/UP主身份徽标，问题评论分色标注；悬停评论组静止600ms弹该组讨论主题词云（data-wc 服务端注入词频，复用 wc-popup）），原"完整报告"标签页已移除、由 @media print 打印样式替代；概览页含操作条（返回首页/重新生成/删除/导出下载）、弹幕密度时间轴（按视频内时间分桶直方图，点击柱条跳转视频对应时段核验）、解析质量区块（解析方式/置信度分布 + 碰撞风险人数）；问题弹幕/问题评论条目带「误报」人工纠偏按钮（false_positive 表持久化，弹幕按内容、评论按 rpid，标记后不计入聚合与用户疑似分、可撤销，跨重跑保留，删除报告时清除）；首页含跨视频重叠用户面板（≥2 个已分析视频都出现过的发送者，视频条目可展开查看该用户在其中的弹幕/评论明细样本）；用户卡片含「其他视频足迹」区块（该用户在其他已分析视频中的弹幕与评论样本）与毕业院校徽标（school），并可经高回复评论作者进入「用户互动时间线」页（/user/<uid>，该用户在全部已分析视频中的弹幕/评论按最近互动倒序）；标签页/弹幕筛选状态写入 URL 可分享；弹幕浏览器支持勾选 mid_hash 手动触发强制分析（后台 job：UID解析+采集+画像+LLM深掘，失败明细透出可重试）；报告页操作条支持删除报告/重新生成（后台完整重跑流水线）；报告页整页 HTML 按 bvid 内存缓存（_PAGE_CACHE 存数据指纹+HTML，job 完成/删除/误报标记时主动失效，且每请求比对六表聚合指纹（含 face_cache 头像缓存）、外部进程 run.py 落库变化也能检出自动重渲染）；Chart.js 与 wordcloud2 已本地化到 static/（离线可用）；run.py/quick_test.py 分析完毕自动启动 web.py 并打开报告页（WEB_AUTOSTART 可关）；静态单文件 HTML 已完全移除）。
 
 - 纯 Python 3 项目，无构建系统（无 pyproject.toml / setup.py / package.json），依赖通过 `requirements.txt` 管理。
 - 主要依赖：`requests`（HTTP）、`lxml`（弹幕 XML 解析）、`qrcode` + `pillow`（扫码登录）、`openai`（LLM 客户端）、`pycryptodome`、`flask`（Web 报告服务）。
@@ -53,7 +53,7 @@ src/
 ├── uid_resolver.py      # mid_hash 破解：评论/充电名单/互动弹幕/视频元信息（main.build_video_meta_uid_map）/全局库交叉验证 + MITM 反查碰撞消歧
 ├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（10万条内存小表，覆盖全部 ≤10 位 UID，秒级）
 ├── spam_detector.py     # 刷屏检测：只标记风险等级（高/中/低），绝不删除弹幕数据
-├── cringe_detector.py   # LLM 问题弹幕检测（七类判定+发送者聚合+llm_cache缓存）+ 问题评论检测（同口径，按 rpid 标注回写 comments.problem，未配置 LLM_API_KEY 自动跳过）
+├── cringe_detector.py   # LLM 问题弹幕检测（八类判定+发送者聚合+llm_cache缓存，key 带口径版本号 v3）+ 问题评论检测（同口径，按 rpid 标注回写 comments.problem，未配置 LLM_API_KEY 自动跳过）
 ├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；阶段5支持主号+小号池按 uid 轮转分摊，风控号当场剔除换号重试）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
 ├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存；全员粗筛已砍，未配置 Key 自动跳过）
@@ -70,7 +70,7 @@ src/
 - **限速是硬约束**：B站 API 有风控，`config.py` 中 `REQUEST_DELAY` / `REQUEST_DELAY_LONG` 为区间值（基础 0.8–1.6s、高风险 2–4s，区间内随机取时长以消除固定节奏特征），触发风控（-412/HTTP412/重签无效的-352/-403）时自适应倍率 ×1.5 上调（上限 5.0，由 `ADAPTIVE_THROTTLE_*` 控制）、业务成功后缓慢回落，重试最多 3 次指数退避。新增 API 调用必须走 `BiliAPIClient`，不要绕过限速直接发请求。
 - **失败要降级而非中断**：例如评论采集失败时回退为仅用 CRC32 破解；LLM 分析失败只打印警告。单个用户采集异常不得中断整体流水线。
 - **不删除数据**：刷屏检测只标记 `spam_level`，不删除任何弹幕。
-- 采集规模由 `config.py` 中的 `MAX_*` 常量控制（评论 100 页、子评论补采 25 页/条、动态定员上限 ANALYZE_USERS_FLOOR=300 / ANALYZE_USERS_RATIO=0.05 / MAX_ANALYZE_USERS_HARD_CAP=1000（保底/按比例上浮/绝对封顶）、深掘 LLM_DEEP_TOP_K=20、问题弹幕批大小 CRINGE_BATCH_SIZE=200、问题评论批次/上限 COMMENT_CRINGE_BATCH_SIZE=100 / COMMENT_CRINGE_MAX_ITEMS=2000、问题评论作者直引阈值 COMMENT_AUTHOR_MIN_SEVERITY=2 / COMMENT_AUTHOR_MIN_HITS=2、问题评论榜 COMMENT_HEAT_REPLY_WEIGHT=10 / PROBLEM_COMMENT_TOP_N=30、争执焦点 ATTACK_FOCUS_TOP_N=5、密度时间轴桶数 DENSITY_BUCKETS=60、跨视频面板 CROSS_VIDEO_MIN_VIDEOS=2 / CROSS_VIDEO_MAX_USERS=50 等），调优时改这里而不是散落在代码里的数字。
+- 采集规模由 `config.py` 中的 `MAX_*` 常量控制（评论 100 页、子评论补采 25 页/条、动态定员上限 ANALYZE_USERS_FLOOR=300 / ANALYZE_USERS_RATIO=0.05 / MAX_ANALYZE_USERS_HARD_CAP=1000（保底/按比例上浮/绝对封顶）、深掘 LLM_DEEP_TOP_K=20、问题弹幕批大小 CRINGE_BATCH_SIZE=200、问题评论批次/上限 COMMENT_CRINGE_BATCH_SIZE=100 / COMMENT_CRINGE_MAX_ITEMS=2000、问题评论作者直引阈值 COMMENT_AUTHOR_MIN_SEVERITY=2 / COMMENT_AUTHOR_MIN_HITS=2、问题评论榜 COMMENT_HEAT_REPLY_WEIGHT=10 / PROBLEM_COMMENT_TOP_N=30、争执焦点 ATTACK_FOCUS_TOP_N=5 / ATTACK_FOCUS_MAX_N=20（保底/封顶，按攻击边数浮动）、密度时间轴桶数 DENSITY_BUCKETS=60、跨视频面板 CROSS_VIDEO_MIN_VIDEOS=2 / CROSS_VIDEO_MAX_USERS=50 等），调优时改这里而不是散落在代码里的数字。
 - 输出文件：`data/reports/report_{BV号}_{时间}.csv/.json`（CSV/JSON 导出，web.py 报告页提供下载链接）、`data/profiler.db`（数据库）、`data/cookie.json`（登录态）。
 
 ## 测试说明
@@ -85,5 +85,5 @@ src/
 ## 安全注意事项
 
 - `src/config.py` 含 LLM API Key 默认值、`data/cookie.json` 与 `data/cookies/`（小号池）含 B站登录凭证，以上连同 `data/profiler.db`、`data/reports/`、`data/qrcode.png` 均已在 `.gitignore` 中排除——**不要把它们提交进仓库或打印到日志**。
-- LLM 配置走环境变量覆盖：`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_MAX_TOKENS`，优先用环境变量而非改 `config.py` 里的硬编码 Key。
+- LLM 配置走环境变量覆盖：`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_MAX_TOKENS`，优先用环境变量而非改 `config.py` 里的硬编码 Key。双厂商：`LLM_PROVIDER=mimo` 切换到小米 MiMo（`MIMO_API_KEY` / `MIMO_BASE_URL` / `MIMO_MODEL`，默认 mimo-v2.5），llm_cache key 含模型名，两厂商缓存互不污染可 A/B 对比。
 - Cookie 等于账号登录态，泄露即等于账号被盗，处理 `data/` 目录文件时保持谨慎。

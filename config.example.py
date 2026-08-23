@@ -130,7 +130,8 @@ COMMENT_HEAT_REPLY_WEIGHT = 10     # 热度 = 点赞 + 回复数 × 该权重（
 PROBLEM_COMMENT_TOP_N = 30         # 榜单最多展示条数
 
 # 争执焦点区块（高回复评论页顶部：问题回复按 parent_rpid 还原「谁攻击谁」）
-ATTACK_FOCUS_TOP_N = 5             # 挑事者/被围攻者各展示的名额
+ATTACK_FOCUS_TOP_N = 5             # 挑事者/被围攻者双榜保底名额
+ATTACK_FOCUS_MAX_N = 20            # 名额上限；实际名额随攻击边数浮动：每10条攻击边+1
 
 # ========== Web 报告配置 ==========
 WEB_AUTOSTART = True   # run.py/quick_test.py 分析完毕自动启动 web.py 并用浏览器打开报告页（False 关闭）
@@ -142,3 +143,12 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "16384"))
+
+# 第二套 LLM：小米 MiMo（备选）。LLM_PROVIDER=mimo 切换启用；
+# 两套缓存按模型名隔离（cache key 含模型名），可同视频 A/B 对比判定质量
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "deepseek")   # deepseek | mimo
+MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
+MIMO_BASE_URL = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
+MIMO_MODEL = os.environ.get("MIMO_MODEL", "mimo-v2.5")
+if LLM_PROVIDER == "mimo":
+    LLM_API_KEY, LLM_BASE_URL, LLM_MODEL = MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL
