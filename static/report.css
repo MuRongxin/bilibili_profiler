@@ -197,13 +197,17 @@
 .af-quote { font-size:13px; color:#666; background:#fafafa; border-left:3px solid #eee;
     padding:4px 10px; margin:6px 0 0; border-radius:0 6px 6px 0; word-break:break-all; }
 .af-quote-atk { border-left-color:#e53935; background:#fdf3f3; color:#555; }
-/* 争执焦点：关系图画布（二分图，节点=用户，边=攻击关系） */
-.af-graph { margin:6px 0 14px; border:1px solid #f0e0e0; border-radius:10px; background:#fffdf8; overflow-x:auto; }
+/* 争执焦点：关系图画布（可拖动/缩放视口，内容挂在一个变换 <g> 上） */
+.af-graph { margin:6px 0 14px; border:1px solid #f0e0e0; border-radius:10px; background:#fffdf8;
+    height:72vh; min-height:540px; overflow:hidden; cursor:grab; position:relative; }
+.af-graph:active { cursor:grabbing; }
+.af-graph-hint { position:absolute; right:12px; bottom:10px; font-size:12px; color:#bbb;
+    pointer-events:none; user-select:none; }
 .af-node { cursor:pointer; }
 .af-node-a { fill:#e53935; fill-opacity:.75; }
 .af-node-v { fill:#1e88e5; fill-opacity:.75; }
-.af-node text.af-lab { font-size:12px; fill:#555; paint-order:stroke; stroke:#fffdf8; stroke-width:3px; }
-.af-node text.af-lab-v { font-size:11px; }
+.af-node text.af-lab { font-size:14px; fill:#555; paint-order:stroke; stroke:#fffdf8; stroke-width:3.5px; }
+.af-node text.af-lab-v { font-size:13px; }
 .af-edge { fill:none; stroke:#e53935; stroke-opacity:0.3; transition:stroke-opacity .15s; }
 .af-edge.af-edge-hot { stroke-opacity:0.95; }
 .af-flash { outline:2px solid #e53935; border-radius:8px; }

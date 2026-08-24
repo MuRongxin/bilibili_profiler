@@ -795,22 +795,29 @@ def _attack_focus_html(data: dict) -> str:
     top_n = data.get("top_n", ATTACK_FOCUS_TOP_N)
     shown_attackers = data["attackers"][:top_n]
     shown_victims = data["victims"][:top_n]
-    # 关系图画布数据（P3-a 重做为二分图）：仅保留两侧都上榜的配对；
-    # links 带权重（攻击次数），nodes 带阵营/计数，供 SVG 画布渲染节点与边
-    shown_v_uids = {e["uid"] for e in shown_victims}
-    names = data["names"]
+    # 关系图画布数据：图节点按 uid 合并——同一人既是挑事者也是被围攻者时只画一个节点
+    # （na=攻击次数 / nv=被攻击次数，攻击链 A→X→B 通过指向ta的边+ta发出的边体现）；
+    # links 的端点放宽到任一身份上榜（链条边：目标仅以挑事者身份上榜也保留）
+    merged: dict[int, dict] = {}
     faces = data.get("faces", {})
-    graph_nodes = ([{"id": e["uid"], "name": e["name"], "side": "a", "n": e["count"],
-                     "face": faces.get(e["uid"], "")} for e in shown_attackers]
-                   + [{"id": e["uid"], "name": e["name"], "side": "v", "n": e["count"],
-                       "face": faces.get(e["uid"], "")} for e in shown_victims])
+    for e in shown_attackers:
+        ent = merged.setdefault(e["uid"], {"id": e["uid"], "name": e["name"],
+                                           "na": 0, "nv": 0, "face": faces.get(e["uid"], "")})
+        ent["na"] = e["count"]
+    for e in shown_victims:
+        ent = merged.setdefault(e["uid"], {"id": e["uid"], "name": e["name"],
+                                           "na": 0, "nv": 0, "face": faces.get(e["uid"], "")})
+        ent["nv"] = e["count"]
+    graph_nodes = list(merged.values())
+    shown_uids = set(merged)
     graph_links = [{"s": e["uid"], "t": v, "w": n}
                    for e in shown_attackers
-                   for v, n in e["victims"].most_common() if v in shown_v_uids]
+                   for v, n in e["victims"].most_common() if v in shown_uids]
     graph = {"nodes": graph_nodes, "links": graph_links}
     graph_html = ""
     if graph_links:
         graph_html = (f'<div class="af-graph" data-af-graph=\'{json.dumps(graph, ensure_ascii=False)}\'>'
+                      f'<div class="af-graph-hint">🖱 拖空白平移 · 滚轮缩放 · 拖头像调位置</div>'
                       f'</div>')
     a_html = "".join(_item(e, "攻击 {} 次", "主要对象：", _opp_text(e["victims"]), "攻击")
                      for e in shown_attackers)
@@ -818,7 +825,7 @@ def _attack_focus_html(data: dict) -> str:
     return f'''
     <div class="cringe-board af-board">
         <h3>⚔️ 争执焦点（谁攻击谁：问题回复按 parent_rpid 还原攻击边 {data.get("edges", 0)} 条；
-            环状画布：被围攻者居中、挑事者环绕，箭头线指向受害者，节点大小/线粗映射攻击次数，悬停节点高亮其关系，点击定位到下方明细）</h3>
+            多圆簇画布：每个冲突簇一个小圆（受害者居中、攻击者环绕），同一人只画一个节点——既攻击又被攻击的链条节点同时有进出边（标签显示 攻×n 被×n），箭头线随攻击者分色，节点大小/线粗映射攻击次数，悬停节点高亮其关系，点击定位到下方明细）</h3>
         {graph_html}
         <div class="af-cols">
             <div class="af-col"><h4>🗡 挑事者 Top{top_n}</h4>{a_html}</div>
@@ -1372,6 +1379,7 @@ def index():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="no-referrer">
 <title>B站弹幕用户画像分析 - 视频列表</title>
 <style>{REPORT_CSS}</style>
 <link rel="stylesheet" href="/static/index.css">
@@ -1595,6 +1603,7 @@ def video_page(bvid: str):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="no-referrer">
 <title>{esc(title)} - B站弹幕用户画像分析</title>
 <script src="/static/chart.umd.min.js"></script>
 <script src="/static/wordcloud2.min.js"></script>
@@ -1747,6 +1756,7 @@ def user_page(uid: int):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="no-referrer">
 <title>{esc(name)} 互动时间线 - B站弹幕用户画像分析</title>
 <style>{REPORT_CSS}</style>
 <link rel="stylesheet" href="/static/report.css">
@@ -2043,6 +2053,7 @@ def not_found(e):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="no-referrer">
 <title>404 - B站弹幕用户画像分析</title>
 <style>{REPORT_CSS}</style>
 <link rel="stylesheet" href="/static/report.css">

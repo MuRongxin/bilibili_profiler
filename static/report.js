@@ -170,7 +170,8 @@ document.querySelectorAll('.hot-item[data-wc]').forEach(item => {
     });
 });
 
-// ===== 争执焦点：关系图画布（环状放射：被围攻者居中，挑事者环绕四周，箭头指向受害者） =====
+// ===== 争执焦点：关系图画布（多圆簇：受害者居中、攻击者环绕；同一人只画一个节点，
+// 既攻击又被攻击的"链条"节点通过指向ta的边+ta发出的边体现） =====
 function drawAfEdges() {
     const box = document.querySelector('.af-graph');
     if (!box) return;
@@ -180,78 +181,137 @@ function drawAfEdges() {
     if (!g.nodes || !g.links || !g.links.length) return;
     const W = box.clientWidth || 800;
     if (W === 0) return;   // 标签页未显示（宽度为0），等可见时再画
-    const attackers = g.nodes.filter(n => n.side === 'a');
-    const victims = g.nodes.filter(n => n.side === 'v');
     const svgNS = 'http://www.w3.org/2000/svg';
+    // 出入度：inDeg>0 的节点是受害者（可能同时是攻击者=链条节点），inDeg=0 是纯攻击者
+    const inDeg = {}, outDeg = {};
+    g.links.forEach(l => {
+        inDeg[l.t] = (inDeg[l.t] || 0) + 1;
+        outDeg[l.s] = (outDeg[l.s] || 0) + 1;
+    });
+    g.nodes.forEach(n => { n.n = (n.na || 0) + (n.nv || 0); });
     const maxN = Math.max(...g.nodes.map(n => n.n), 1);
     const maxW = Math.max(...g.links.map(l => l.w), 1);
-    const rOf = n => 8 + 10 * Math.sqrt(n.n / maxN);
-    // 每个挑事者一个颜色，其连出的边/箭头同色
+    // 节点半径随总涉及次数线性放大（攻击/被攻击越多头像越大）
+    const rOf = n => 9 + 21 * (n.n / maxN);
+    // 每个发过攻击的节点一个颜色，其连出的边/箭头同色
     const PALETTE = ['#e53935', '#fb8c00', '#8e24aa', '#3949ab', '#00897b', '#7cb342',
                      '#c0ca33', '#6d4c41', '#d81b60', '#00acc1', '#5e35b1', '#f4511e',
                      '#43a047', '#1e88e5', '#757575', '#c2185b'];
     const aColor = {};
-    attackers.forEach((n, i) => { aColor[String(n.id)] = PALETTE[i % PALETTE.length]; });
+    const colorNodes = g.nodes.filter(n => n.na > 0);
+    colorNodes.forEach((n, i) => { aColor[String(n.id)] = PALETTE[i % PALETTE.length]; });
 
-    // 环状布局（连线交叉最小化）：连通分量锚定法——
-    // 外圈：无边攻击者占接缝顶部，随后各分量（hub受害组/1:1对）的攻击者连续占位；
-    // 内圈：无边受害者同样占顶部，有边受害者锚定到其攻击者弧的环状中心（组内微偏移）。
-    // 每个分量的边全部落在自己的楔块内，分量间不交叉（实测交叉数 0，旧排布 11）
-    const R = Math.max(170, attackers.length * 15);
-    const Ri = Math.min(Math.max(46, victims.length * 9), R * 0.6);
-    const cx = W / 2, cy = R + 76;
-    const H = cy + R + 76;
-    const svg = document.createElementNS(svgNS, 'svg');
-    svg.setAttribute('width', W);
-    svg.setAttribute('height', H);
+    // 并查集求连通分量（按 uid 合并后的单节点图，边即攻击关系）
     const byId = {};
-    g.nodes.forEach(n => { byId[String(n.id) + n.side] = n; });  // 同一人可能两侧都出现，按 side 区分
-    // 并查集求连通分量（有边节点）
+    g.nodes.forEach(n => { byId[String(n.id)] = n; });
     const parent = {};
-    g.nodes.forEach(n => { parent[String(n.id) + n.side] = String(n.id) + n.side; });
+    g.nodes.forEach(n => { parent[String(n.id)] = String(n.id); });
     const find = k => { while (parent[k] !== k) { parent[k] = parent[parent[k]]; k = parent[k]; } return k; };
     const linked = new Set();
     g.links.forEach(l => {
-        const ka = String(l.s) + 'a', kv = String(l.t) + 'v';
-        if (byId[ka] && byId[kv]) { parent[find(ka)] = find(kv); linked.add(ka); linked.add(kv); }
+        const ks = String(l.s), kt = String(l.t);
+        if (byId[ks] && byId[kt]) { parent[find(ks)] = find(kt); linked.add(ks); linked.add(kt); }
     });
     const comps = {};
     g.nodes.forEach(n => {
-        const key = String(n.id) + n.side;
+        const key = String(n.id);
         if (linked.has(key)) (comps[find(key)] = comps[find(key)] || []).push(n);
     });
     const compList = Object.values(comps).sort((a, b) =>
         b.reduce((s, n) => s + n.n, 0) - a.reduce((s, n) => s + n.n, 0));   // 大的分量先排
-    // 外圈定位
-    const aOrder = attackers.filter(n => !linked.has(String(n.id) + 'a'));
-    compList.forEach(comp =>
-        comp.filter(n => n.side === 'a').sort((x, y) => y.n - x.n).forEach(n => aOrder.push(n)));
-    const stepA = 2 * Math.PI / attackers.length;
-    aOrder.forEach((n, i) => {
-        n.ang = -Math.PI / 2 + i * stepA;
-        n.x = cx + R * Math.cos(n.ang);
-        n.y = cy + R * Math.sin(n.ang);
+
+    // 多圆簇布局：每个连通分量一个独立小圆——受害者（含链条节点）居中、纯攻击者环绕；
+    // 无边节点没有边要表达，用紧凑网格簇而不是大圆环（大环是纵向空间的最大浪费源）；
+    // 簇按半径网格流式排布，大簇先放。边不出簇 → 天然零交叉；簇间网格隔离 → 不互相压
+    const clusters = compList.map(comp => {
+        const centers = comp.filter(n => (inDeg[n.id] || 0) > 0).sort((x, y) => y.n - x.n);
+        const ring = comp.filter(n => (inDeg[n.id] || 0) === 0).sort((x, y) => y.n - x.n);
+        return {centers, ring, w: comp.reduce((s, n) => s + n.n, 0)};
     });
-    // 内圈定位：无边受害者占顶部；有边的锚定分量中心 + 组内微偏移；标签内外交错防重叠
-    const stepV = 2 * Math.PI / victims.length;
-    victims.filter(n => !linked.has(String(n.id) + 'v')).forEach((n, i) => {
-        n.ang = -Math.PI / 2 + i * stepV;
-        n.labIn = i % 2 === 1;
+    const freeNs = g.nodes.filter(n => !linked.has(String(n.id)));
+    if (freeNs.length) clusters.push({centers: [], ring: [], free: freeNs, w: 0});
+    clusters.forEach(c => {
+        if (c.free) {
+            // 无边节点网格簇：节点+标签为一格，行列近似方形
+            const cellW = 120, cellH = 84;
+            c.cols = Math.ceil(Math.sqrt(c.free.length));
+            c.rows = Math.ceil(c.free.length / c.cols);
+            c.halfW = c.cols * cellW / 2;
+            c.halfH = c.rows * cellH / 2;
+            c.rad = 0;
+            return;
+        }
+        const ringN = c.ring.length;
+        const maxRingR = ringN ? Math.max(...c.ring.map(rOf)) : 0;
+        const maxCenterR = c.centers.length ? Math.max(...c.centers.map(rOf)) : 0;
+        // 簇半径按节点实际尺寸计算（留白从宽，宁大勿小——边太短会看不清箭头指向）：
+        // 环上相邻节点弦长 ≥ 直径和+34，环上节点与中心受害者 ≥ 半径和+56
+        let rad = 110;
+        if (ringN > 0) {
+            rad = Math.max(rad, ringN * 26);
+            if (ringN >= 2)
+                rad = Math.max(rad, (maxRingR * 2 + 34) / (2 * Math.sin(Math.PI / ringN)));
+            rad = Math.max(rad, maxCenterR + maxRingR + 56);
+        }
+        c.rad = rad;
+        // 标签余量：切线旋转标签的最大延伸 = off(≈32) + 8字文本宽(≈95)，给足防簇间串字
+        c.halfW = rad + 130;
+        c.halfH = rad + 100;
     });
-    compList.forEach(comp => {
-        const vs = comp.filter(n => n.side === 'v').sort((x, y) => y.n - x.n);
-        if (!vs.length) return;
-        let sx = 0, sy = 0;
-        comp.filter(n => n.side === 'a').forEach(n => { sx += Math.cos(n.ang); sy += Math.sin(n.ang); });
-        const center = Math.atan2(sy, sx);
-        vs.forEach((n, i) => {
-            n.ang = center + (i - (vs.length - 1) / 2) * stepV * 0.5;
-            n.labIn = i % 2 === 1;
+    clusters.sort((a, b) => b.halfW - a.halfW || b.w - a.w);
+    // 虚拟布局宽度大于视口（横向排列，每行更多簇；画布可平移缩放，不必塞进一屏）
+    const LW = W * 1.35;
+    const GAP = 48, MARGIN = 30;
+    let gx = MARGIN, gy = 0, rowH = 0, maxRowW = 0;
+    clusters.forEach(c => {
+        if (gx > MARGIN && gx + c.halfW * 2 > LW - MARGIN) {
+            maxRowW = Math.max(maxRowW, gx - GAP);
+            gx = MARGIN; gy += rowH + GAP; rowH = 0;
+        }
+        c.cx = gx + c.halfW; c.cy = gy + c.halfH;
+        gx += c.halfW * 2 + GAP;
+        rowH = Math.max(rowH, c.halfH * 2);
+    });
+    maxRowW = Math.max(maxRowW, gx - GAP);
+    // 整体放大：内容没占满布局宽度时按比例放大簇中心与簇半径（节点大小不变、边拉长，
+    // 避免大片空白下簇挤作一团），上限 1.8 倍
+    const zoom = Math.min(1.8, (LW - MARGIN * 2) / Math.max(maxRowW, 1));
+    if (zoom > 1)
+        clusters.forEach(c => { c.cx *= zoom; c.cy *= zoom; c.rad *= zoom; });
+    const H = (gy + rowH) * zoom + 26;
+    // 视口结构：af-graph 是固定高度的可拖拽/缩放视口，全部内容挂在一个 <g> 变换组上
+    const svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('width', W);
+    svg.setAttribute('height', '100%');
+    const view = document.createElementNS(svgNS, 'g');
+    svg.appendChild(view);
+    const svgRoot = svg, content = view;   // 后续内容全部挂 content，svgRoot 仅作容器
+    // 簇内定位：受害者（含链条节点）居中（多个并排），纯攻击者沿小圆环绕；无边簇网格排布
+    clusters.forEach(c => {
+        if (c.free) {
+            // 网格簇：标签放节点正上方（center 同款 labUp=false 样式，用 grid 标记）
+            c.free.forEach((n, i) => {
+                n.grid = true;
+                n.x = c.cx + (i % c.cols - (c.cols - 1) / 2) * 120;
+                n.y = c.cy + (Math.floor(i / c.cols) - (c.rows - 1) / 2) * 84;
+            });
+            return;
+        }
+        // 中心受害者按实际直径累计放置（大头像不重叠，间距放宽至 20px）；标签上下交错
+        // （节点间距≈直径和+20，但 8 字标签宽 ~85px，全放下方必撞）
+        let vx = c.cx - (c.centers.reduce((s, n) => s + rOf(n) * 2, 0) + (c.centers.length - 1) * 20) / 2;
+        c.centers.forEach((n, i) => {
+            n.center = true;
+            n.labUp = i % 2 === 1;
+            n.x = vx + rOf(n);
+            n.y = c.cy;
+            vx += rOf(n) * 2 + 20;
         });
-    });
-    victims.forEach(n => {
-        n.x = cx + Ri * Math.cos(n.ang);
-        n.y = cy + Ri * Math.sin(n.ang);
+        c.ring.forEach((n, i) => {
+            n.ang = -Math.PI / 2 + i * 2 * Math.PI / c.ring.length;
+            n.x = c.cx + c.rad * Math.cos(n.ang);
+            n.y = c.cy + c.rad * Math.sin(n.ang);
+        });
     });
 
     // 箭头 marker 按攻击者颜色各建一个
@@ -264,7 +324,7 @@ function drawAfEdges() {
             m.setAttribute('id', id);
             m.setAttribute('viewBox', '0 0 10 10');
             m.setAttribute('refX', '9'); m.setAttribute('refY', '5');
-            m.setAttribute('markerWidth', '6'); m.setAttribute('markerHeight', '6');
+            m.setAttribute('markerWidth', '8'); m.setAttribute('markerHeight', '8');
             m.setAttribute('orient', 'auto');
             const tri = document.createElementNS(svgNS, 'path');
             tri.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z');
@@ -275,54 +335,81 @@ function drawAfEdges() {
         }
         return markerIds[color];
     };
-    svg.appendChild(defs);
+    content.appendChild(defs);
 
-    // 边：攻击者→受害者带箭头曲线；指向同一受害者的平行边交替向两侧弯曲，减少重叠
-    const perTarget = {};
-    g.links.forEach(l => {
-        const a = byId[String(l.s) + 'a'], v = byId[String(l.t) + 'v'];
-        if (!a || !v) return;
-        const idx = (perTarget[l.t] = (perTarget[l.t] || 0) + 1) - 1;
+    // 边：攻击者→受害者带箭头曲线（链条节点的出边即从中心连向另一个中心）；
+    // 指向同一受害者的平行边交替向两侧弯曲，减少重叠。edgeRecs 记录每条边的端点与弯曲量，
+    // 节点被拖动时按此重算路径
+    const edgeD = (a, v, off) => {
         const dx = v.x - a.x, dy = v.y - a.y;
         const len = Math.hypot(dx, dy) || 1;
         const ux = dx / len, uy = dy / len;
-        const color = aColor[String(l.s)] || '#e53935';
-        // 起点=攻击者节点边缘，终点=受害者节点边缘再退 8px 给箭头留位
-        const sx = a.x + ux * rOf(a), sy = a.y + uy * rOf(a);
-        const ex = v.x - ux * (rOf(v) + 8), ey = v.y - uy * (rOf(v) + 8);
-        const off = (idx % 2 ? 1 : -1) * Math.ceil(idx / 2) * 14;   // 交替两侧、逐条加宽
+        // 起点=攻击者节点中心（被节点盖住不露端头）；终点=受害者节点边缘退箭头位，
+        // 退缩量按边长自适应——短边若全额退缩只剩 1px 线段，会变成节点旁的小疙瘩
+        const sx = a.x, sy = a.y;
+        const inset = Math.min(rOf(v) + 8, len * 0.4);
+        const ex = v.x - ux * inset, ey = v.y - uy * inset;
         const qx = (sx + ex) / 2 - uy * off, qy = (sy + ey) / 2 + ux * off;
+        return `M ${sx} ${sy} Q ${qx} ${qy} ${ex} ${ey}`;
+    };
+    const edgeRecs = [];
+    const perTarget = {};
+    g.links.forEach(l => {
+        const a = byId[String(l.s)], v = byId[String(l.t)];
+        if (!a || !v) return;
+        const idx = (perTarget[l.t] = (perTarget[l.t] || 0) + 1) - 1;
+        const color = aColor[String(l.s)] || '#e53935';
+        const off = (idx % 2 ? 1 : -1) * Math.ceil(idx / 2) * 14   // 交替两侧、逐条加宽
+                  * Math.min(1, Math.hypot(v.x - a.x, v.y - a.y) / 120);  // 短边少弯，防弯成钩子
         const p = document.createElementNS(svgNS, 'path');
-        p.setAttribute('d', `M ${sx} ${sy} Q ${qx} ${qy} ${ex} ${ey}`);
+        p.setAttribute('d', edgeD(a, v, off));
         p.setAttribute('class', 'af-edge');
         p.style.stroke = color;
         p.style.strokeWidth = (1 + 3 * l.w / maxW).toFixed(1);
         p.setAttribute('marker-end', `url(#${markerFor(color)})`);
         p.dataset.uids = `${l.s},${l.t}`;
-        svg.appendChild(p);
+        content.appendChild(p);
+        edgeRecs.push({p, a, v, off});
     });
 
-    // 节点：圆点+名字×次数；攻击者标签放外圈外侧，受害者标签沿径向放内圈外侧
+    // 节点：头像+名字×次数；居中受害者标签放正上/下方，环上标签沿切线旋转
+    let nodeDrag = null, nlx = 0, nly = 0;   // 节点拖动状态（pointermove 在 st 定义后注册）
     g.nodes.forEach(n => {
         const gEl = document.createElementNS(svgNS, 'g');
         gEl.setAttribute('class', 'af-node');
         const c = document.createElementNS(svgNS, 'circle');
         c.setAttribute('cx', n.x); c.setAttribute('cy', n.y);
         c.setAttribute('r', rOf(n).toFixed(1));
-        c.setAttribute('class', n.side === 'a' ? 'af-node-a' : 'af-node-v');
-        if (n.side === 'a') c.style.fill = aColor[String(n.id)];   // 挑事者节点与边同色
+        c.setAttribute('class', n.na > 0 ? 'af-node-a' : 'af-node-v');
+        if (n.na > 0) c.style.fill = aColor[String(n.id)];   // 攻击者节点与边同色
         const t = document.createElementNS(svgNS, 'text');
-        const maxLen = n.side === 'a' ? 10 : 8;   // 受害者标签更短，内圈位置紧张
+        const maxLen = 8;   // 标签统一截 8 字，配合簇半径余量防越界
         const label = n.name.length > maxLen ? n.name.slice(0, maxLen) + '…' : n.name;
-        const cos = Math.cos(n.ang), sin = Math.sin(n.ang);
-        // 攻击者标签放外圈外侧；受害者标签内外交错 + 白色光晕描边（内圈节点密，防互相压字）
-        const lr = n.side === 'a' ? R + rOf(n) + 12
-                                  : Ri + (n.labIn ? -(rOf(n) + 20) : rOf(n) + 12);
-        t.setAttribute('x', cx + lr * cos);
-        t.setAttribute('y', cy + lr * sin + 4);
-        t.setAttribute('text-anchor', cos > 0.3 ? 'start' : (cos < -0.3 ? 'end' : 'middle'));
-        t.setAttribute('class', n.side === 'a' ? 'af-lab' : 'af-lab af-lab-v');
-        t.textContent = `${label} ×${n.n}`;
+        // 计数文本：双角色节点（链条）显示 攻×na 被×nv，单角色显示 ×n
+        const cnt = (n.na > 0 && n.nv > 0) ? `攻${n.na} 被${n.nv}` : `×${n.n}`;
+        const off = rOf(n) + 8;
+        let tx, ty, anchor;
+        if (n.center || n.grid) {
+            // 中心受害者上下交错防相邻标签相撞；无边网格节点统一放正上方
+            tx = n.x;
+            ty = n.y + ((n.labUp || n.grid) ? -(rOf(n) + 14) : rOf(n) + 14);
+            anchor = 'middle';
+        } else {
+            const cos = Math.cos(n.ang), sin = Math.sin(n.ang);
+            // 切线旋转：上半环 +90°，下半环 -90° 且锚点翻转为 end（判定用 sin，用 cos 会倒挂）
+            const bottom = sin > 0;
+            const deg = n.ang * 180 / Math.PI + (bottom ? -90 : 90);
+            tx = n.x + cos * off;
+            ty = n.y + sin * off + 4;
+            anchor = bottom ? 'end' : 'start';
+            t.setAttribute('transform',
+                `rotate(${deg.toFixed(1)} ${tx.toFixed(1)} ${ty.toFixed(1)})`);
+        }
+        t.setAttribute('x', tx);
+        t.setAttribute('y', ty);
+        t.setAttribute('text-anchor', anchor);
+        t.setAttribute('class', n.na > 0 ? 'af-lab' : 'af-lab af-lab-v');
+        t.textContent = `${label} ${cnt}`;
         gEl.appendChild(c);
         // 头像节点：有 face 的用圆形裁剪头像盖在色点上（加载失败移除图片，回退为色点）
         if (n.face) {
@@ -337,29 +424,101 @@ function drawAfEdges() {
             gEl.appendChild(img);
         }
         gEl.appendChild(t);
+        // 节点单独拖动：按下节点只拖节点（不动画布），边随动重算；拖动后吞掉 click
+        gEl.addEventListener('pointerdown', e => {
+            e.stopPropagation();
+            nodeDrag = {n, c, img: gEl.querySelector('image'), t,
+                        tx, ty, deg: t.getAttribute('transform') || ''};
+            nlx = e.clientX; nly = e.clientY;
+        });
         gEl.addEventListener('mouseenter', () => {
-            // side 感知：悬停攻击者只高亮"ta发出的"边（s=uid），悬停受害者只高亮"指向ta的"边（t=uid）；
-            // 同一人两侧都出现时不再把对侧的边一起点亮（旧实现用 includes 会带出别人的边）
-            const pos = n.side === 'a' ? 0 : 1;
+            // 单节点：高亮与 ta 相关的全部边（发出的+指向的，链条节点两侧关系一起亮）
             svg.querySelectorAll('.af-edge').forEach(p =>
                 p.classList.toggle('af-edge-hot',
-                    (p.dataset.uids || '').split(',')[pos] === String(n.id)));
+                    (p.dataset.uids || '').split(',').includes(String(n.id))));
         });
         gEl.addEventListener('mouseleave', () =>
             svg.querySelectorAll('.af-edge.af-edge-hot').forEach(p => p.classList.remove('af-edge-hot')));
         gEl.addEventListener('click', () => {
-            const item = document.querySelector(`.af-item[data-side="${n.side}"][data-uid="${n.id}"]`);
+            // 定位明细条目（挑事者/被围攻者两个列表都可能有 ta，取第一个命中）
+            const item = document.querySelector(`.af-item[data-uid="${n.id}"]`);
             if (item) {
                 item.scrollIntoView({behavior: 'smooth', block: 'center'});
                 item.classList.add('af-flash');
                 setTimeout(() => item.classList.remove('af-flash'), 1200);
             }
         });
-        svg.appendChild(gEl);
+        content.appendChild(gEl);
     });
     box.appendChild(svg);
+
+    // 视口交互：拖动平移 + 滚轮缩放（以光标为中心）。
+    // 默认缩放：内容恰好撑满视口宽度（k = W/LW ≈ 0.74），顶对齐；内容矮时垂直居中
+    const vh = box.clientHeight || 520;
+    const st = {x: 0, y: 16, k: Math.min(1, W / LW)};
+    st.x = (W - LW * st.k) / 2;   // 水平居中（k<1 时内容恰满宽，x≈0）
+    if (H * st.k < vh) st.y = (vh - H * st.k) / 2;
+    const apply = () => content.setAttribute('transform', `translate(${st.x} ${st.y}) scale(${st.k})`);
+    apply();
+    let dragging = false, moved = false, lx = 0, ly = 0;
+    box.addEventListener('pointerdown', e => {
+        dragging = true; moved = false;
+        lx = e.clientX; ly = e.clientY;
+        box.setPointerCapture(e.pointerId);
+    });
+    box.addEventListener('pointermove', e => {
+        if (!dragging) return;
+        const dx = e.clientX - lx, dy = e.clientY - ly;
+        if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+        lx = e.clientX; ly = e.clientY;
+        st.x += dx; st.y += dy;
+        apply();
+    });
+    box.addEventListener('pointerup', () => { dragging = false; });
+    box.addEventListener('wheel', e => {
+        e.preventDefault();
+        const rect = box.getBoundingClientRect();
+        const px = e.clientX - rect.left, py = e.clientY - rect.top;
+        const k2 = Math.min(4, Math.max(0.2, st.k * (e.deltaY < 0 ? 1.12 : 1 / 1.12)));
+        // 以光标为中心缩放：光标下的内容点保持不动
+        st.x = px - (px - st.x) * (k2 / st.k);
+        st.y = py - (py - st.y) * (k2 / st.k);
+        st.k = k2;
+        apply();
+    }, {passive: false});
+    // 拖拽后的抬起会紧跟一次 click：吞掉它，避免误触节点的"定位到明细"
+    box.addEventListener('click', e => {
+        if (moved) { e.stopPropagation(); e.preventDefault(); moved = false; }
+    }, true);
+
+    // 节点拖动：屏幕位移 ÷ 缩放系数换算回内容坐标；相连的边随动重算
+    window.addEventListener('pointermove', e => {
+        if (!nodeDrag) return;
+        const dx = (e.clientX - nlx) / st.k, dy = (e.clientY - nly) / st.k;
+        nlx = e.clientX; nly = e.clientY;
+        if (Math.abs(dx) + Math.abs(dy) > 0.5) moved = true;   // 触发 click 吞没
+        const n = nodeDrag.n;
+        n.x += dx; n.y += dy;
+        nodeDrag.c.setAttribute('cx', n.x);
+        nodeDrag.c.setAttribute('cy', n.y);
+        if (nodeDrag.img) {
+            nodeDrag.img.setAttribute('x', n.x - (rOf(n) - 1.5));
+            nodeDrag.img.setAttribute('y', n.y - (rOf(n) - 1.5));
+        }
+        nodeDrag.tx += dx; nodeDrag.ty += dy;
+        nodeDrag.t.setAttribute('x', nodeDrag.tx);
+        nodeDrag.t.setAttribute('y', nodeDrag.ty);
+        if (nodeDrag.deg)   // 旋转标签的旋转中心跟随
+            nodeDrag.t.setAttribute('transform',
+                nodeDrag.deg.replace(/rotate\((\S+) \S+ \S+\)/,
+                    (m, d) => `rotate(${d} ${nodeDrag.tx.toFixed(1)} ${nodeDrag.ty.toFixed(1)})`));
+        edgeRecs.forEach(r => {
+            if (r.a === n || r.v === n) r.p.setAttribute('d', edgeD(r.a, r.v, r.off));
+        });
+    });
+    window.addEventListener('pointerup', () => { nodeDrag = null; });
     // 明细列表的挑事者条目前缀同色圆点：图与列表颜色互参
-    attackers.forEach(n => {
+    colorNodes.forEach(n => {
         const item = document.querySelector(`.af-item[data-side="a"][data-uid="${n.id}"]`);
         const line = item && item.querySelector('.af-line');
         if (line && !line.querySelector('.af-dot')) {
