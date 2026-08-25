@@ -17,7 +17,7 @@ import time
 import requests
 
 from clash_ctl import ClashCtl
-from config import DATA_DIR, MIHOMO_PATH
+from config import BASE_DIR, DATA_DIR, MIHOMO_PATH
 
 _RUNTIME_DIR = os.path.join(DATA_DIR, "mihomo_runtime")
 _RELEASES = "https://github.com/MetaCubeX/mihomo/releases/latest/download"
@@ -52,17 +52,22 @@ def _download_binary(dest: str) -> bool:
              if (goos, goarch) == ("linux", "amd64") else [f"{base}{suffix}.gz"])
     for name in names:
         url = f"{_RELEASES}/{name}"
+        tmp = dest + ".tmp"
         try:
             print(f"[ProxyCore] 下载 mihomo 核心: {url}")
             r = requests.get(url, timeout=120)
             r.raise_for_status()
+            data = gzip.decompress(r.content)   # 先解压再落盘，避免截断/0字节残留
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "wb") as f:
-                f.write(gzip.decompress(r.content))
-            os.chmod(dest, 0o755)
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, dest)   # 原子替换：不存在半成品 dest
             return True
         except Exception as e:
             print(f"[ProxyCore] 下载失败（{name}）: {e}")
+            if os.path.exists(tmp):
+                os.remove(tmp)
     return False
 
 
@@ -70,7 +75,7 @@ def ensure_binary(allow_download: bool = True) -> str | None:
     """定位 mihomo 二进制：MIHOMO_PATH → vendor/mihomo → data/mihomo → 自动下载"""
     candidates = [MIHOMO_PATH] if MIHOMO_PATH else []
     exe = "mihomo.exe" if sys.platform.startswith("win") else "mihomo"
-    candidates += [os.path.join("vendor", exe), os.path.join(DATA_DIR, exe)]
+    candidates += [os.path.join(BASE_DIR, "vendor", exe), os.path.join(DATA_DIR, exe)]
     for p in candidates:
         if p and os.path.isfile(p):
             return os.path.abspath(p)
@@ -84,10 +89,18 @@ class ProxyCore:
     """内置 mihomo 核心：start() 成功返回就绪的 ClashCtl，失败返回 None（静默降级）"""
 
     def __init__(self, sub_urls: list[str], group: str = "profiler"):
-        self.sub_urls = list(sub_urls)
+        # 剔除会生成非法 yaml 的链接（含双引号/换行），避免静默失效
+        self.sub_urls = []
+        for u in sub_urls:
+            if '"' in u or "\n" in u or "\r" in u:
+                print(f"[ProxyCore] 订阅链接含非法字符（双引号/换行），已剔除: {u[:40]}...")
+            else:
+                self.sub_urls.append(u)
         self.group = group
         self.mix_port = _free_port()
         self.api_port = _free_port()
+        while self.api_port == self.mix_port:   # 理论上可撞，守卫一下
+            self.api_port = _free_port()
         self.secret = secrets.token_hex(8)
         self._proc: subprocess.Popen | None = None
 
@@ -123,15 +136,22 @@ class ProxyCore:
         """拉起核心子进程并轮询就绪（核心需先拉订阅，最长等 60s）；失败返回 None"""
         if self._proc is not None:
             return None
+        if not self.sub_urls:
+            print("[ProxyCore] 无可用订阅链接（全部被剔除或未配置），禁用内置核心")
+            return None
         bin_path = ensure_binary(allow_download=allow_download)
         if not bin_path:
             print("[ProxyCore] 未找到 mihomo 二进制（可设 MIHOMO_PATH 或放置到 vendor/），禁用内置核心")
             return None
-        os.makedirs(_RUNTIME_DIR, exist_ok=True)
-        cfg_path = os.path.join(_RUNTIME_DIR, "config.yaml")
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            f.write(self._gen_config())
-        os.chmod(cfg_path, 0o600)   # 含订阅链接，收紧权限
+        try:
+            os.makedirs(_RUNTIME_DIR, exist_ok=True)
+            cfg_path = os.path.join(_RUNTIME_DIR, "config.yaml")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write(self._gen_config())
+            os.chmod(cfg_path, 0o600)   # 含订阅链接，收紧权限
+        except OSError as e:
+            print(f"[ProxyCore] 配置写入失败: {e}，禁用内置核心")
+            return None
         try:
             self._proc = subprocess.Popen(
                 [bin_path, "-d", _RUNTIME_DIR, "-f", cfg_path],
