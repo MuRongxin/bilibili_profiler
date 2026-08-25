@@ -54,6 +54,9 @@ class BiliAPIClient:
         # 自适应降速倍率：触发风控时 ×ADAPTIVE_THROTTLE_FACTOR（上限 ADAPTIVE_THROTTLE_MAX），
         # 业务成功请求缓慢衰减回 1.0；进程内共享（多线程读写 float 靠 GIL 即可，启发式允许竞态）
         self._throttle = 1.0
+        # 代理激活标记（set_proxy 维护）：激活时 SSLError/ConnectionError/Timeout
+        # 大概率是上游节点死了（隧道中断），按 IP 池故障抛 ProxyConnError 触发切节点
+        self._proxy_active = False
         # RLock：_get_wbi_key/_ensure_buvid3 在持有锁的请求路径中可能嵌套发请求
         self._lock = threading.RLock()
         self._wbi_key = None
@@ -254,7 +257,18 @@ class BiliAPIClient:
             except requests.exceptions.ProxyError as e:
                 # 代理连接失败是 IP 池故障而非目标站风控：立即上报，不消耗重试
                 raise ProxyConnError(str(e)) from e
-            except (requests.Timeout, requests.ConnectionError, ValueError) as e:
+            except (requests.exceptions.SSLError,
+                    requests.Timeout, requests.ConnectionError) as e:
+                # 代理激活时隧道级失败（上游节点死亡多表现为 SSL EOF/连接重置/超时），
+                # 按 IP 池故障抛 ProxyConnError 触发切节点；直连时维持原重试降级
+                if self._proxy_active:
+                    raise ProxyConnError(str(e)) from e
+                if attempt < MAX_RETRY - 1:
+                    wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait)
+                else:
+                    return {"code": -1, "message": f"请求异常: {e}"}
+            except ValueError as e:
                 # ValueError 含 resp.json() 解析失败（风控 HTML 错误页等非 JSON 响应）
                 if attempt < MAX_RETRY - 1:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
@@ -306,7 +320,17 @@ class BiliAPIClient:
             except requests.exceptions.ProxyError as e:
                 # 代理连接失败是 IP 池故障而非目标站风控：立即上报，不消耗重试
                 raise ProxyConnError(str(e)) from e
-            except (requests.Timeout, requests.ConnectionError, ValueError) as e:
+            except (requests.exceptions.SSLError,
+                    requests.Timeout, requests.ConnectionError) as e:
+                # 代理激活时隧道级失败按 IP 池故障处理（同 get()）
+                if self._proxy_active:
+                    raise ProxyConnError(str(e)) from e
+                if attempt < MAX_RETRY - 1:
+                    wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait)
+                else:
+                    return {"code": -1, "message": f"请求异常: {e}"}
+            except ValueError as e:
                 # ValueError 含 resp.json() 解析失败（非 JSON 响应）
                 if attempt < MAX_RETRY - 1:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
@@ -352,7 +376,11 @@ class BiliAPIClient:
                 if attempt < MAX_RETRY - 1:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
                     time.sleep(wait)
-            except (requests.Timeout, requests.ConnectionError) as e:
+            except (requests.exceptions.SSLError,
+                    requests.Timeout, requests.ConnectionError) as e:
+                # 代理激活时隧道级失败按 IP 池故障处理（同 get()）
+                if self._proxy_active:
+                    raise ProxyConnError(str(e)) from e
                 last_exc = e
                 if attempt < MAX_RETRY - 1:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
@@ -362,6 +390,7 @@ class BiliAPIClient:
     def set_proxy(self, url: str | None):
         """设置/清除代理（None 或空串 = 直连）；带认证的代理地址直接内嵌 user:pass@host:port"""
         self.session.proxies = {"http": url, "https": url} if url else {}
+        self._proxy_active = bool(url)
 
     def update_cookies(self, cookies: dict):
         self.session.cookies.update(cookies)

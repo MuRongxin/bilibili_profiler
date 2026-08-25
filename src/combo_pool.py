@@ -173,16 +173,26 @@ def _discover_ip_pool():
     return None, None
 
 
-def _proxy_selfcheck(pool: ComboPool) -> bool:
-    """启动自检：经代理发一次轻量请求（NAV）；失败由调用方摘代理转直连"""
+def _proxy_selfcheck(pool: ComboPool, max_tries: int = 5) -> bool:
+    """启动自检：经代理发一次轻量请求（NAV）；当前节点死亡则切下一个重试，
+    连续 max_tries 次仍不通才由调用方摘代理转直连（订阅里常混有死节点）"""
     _, client = pool.current
-    try:
-        data = client.get(NAV_URL, timeout=8)
-        return isinstance(data, dict) and "code" in data
-    except RiskControlError:
-        return True     # 账号风控说明代理链路是通的，不应摘代理
-    except Exception:
-        return False
+    for attempt in range(max_tries):
+        try:
+            data = client.get(NAV_URL, timeout=8)
+            if isinstance(data, dict) and "code" in data:
+                return True
+        except RiskControlError:
+            return True     # 账号风控说明代理链路是通的，不应摘代理
+        except Exception:
+            pass
+        if pool._clash and attempt < max_tries - 1:
+            nxt = pool._clash.pick_next_node()
+            if nxt and pool._clash.switch_node(nxt):
+                print(f"[Pool] 自检节点不通，切换到 [{nxt}] 重试")
+            else:
+                break       # 无节点可切，提前结束
+    return False
 
 
 def build_pool(main_client) -> ComboPool:

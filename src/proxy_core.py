@@ -18,10 +18,15 @@ import time
 import requests
 
 from clash_ctl import ClashCtl
-from config import BASE_DIR, DATA_DIR, MIHOMO_PATH
+from config import BASE_DIR, DATA_DIR, GH_PROXIES, MIHOMO_PATH
 
 _RUNTIME_DIR = os.path.join(DATA_DIR, "mihomo_runtime")
-_RELEASES = "https://github.com/MetaCubeX/mihomo/releases/latest/download"
+_RELEASE_API = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+
+
+def _gh_urls(url: str) -> list[str]:
+    """GitHub 加速：依次尝试各加速前缀，最后回退直连"""
+    return [p + url for p in GH_PROXIES] + [url]
 
 
 def _free_port() -> int:
@@ -47,28 +52,43 @@ def _download_binary(dest: str) -> bool:
         print(f"[ProxyCore] 不支持的平台 {sys.platform}/{platform.machine()}，请手动放置 mihomo 到 {dest}")
         return False
     base = f"mihomo-{goos}-{goarch}"
-    suffix = ".exe" if goos == "windows" else ""
-    # linux/amd64 优先 compatible 变体（老 CPU 无 v3 指令集也能跑）
-    names = ([f"{base}-compatible{suffix}.gz", f"{base}{suffix}.gz"]
-             if (goos, goarch) == ("linux", "amd64") else [f"{base}{suffix}.gz"])
-    for name in names:
-        url = f"{_RELEASES}/{name}"
-        tmp = dest + ".tmp"
+    # 资产名带版本号（如 mihomo-linux-amd64-compatible-v1.19.30.gz），
+    # 需先查 latest release 的资产清单再按名匹配
+    assets = {}
+    for api in _gh_urls(_RELEASE_API):
         try:
-            print(f"[ProxyCore] 下载 mihomo 核心: {url}")
-            r = requests.get(url, timeout=120)
-            r.raise_for_status()
-            data = gzip.decompress(r.content)   # 先解压再落盘，避免截断/0字节残留
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(tmp, "wb") as f:
-                f.write(data)
-            os.chmod(tmp, 0o755)
-            os.replace(tmp, dest)   # 原子替换：不存在半成品 dest
-            return True
+            rel = requests.get(api, timeout=30).json()
+            assets = {a["name"]: a["browser_download_url"]
+                      for a in rel.get("assets", [])}
+            if assets:
+                break
         except Exception as e:
-            print(f"[ProxyCore] 下载失败（{name}）: {e}")
-            if os.path.exists(tmp):
-                os.remove(tmp)
+            print(f"[ProxyCore] 查询 release 资产清单失败（{api[:40]}...）: {e}")
+    if not assets:
+        return False
+    # 只取 .gz 包（排除 .deb/.rpm/.pkg.tar.zst；windows 为 .zip 暂不支持自动下载）
+    names = [n for n in assets if n.startswith(base) and n.endswith(".gz")]
+    # linux/amd64 优先 compatible 变体（老 CPU 无 v3 指令集也能跑），其余按名长升序
+    # （短名=普通变体优先于 go120/go123 等工具链变体）
+    names.sort(key=lambda n: ("-compatible" not in n, len(n)))
+    for name in names:
+        tmp = dest + ".tmp"
+        for url in _gh_urls(assets[name]):
+            try:
+                print(f"[ProxyCore] 下载 mihomo 核心: {url}")
+                r = requests.get(url, timeout=120)
+                r.raise_for_status()
+                data = gzip.decompress(r.content)   # 先解压再落盘，避免截断/0字节残留
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.chmod(tmp, 0o755)
+                os.replace(tmp, dest)   # 原子替换：不存在半成品 dest
+                return True
+            except Exception as e:
+                print(f"[ProxyCore] 下载失败（{name}）: {e}")
+                if os.path.exists(tmp):
+                    os.remove(tmp)
     return False
 
 
@@ -123,6 +143,8 @@ class ProxyCore:
             f'  sub{i}:\n'
             f'    type: http\n'
             f'    url: "{u}"\n'
+            # 订阅必须直连拉取（节点还没加载，走代理组是鸡生蛋问题）
+            f'    proxy: DIRECT\n'
             f'    interval: 86400\n'
             f'    health-check:\n'
             f'      enable: true\n'
@@ -138,6 +160,12 @@ class ProxyCore:
             f"external-controller: 127.0.0.1:{self.api_port}\n"
             f'secret: "{self.secret}"\n'
             f"log-level: warning\n"
+            # 系统 DNS 可能被污染（订阅域名解析到假 IP），内置 DNS 走国内公共 DNS 直连解析
+            f"dns:\n"
+            f"  enable: true\n"
+            f"  nameserver:\n"
+            f"    - 223.5.5.5\n"
+            f"    - 119.29.29.29\n"
             f"proxy-providers:\n{providers}\n"
             f"proxy-groups:\n"
             f'  - name: "{self.group}"\n'

@@ -78,6 +78,13 @@ ADAPTIVE_THROTTLE_DECAY = 0.99   # 每次业务成功请求后倍率衰减（约
 SUB_URLS = [u.strip() for u in os.environ.get("SUB_URLS", "").split(",") if u.strip()]
 # 覆盖内置 mihomo 二进制定位（默认依次找 vendor/mihomo、data/mihomo，都没有则自动下载）
 MIHOMO_PATH = os.environ.get("MIHOMO_PATH", "")
+# GitHub 加速前缀列表（下载 mihomo 核心用，按序尝试、全部失败回退直连；
+# 环境变量 GH_PROXIES 逗号分隔可覆盖，置空则只直连）
+GH_PROXIES = [u.strip() for u in os.environ.get(
+    "GH_PROXIES",
+    "https://gh-proxy.cn/,https://gh-proxy.com/,https://ghfast.top/,"
+    "https://mirror.ghproxy.com/,https://hub.gitmirror.com/",
+).split(",") if u.strip()]
 # 外部 Clash/ShellCrash 控制器（CLASH_ENABLED=1 显式启用；未启用也会自动探测本机常见端口）
 CLASH_ENABLED = os.environ.get("CLASH_ENABLED", "") == "1"
 CLASH_API_URL = os.environ.get("CLASH_API_URL", "http://127.0.0.1:9090")
