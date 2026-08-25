@@ -89,11 +89,11 @@ class ProxyCore:
     """内置 mihomo 核心：start() 成功返回就绪的 ClashCtl，失败返回 None（静默降级）"""
 
     def __init__(self, sub_urls: list[str], group: str = "profiler"):
-        # 剔除会生成非法 yaml 的链接（含双引号/换行），避免静默失效
+        # 剔除会生成非法 yaml 的链接（含双引号/换行），避免静默失效；警告只打印序号，凭证不落日志
         self.sub_urls = []
-        for u in sub_urls:
+        for i, u in enumerate(sub_urls):
             if '"' in u or "\n" in u or "\r" in u:
-                print(f"[ProxyCore] 订阅链接含非法字符（双引号/换行），已剔除: {u[:40]}...")
+                print(f"[ProxyCore] 警告：第 {i} 条订阅链接含非法字符（引号/换行），已剔除")
             else:
                 self.sub_urls.append(u)
         self.group = group
