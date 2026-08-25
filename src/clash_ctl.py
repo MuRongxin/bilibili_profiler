@@ -59,24 +59,25 @@ class ClashCtl:
         return self._nodes
 
     def current_node(self) -> str | None:
+        """当前选中节点；请求失败或组内无选中（空串）均归一为 None"""
         try:
             return self._fetch_group()["now"] or None
         except requests.RequestException:
             return None
 
     def pick_next_node(self) -> str | None:
-        """组内轮询推进，跳过当前节点；节点为空返回 None"""
+        """组内轮询推进：游标先对齐当前节点再取其下一个；
+        节点为空、或单节点组（唯一节点即当前节点）无节点可换时返回 None"""
         if not self._nodes:
             self.refresh_nodes()
         if not self._nodes:
             return None
         cur = self.current_node()
+        if cur and cur in self._nodes:
+            self._cursor = self._nodes.index(cur)   # 游标对齐真实当前节点，轮换从下一个开始
+        if len(self._nodes) == 1 and self._nodes[0] == cur:
+            return None                              # 单节点组：无节点可换，让消费方感知
         self._cursor = (self._cursor + 1) % len(self._nodes)
-        if cur and len(self._nodes) > 1:
-            for _ in range(len(self._nodes)):
-                if self._nodes[self._cursor] != cur:
-                    break
-                self._cursor = (self._cursor + 1) % len(self._nodes)
         return self._nodes[self._cursor]
 
     def switch_node(self, name: str) -> bool:
@@ -90,6 +91,10 @@ class ClashCtl:
             r = requests.put(
                 f"{self.api_url}/proxies/{requests.utils.quote(g['name'], safe='')}",
                 headers=self._headers(), json={"name": name}, timeout=5)
-            return r.status_code in (200, 204)
+            if r.status_code in (200, 204):
+                if name in self._nodes:
+                    self._cursor = self._nodes.index(name)   # 切换成功后游标同步到新节点
+                return True
+            return False
         except requests.RequestException:
             return False
