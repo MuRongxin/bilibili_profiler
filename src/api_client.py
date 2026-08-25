@@ -45,6 +45,9 @@ class BiliAPIClient:
     def __init__(self, session: requests.Session = None):
         self.session = session or requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
+        # 直连/代理由程序显式控制（set_proxy）：关闭 trust_env，避免环境变量
+        # http_proxy/https_proxy 被 requests 合并进请求，导致"摘代理转直连"不彻底
+        self.session.trust_env = False
         self._last_request_time = 0
         # -412 风控全局冷却截止时刻（时间戳），所有线程共享；0 表示无冷却
         self._risk_cooldown_until = 0.0

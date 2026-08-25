@@ -163,8 +163,9 @@ def _discover_ip_pool():
             print(f"[Pool] 发现外部 Clash 控制器 {api}（组 {ctl.group}，{len(nodes)} 节点）")
             return ctl, CLASH_PROXY_URL
     if SUB_URLS:
-        from proxy_core import ProxyCore
-        core = ProxyCore(SUB_URLS, group=CLASH_GROUP or "profiler")
+        from proxy_core import get_core
+        # 单例：web.py 重新生成 job 反复建池时复用同一内置核心，不累积拉起子进程
+        core = get_core(SUB_URLS, group=CLASH_GROUP or "profiler")
         ctl = core.start()
         if ctl:
             return ctl, f"http://127.0.0.1:{core.mix_port}"
@@ -194,7 +195,7 @@ def build_pool(main_client) -> ComboPool:
     accounts = [("主号", main_client)] + load_extra_clients()
     if len(accounts) > 1:
         names = "、".join(n for n, _ in accounts[1:])
-        print(f"[Pool] 小号池: {len(accounts) - 1} 个可用（{names}），采集将按组合轮转分摊")
+        print(f"[Pool] 小号池: {len(accounts) - 1} 个可用（{names}），风控时轮换兜底（无风控仅主号采集）")
 
     clash, proxy_url = _discover_ip_pool()
     pool = ComboPool(accounts, clash=clash, proxy_url=proxy_url)
