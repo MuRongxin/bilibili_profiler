@@ -143,6 +143,21 @@ def _get_client() -> BiliAPIClient:
         raise CookieInvalidError("Cookie 失效，请先运行 python login.py")
 
 
+# 账号×IP 组合池懒加载单例：小号池发现/（配 SUB_URLS 时）IP 池探测与 mihomo 核心
+# 拉起只做一次，避免每个手动分析 job 重复探测；池内组合故障时本身会自动降级
+_POOL = None
+_POOL_LOCK = threading.Lock()
+
+
+def _get_pool(client):
+    """模块级懒加载组合池单例（锁内双重检查后建池缓存）"""
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL is None:
+            _POOL = build_pool(client)
+    return _POOL
+
+
 def _sender_danmaku_stats(bvid: str, mid_hash: str) -> dict:
     """从 danmaku 表重建该发送者的弹幕统计（web 端无内存态 sender_groups）"""
     with closing(get_db()) as conn:
@@ -188,8 +203,13 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
         update(finished=True, current="")
         return
 
-    # 账号×IP 组合池（同主流程：风控换号+切节点，故障自动降级）
-    pool = build_pool(client)
+    # 账号×IP 组合池（同主流程：风控换号+切节点，故障自动降级）；建池失败同 Cookie 失效语义终止 job
+    try:
+        pool = _get_pool(client)
+    except Exception as e:
+        add_error(f"构建组合池失败: {e}（job 已终止）")
+        update(finished=True, current="")
+        return
 
     cached = {r["mid_hash"]: r for r in load_senders(bvid)}
     video_info = load_video_info(bvid) or {}
@@ -636,7 +656,13 @@ def _backfill_faces(uids: list[int]):
     def work():
         try:
             for uid in todo:
-                data = client.get(USER_CARD_URL, params={"mid": uid, "photo": "false"})
+                try:
+                    data = client.get(USER_CARD_URL, params={"mid": uid, "photo": "false"})
+                except Exception as e:
+                    # 分析 job 跑过后共享 client 的 raise_on_risk 已置 True，-412 会抛
+                    # RiskControlError 而非返回 dict：兜底为"放弃本次补采"，下次渲染再试
+                    print(f"[Face] 请求异常（{e}），放弃本次补采（剩 {len(todo) - todo.index(uid)} 个下次再采）")
+                    break
                 if data.get("code") == -412:
                     print(f"[Face] 触发风控，停止本次补采（剩 {len(todo) - todo.index(uid)} 个下次再采）")
                     break
