@@ -46,6 +46,7 @@ from storage import (load_senders, load_global_uid_map, save_global_uid,
                      load_faces, load_face_cached_uids, save_face)
 from main import run_analysis
 from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
+from combo_pool import build_pool
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from spam_detector import batch_detect_spam
@@ -187,6 +188,9 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
         update(finished=True, current="")
         return
 
+    # 账号×IP 组合池（同主流程：风控换号+切节点，故障自动降级）
+    pool = build_pool(client)
+
     cached = {r["mid_hash"]: r for r in load_senders(bvid)}
     video_info = load_video_info(bvid) or {}
     # web 端无评论映射（spec 7 明确不做）：全局映射库作为唯一明文源，CRC32 彩虹表破解兜底
@@ -216,7 +220,7 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
             if uid is None:
                 # 1. UID 解析：全局库明文命中优先，CRC32 彩虹表破解兜底；失败记 errors 继续
                 uid, confidence, method, _info, collision_risk, candidates = resolve_sender(
-                    mid_hash, stats["contents"], plain_uid_map, client, method_map=method_map)
+                    mid_hash, stats["contents"], plain_uid_map, pool, method_map=method_map)
                 if uid is None:
                     add_error(f"UID 解析失败（{method}）", mid_hash)
                     update(done=i)
@@ -235,7 +239,7 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
                 collision_risk = row["method"] == METHOD_CRC32_CRACK
 
             # 2. 强制采集（无视置信度，含"低"/碰撞）
-            user_data = collect_user_data(uid, client)
+            user_data = collect_user_data(uid, pool)
             if "error" in user_data:
                 add_error(f"UID:{uid} 采集失败 {user_data['error']}", mid_hash)
                 update(done=i)
