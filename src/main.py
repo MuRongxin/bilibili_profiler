@@ -18,7 +18,9 @@ from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
 from storage import save_danmaku, save_comments, update_comment_problems
-from auth import get_auth_client, load_extra_clients
+from auth import get_auth_client
+from combo_pool import build_pool
+from api_client import RiskControlError
 from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page, fetch_command_dms, build_command_uid_map
 from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map
@@ -388,15 +390,12 @@ def phase_comment_cringe(comments: list, video_info: dict) -> dict:
         return {}
 
 
-def phase_collect_users(resolved: dict, client, max_users: int | None = None, force: bool = False,
-                        extra_clients: list | None = None):
+def phase_collect_users(resolved: dict, pool, max_users: int | None = None, force: bool = False):
     """阶段5: 深度采集用户数据（名单已由阶段4兴趣定员；max_users 为手动硬上限
     （--max-users 传入时），None 不截断；成功立即落库可断点续采；force=True 跳过缓存强制重采）
 
-    账号池（extra_clients）：主号+小号按 uid 轮转分摊采集——每个 uid 的全部接口由
-    同一账号连续打完（行为更像真人），各号限速/冷却独立，分摊账号维度风控压力；
-    某号触发风控不剔除，仅该 uid 换下一账号重试（该号保留在轮询池，后续 uid 仍会轮到，
-    风控后的降速/冷却由各号 api_client 自身的自适应机制承担），全部账号试过仍失败才跳过。"""
+    组合池（ComboPool）：每个请求由池透明接管——风控自动换"新号+新IP"重试，
+    长冷却为池内兜底；兜底耗尽抛 RiskControlError，本 uid 按失败跳过（流水线不中断）。"""
     print("\n[Phase 5/6] 深度采集用户信息...")
 
     # 筛选需要采集的用户（有UID且置信度 acceptable）
@@ -431,10 +430,6 @@ def phase_collect_users(resolved: dict, client, max_users: int | None = None, fo
     user_data_map = {}
     processed = set()
 
-    # 账号池轮转状态：pool[0] 恒为主号；风控不剔除账号，仅换号继续轮询
-    pool = [("主号", client)] + list(extra_clients or [])
-    rr = 0
-
     for idx, (mid_hash, uid) in enumerate(uids_to_collect, 1):
         print(f"\n  [{idx}/{total}] 采集 UID:{uid}...")
 
@@ -447,33 +442,11 @@ def phase_collect_users(resolved: dict, client, max_users: int | None = None, fo
                 processed.add(uid)
                 continue
 
-        # 选一个账号采集；触发风控则换号重试（不剔除，该号保留在轮询池），非风控错误不换号
-        tried: set[int] = set()
-        data = {"error": "无可用账号"}
-        while True:
-            ci = -1
-            for _ in range(len(pool)):
-                cand = rr
-                rr = (rr + 1) % len(pool)
-                if cand not in tried:
-                    ci = cand
-                    break
-            if ci < 0:
-                break
-            tried.add(ci)
-            cname, cclient = pool[ci]
-            if len(pool) > 1:
-                print(f"  [账号:{cname}] 采集中...")
-            try:
-                data = collect_user_data(uid, cclient)
-            except Exception as e:
-                data = {"error": str(e)}
-            if "error" not in data:
-                break
-            if "风控" in data["error"] or "412" in data["error"]:
-                print(f"  [账号:{cname}] 触发风控，换号重试（该号保留在轮询池）")
-                continue
-            break
+        # 组合池接管风控轮换与兜底冷却；兜底耗尽抛 RiskControlError，按失败跳过本 uid
+        try:
+            data = collect_user_data(uid, pool)
+        except Exception as e:
+            data = {"error": str(e)}
 
         if "error" not in data:
             user_data_map[uid] = data
@@ -582,12 +555,9 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     # 阶段1: 登录
     client = phase_login()
 
-    # 小号池（data/cookies/*.json，python login.py <名字> 写入）：仅供阶段5用户采集
-    # 轮转分摊账号维度风控压力；其余阶段仍走主号
-    extra_clients = load_extra_clients()
-    if extra_clients:
-        names = "、".join(n for n, _ in extra_clients)
-        print(f"[Main] 小号池: {len(extra_clients)} 个可用（{names}），阶段5采集将轮转分摊")
+    # 账号×IP 组合池：主号+小号轮转，风控换"新号+新IP"重试，长冷却兜底；
+    # IP 池自动发现（外部控制器探测 → SUB_URLS 内置核心），故障自动降级直连
+    pool = build_pool(client)
 
     # --force: 登录成功后清除该视频的全部缓存，后续阶段全部重新采集
     # （放在登录后，避免登录失败/取消时缓存已清但新数据未采）
@@ -596,7 +566,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         print(f"[Main] --force 已清除 {bvid} 的缓存，全部重新采集")
 
     # 阶段2: 弹幕
-    video_info, danmaku_list, sender_groups, command_dms = phase_danmaku(bvid, client)
+    video_info, danmaku_list, sender_groups, command_dms = phase_danmaku(bvid, pool)
 
     # 弹幕为空时提前终止：后续评论/解析/画像均无意义，避免白跑全流程产出空报告
     if not danmaku_list:
@@ -610,7 +580,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     cringe_results = phase_cringe(danmaku_list, sender_groups, video_info)
 
     # 阶段3: 评论 + 充电名单（comment_location_map 为 uid→IP属地，uid_comments 阶段6贯通进画像）
-    comments, comment_uid_map, comment_location_map, charge_uid_map = phase_comment(video_info, client)
+    comments, comment_uid_map, comment_location_map, charge_uid_map = phase_comment(video_info, pool)
     # uid → 该用户在本视频的评论（按点赞降序），供阶段6注入画像与阶段7深掘证据包
     uid_comments: dict[int, list] = {}
     for c in comments:
@@ -638,7 +608,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
                 c["problem"] = v["category"]
 
     # 阶段4: UID解析（兴趣分驱动选人）
-    resolved = phase_resolve(bvid, sender_groups, comment_uid_map, client,
+    resolved = phase_resolve(bvid, sender_groups, comment_uid_map, pool,
                              max_users=max_users, charge_uid_map=charge_uid_map,
                              command_uid_map=build_command_uid_map(command_dms),
                              meta_uid_map=build_video_meta_uid_map(video_info),
@@ -673,9 +643,8 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         print(f"[Phase 4+] 问题评论作者直引: {cmt_added} 人并入画像名单"
               f"（严重度≥{COMMENT_AUTHOR_MIN_SEVERITY} 或 命中≥{COMMENT_AUTHOR_MIN_HITS} 条，共候选 {len(cmt_authors)} 人）")
 
-    # 阶段5: 用户采集（小号池轮转分摊）
-    user_data_map = phase_collect_users(resolved, client, max_users=max_users, force=force,
-                                        extra_clients=extra_clients)
+    # 阶段5: 用户采集（组合池透明接管风控轮换）
+    user_data_map = phase_collect_users(resolved, pool, max_users=max_users, force=force)
 
     # 阶段6: 画像分析（评论IP属地/本视频评论/问题弹幕在此贯通进画像）
     profiles = phase_analyze(resolved, spam_results, user_data_map, sender_groups,
@@ -800,6 +769,9 @@ def main():
 
     try:
         run_analysis(bvid, force=args.force, max_users=args.max_users)
+    except RiskControlError as e:
+        print(f"[Main] 风控兜底耗尽（{e}），本视频分析终止")
+        raise SystemExit(1)
     except KeyboardInterrupt:
         print("\n\n[Exit] 用户中断，进度已保存，可重新运行恢复")
     except Exception as e:

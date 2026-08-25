@@ -11,6 +11,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 from config import LLM_API_KEY, HISTORY_DANMAKU_ENABLED
 from auth import get_auth_client
+from combo_pool import build_pool
 from danmaku import collect_danmaku_data
 from spam_detector import batch_detect_spam
 from cringe_detector import detect_cringe_danmaku
@@ -40,15 +41,17 @@ def main():
     # 1. 登录
     print("[1/6] 登录...")
     client = get_auth_client()
+    # 账号×IP 组合池（同主流程：风控换号+切节点，故障自动降级）
+    pool = build_pool(client)
 
     # 2. 采集全部弹幕
     print("[2/6] 采集弹幕...")
-    video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, client)
+    video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, pool)
     print(f"   视频: {video_info.get('title')}")
 
     # 对齐主流程：开启历史弹幕时合并每日弹幕池快照，保证刷屏 top-N 口径与 run.py 一致
     if HISTORY_DANMAKU_ENABLED:
-        danmaku_list, sender_groups = _merge_history_danmaku(video_info, danmaku_list, client)
+        danmaku_list, sender_groups = _merge_history_danmaku(video_info, danmaku_list, pool)
 
     # 弹幕落库（供 web.py 弹幕浏览器查询；失败只警告不中断冒烟流程）
     try:
@@ -84,7 +87,7 @@ def main():
     print("[4/6] 收集评论...")
     comments = []
     try:
-        comments, comment_uid_map, _ = collect_comment_data(video_info.get("aid", 0), client)
+        comments, comment_uid_map, _ = collect_comment_data(video_info.get("aid", 0), pool)
     except Exception as e:
         # 对齐主流程 phase_comment：评论采集失败降级为仅用CRC32破解，只警告不中断
         print(f"   评论采集失败 (将仅用CRC32破解): {e}")
@@ -109,7 +112,7 @@ def main():
 
         # 解析 UID
         uid, confidence, method, _, collision_risk, _ = resolve_sender(
-            mid_hash, group["contents"], comment_uid_map, client
+            mid_hash, group["contents"], comment_uid_map, pool
         )
         if not uid:
             print(f"  ❌ UID 解析失败!")
@@ -118,7 +121,11 @@ def main():
         print(f"  ✅ UID={uid} (方法: {method}, 置信度: {confidence}){risk_note}")
 
         # 采集数据（对齐主流程：采集失败跳过该用户，不生成幽灵画像）
-        user_data = collect_user_data(uid, client)
+        try:
+            user_data = collect_user_data(uid, pool)
+        except Exception as e:
+            print(f"  ❌ 用户数据采集失败: {e}")
+            continue
         if "error" in user_data:
             print(f"  ❌ 用户数据采集失败: {user_data['error']}")
             continue
