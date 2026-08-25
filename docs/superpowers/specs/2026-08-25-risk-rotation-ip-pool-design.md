@@ -21,6 +21,7 @@ run.py / web.py 后台 job
   └─ ComboPool（新，src/combo_pool.py）   编排层：账号轮转 + 节点切换 + 兜底冷却
        ├─ accounts: [("主号", BiliAPIClient), ("alt1", ...), ...]   复用 auth.load_extra_clients
        ├─ ClashCtl（新，src/clash_ctl.py）  Clash 控制器封装：列节点/切节点
+       ├─ ProxyCore（新，src/proxy_core.py） 内置 mihomo 核心生命周期（订阅→本地代理端口+控制器）
        └─ BiliAPIClient（改，src/api_client.py）  支持代理；风控抛 RiskControlError 而非长冷却
 ```
 
@@ -28,16 +29,37 @@ run.py / web.py 后台 job
 
 - `BiliAPIClient`：发请求、限速、短退避、识别风控并**上报信号**（抛异常），不再自行长冷却。
 - `ComboPool`：持有账号池与节点切换器，维护轮转游标与圈计数；`run(fn)` 执行一个任务单元，风控时换"新号+新IP"重试，兜底冷却。
-- `ClashCtl`：纯封装 Clash 外部控制器 API，所有失败静默降级返回 False/空，不抛给上层。
+- `ClashCtl`：纯封装 Clash 外部控制器 API，所有失败静默降级返回 False/空，不抛给上层。对内置核心与外部 ShellCrash 一视同仁。
+- `ProxyCore`（新，`src/proxy_core.py`）：内置 mihomo 核心生命周期管理——定位/下载二进制、生成最小配置（订阅链接交给核心自己拉取解析）、拉起子进程、健康检查、退出清理。**使用者无需安装任何梯子工具，给一个或多个机场订阅链接即可获得 IP 池。**
 
 ## 组件设计
+
+### 0. `src/proxy_core.py`（新增，内置 mihomo 核心）
+
+职责：把"机场订阅 → 本地代理端口 + 控制器"这一整套 ShellCrash 功能集成进程序。
+
+- 二进制定位顺序：`MIHOMO_PATH` 环境变量 → `vendor/mihomo`（用户自行放置）→ `data/mihomo`（首次运行时按平台自动从 GitHub Releases 下载，linux/amd64 等）→ 全部失败则打印指引并禁用 IP 池（降级链照常工作）。
+- 配置生成：写出最小 yaml 到 `data/mihomo_runtime/`：
+  - `mixed-port` / `external-controller` 绑定 `127.0.0.1` + 动态空闲端口（避免与已有 Clash 冲突）；
+  - `external-controller-secret` 随机生成；
+  - `proxy-providers`：每个订阅链接一个 provider（`type: http`），节点拉取/解析（base64 分享链或 Clash yaml）由 mihomo 完成，程序不解析订阅；
+  - 一个 `select` 类型节点组（组名固定 `profiler`），`use` 引用全部 provider（多订阅节点汇入同一轮换组）+ 可选 `url-test` 自动组。
+- 生命周期：ComboPool 激活时 `start()`（子进程 + 轮询控制器就绪）；`atexit`/流水线结束 `stop()`；核心崩溃 → 记日志并禁用 IP 池降级。
+- 订阅链接是凭证：只走 gitignore 的 `config.py` 或环境变量，不落日志、不进仓库。
 
 ### 1. `src/clash_ctl.py`（新增）
 
 配置（`config.py`，均支持环境变量覆盖，沿用 LLM_* 先例）：
 
-- `CLASH_ENABLED = False`（默认关；未启用时 ComboPool 退化为纯账号轮转）
-- `CLASH_API_URL`（如 `http://127.0.0.1:9090`）/ `CLASH_SECRET` / `CLASH_GROUP`（轮换节点组名）/ `CLASH_PROXY_URL`（如 `http://127.0.0.1:7890`）
+- `SUB_URLS`（机场订阅链接列表，支持多个；内置核心的节点来源，环境变量 `SUB_URLS` 逗号分隔）
+- 外部 Clash（可选）：`CLASH_ENABLED = False`、`CLASH_API_URL` / `CLASH_SECRET` / `CLASH_GROUP` / `CLASH_PROXY_URL`
+- 内置核心参数：`MIHOMO_PATH`（覆盖二进制定位）、`CLASH_GROUP` 复用为组名（默认自动创建 `profiler` 组）
+
+IP 池来源自动发现顺序（无需用户做任何配置时也能尽量工作）：
+
+1. **外部控制器自动探测**：依次探测 `CLASH_API_URL`（若显式配置）及本机常见控制器端口（9090/9999/9097），可用即直接接管节点切换——**用户已有运行中的 Clash/ShellCrash 时什么都不用填，也不需要订阅链接**；
+2. **`SUB_URLS` 内置核心**：拉起 ProxyCore；
+3. 都不可用 → 无 IP 池，降级直连（账号轮转 + 长冷却兜底照常）。
 
 接口：
 
@@ -106,28 +128,31 @@ class ComboPool:
 - **登录/扫码/cookie 校验与刷新（auth.py 全部）：直连主号，不走代理、不轮换**（避免异地登录风控）。代理在 phase_login 完成后才由 ComboPool 统一挂载。
 - `web.py` 手动分析后台 job 跑同一套采集函数，签名变更后自然接入组合池。
 - LLM 调用（openai 客户端）不走代理池，维持现状。
-- 单 Clash 实例同一时刻只有一个出口 IP，节点切换是全局操作："账号×IP"为时间片轮换，非多账号各自独立 IP 并行（真并行需 mihomo listeners 按端口绑节点，后续扩展，不进本次范围）。
-- 未启用 Clash（默认）：行为 = 账号轮转 + 直连 + 长冷却兜底，与现状基本一致。
+- 单核心实例同一时刻只有一个出口 IP，节点切换是全局操作："账号×IP"为时间片轮换，非多账号各自独立 IP 并行（真并行需 mihomo listeners 按端口绑节点，后续扩展，不进本次范围）。
+- 未配置任何 IP 池（无 `SUB_URLS`、外部控制器探测不到）：行为 = 账号轮转 + 直连 + 长冷却兜底，与现状基本一致。
 
 ## 配置汇总（config.py 新增）
 
 | 常量 | 默认 | 说明 |
 |---|---|---|
-| `CLASH_ENABLED` | `False` | 总开关，环境变量 `CLASH_ENABLED=1` 覆盖 |
-| `CLASH_API_URL` | `http://127.0.0.1:9090` | 控制器地址 |
-| `CLASH_SECRET` | `""` | 控制器 secret |
-| `CLASH_GROUP` | `""` | 轮换节点组名 |
-| `CLASH_PROXY_URL` | `http://127.0.0.1:7890` | 混合代理端口 |
+| `SUB_URLS` | `[]` | 机场订阅链接列表（支持多个）；内置核心的节点来源（环境变量 `SUB_URLS` 逗号分隔） |
+| `MIHOMO_PATH` | `""` | 覆盖内置核心二进制定位 |
+| `CLASH_ENABLED` | `False` | 显式指定使用外部 Clash/ShellCrash |
+| `CLASH_API_URL` | `http://127.0.0.1:9090` | 外部控制器地址（内置核心时自动填动态端口） |
+| `CLASH_SECRET` | `""` | 控制器 secret（内置核心随机生成） |
+| `CLASH_GROUP` | `""` | 轮换节点组名（内置核心默认 `profiler`） |
+| `CLASH_PROXY_URL` | `http://127.0.0.1:7890` | 混合代理端口（内置核心时自动填动态端口） |
 | `MAX_RISK_ROUNDS` | `2` | 单任务单元允许的兜底冷却圈数 |
 
 ## 测试与验证
 
-- 项目无单测框架：所有改动过 `py_compile`；`python quick_test.py` 冒烟验证**无代理环境**（默认 `CLASH_ENABLED=False`）行为不回归。
-- `clash_ctl.py` 自检：`python -c "from clash_ctl import ClashCtl; ..."` 打印当前节点并试切换（需先配好 ShellCrash）。
+- 项目无单测框架：所有改动过 `py_compile`；`python quick_test.py` 冒烟验证**无代理环境**（默认不配 `SUB_URLS`）行为不回归。
+- `clash_ctl.py` 自检：`python -c "from clash_ctl import ClashCtl; ..."` 打印当前节点并试切换。
+- 内置核心自检：配 `SUB_URLS` 后 `python -c "from proxy_core import ProxyCore; ..."` 拉起核心、打印节点数与出口 IP、退出清理。
 - 有条件时两小号+节点池实跑 `run.py`，观察日志：风控出现"换号+切节点"而非"冷却600秒"。
 
-## 前置条件（用户侧）
+## 前置条件（用户侧，三档自动择优，无需手工选择）
 
-ShellCrash 当前为 Redir 模式且核心未运行、混合端口关闭。需：配好订阅 → 开启混合代理端口与外部控制器 → 将地址/secret/节点组名填入 `config.py` 或环境变量。
-
-**不影响其它应用**：ShellCrash 菜单「模式设置 → 流量劫持范围」选 `4 不配置流量劫持（纯净模式）`，核心只监听混合端口（HTTP/SOCK5），不碰 iptables/TUN，系统与其它应用流量完全不经过代理；只有本程序通过 `session.proxies` 显式连接该端口。确认方法：启动后 `curl -x http://127.0.0.1:<mix_port> https://api.ipify.org` 返回节点 IP，而直接 `curl https://api.ipify.org` 仍返回本机真实 IP。
+1. **已有运行中的 Clash/ShellCrash（最省事）**：程序自动探测本机控制器端口（9090/9999/9097），可用即直接接管，**无需订阅链接、无需任何配置**。ShellCrash 建议在「模式设置 → 流量劫持范围」选 `4 不配置流量劫持（纯净模式）`，其它应用流量不受影响。确认方法：`curl -x http://127.0.0.1:<mix_port> https://api.ipify.org` 返回节点 IP，直接 `curl https://api.ipify.org` 仍返回本机真实 IP。
+2. **只给订阅链接（零安装）**：在 `config.py` 或环境变量填 `SUB_URLS`（支持多个），程序自动下载/拉起内置 mihomo 核心，只监听 127.0.0.1 随机端口，其它应用流量完全不经过它。
+3. **什么都不配**：无 IP 池，行为同现状（账号轮转 + 长冷却兜底）。
