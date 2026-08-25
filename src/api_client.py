@@ -37,6 +37,9 @@ class BiliAPIClient:
     注意：重试退避 sleep（-352/-403 等待、指数退避）在锁外执行，不阻塞其他线程；
     但 -412 风控冷却通过全局共享时间戳 _risk_cooldown_until 在锁内等待，
     所有线程一起暂停（全局冷却的预期语义，避免多线程各自命中 -412 加重风控）。
+    该冷却语义仅属旧模式（raise_on_risk=False，登录等独立 client 路径）；
+    raise_on_risk=True（ComboPool 成员）时 -412/HTTP412 改抛 RiskControlError
+    由池轮换接管，不再设置全局冷却。
     """
 
     def __init__(self, session: requests.Session = None):
@@ -284,6 +287,8 @@ class BiliAPIClient:
         """POST 请求（限速+重试），返回解析后的 JSON dict
 
         与 get() 同款限速/指数退避重试，耗尽降级返回 {"code": -1, ...} 不 raise。
+        例外：raise_on_risk 模式遇 HTTP 412 抛 RiskControlError；
+        任何模式遇代理连接失败抛 ProxyConnError（IP 池故障，立即上报不重试）。
         不走 WBI 签名，也不调用 _ensure_buvid3（cookie 刷新等接口不需要，
         且避免在 buvid3 获取路径中嵌套 POST 造成递归）。
         """
@@ -321,6 +326,8 @@ class BiliAPIClient:
         """带重试的原始响应请求（弹幕 XML 等非 JSON 接口）
 
         重试 MAX_RETRY 次（指数退避+抖动），耗尽后 raise 最后一个异常，由调用方兜底。
+        例外：raise_on_risk 模式遇 HTTP 412 抛 RiskControlError；
+        任何模式遇代理连接失败抛 ProxyConnError（IP 池故障，立即上报不重试）。
         """
         last_exc = None
         for attempt in range(MAX_RETRY):
