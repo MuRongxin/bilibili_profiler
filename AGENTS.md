@@ -46,6 +46,9 @@ src/
 ├── web_autostart.py     # 分析完毕自动启动 web.py 并打开报告页（maybe_launch_web，WEB_AUTOSTART 开关）
 ├── config.py            # 全部配置常量：API 端点、限速/重试、采集翻页上限、LLM 配置（含 API Key，已被 .gitignore 排除）
 ├── api_client.py        # BiliAPIClient：HTTP 封装（线程安全限速（区间内随机：基础0.8–1.6s/高风险2–4s）、自适应降速（触发风控×1.5、成功缓慢回落）、重试退避、-412及重签无效的-352/-403风控全局冷却、Cookie、WBI签名、bili_ticket）
+├── clash_ctl.py         # Clash/mihomo 控制器封装（列节点/切节点换出口 IP，失败静默降级）
+├── proxy_core.py        # 内置 mihomo 核心生命周期（SUB_URLS 多订阅→127.0.0.1 随机端口代理+控制器，零安装）
+├── combo_pool.py        # 账号×IP 组合池（鸭子类型模拟 BiliAPIClient；风控换"新号+新IP"重试，长冷却兜底，IP 池故障摘代理降级直连）
 ├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新、小号池发现（data/cookies/*.json → load_extra_clients，失效自动尝试刷新）
 ├── danmaku.py           # 实时弹幕 XML 解析，按 mid_hash 聚合发送者
 ├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析）
@@ -54,7 +57,7 @@ src/
 ├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（10万条内存小表，覆盖全部 ≤10 位 UID，秒级）
 ├── spam_detector.py     # 刷屏检测：只标记风险等级（高/中/低），绝不删除弹幕数据
 ├── cringe_detector.py   # LLM 问题弹幕检测（八类判定+发送者聚合+llm_cache缓存，key 带口径版本号 v3）+ 问题评论检测（同口径，按 rpid 标注回写 comments.problem，未配置 LLM_API_KEY 自动跳过）
-├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；阶段5支持主号+小号池按 uid 轮转分摊，风控号不剔除、仅换号重试）
+├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；采集全程走账号×IP 组合池（combo_pool，鸭子类型透明接管：风控换号+切节点重试，长冷却兜底，IP 池故障自动降级直连））
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
 ├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存；全员粗筛已砍，未配置 Key 自动跳过）
 ├── up_analyzer.py       # UP 主相关分析
@@ -87,3 +90,4 @@ src/
 - `src/config.py` 含 LLM API Key 默认值、`data/cookie.json` 与 `data/cookies/`（小号池）含 B站登录凭证，以上连同 `data/profiler.db`、`data/reports/`、`data/qrcode.png` 均已在 `.gitignore` 中排除——**不要把它们提交进仓库或打印到日志**。
 - LLM 配置走环境变量覆盖：`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_MAX_TOKENS`，优先用环境变量而非改 `config.py` 里的硬编码 Key。双厂商：`LLM_PROVIDER=mimo` 切换到小米 MiMo（`MIMO_API_KEY` / `MIMO_BASE_URL` / `MIMO_MODEL`，默认 mimo-v2.5），llm_cache key 含模型名，两厂商缓存互不污染可 A/B 对比。
 - Cookie 等于账号登录态，泄露即等于账号被盗，处理 `data/` 目录文件时保持谨慎。
+- 机场订阅链接（config.py SUB_URLS / 环境变量）与 data/mihomo_runtime/config.yaml 含凭证，均不入库、不打印；内置核心二进制在 data/ 或 vendor/（gitignore）。

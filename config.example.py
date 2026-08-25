@@ -69,6 +69,24 @@ ADAPTIVE_THROTTLE_FACTOR = 1.5   # 触发风控后间隔倍率增幅（×该值�
 ADAPTIVE_THROTTLE_MAX = 5.0      # 间隔倍率上限
 ADAPTIVE_THROTTLE_DECAY = 0.99   # 每次业务成功请求后倍率衰减（约40次成功回落一半）
 
+# ========== IP 池（外部 Clash / 内置 mihomo 核心） ==========
+# 三档来源自动择优（都不配置则降级直连，程序照常运行）：
+#   1. 外部控制器自动探测：本机已有运行中的 Clash/ShellCrash（9090/9999/9097）即直接接管；
+#   2. SUB_URLS 内置核心：填机场订阅链接后自动下载/拉起内置 mihomo 核心（仅监听 127.0.0.1 随机端口）；
+#   3. 都不可用 → 无 IP 池，账号轮转 + 长冷却兜底直连。
+# 机场订阅链接列表（内置 mihomo 核心的节点来源；凭证，勿提交、勿打印）
+SUB_URLS = [u.strip() for u in os.environ.get("SUB_URLS", "").split(",") if u.strip()]
+# 覆盖内置 mihomo 二进制定位（默认依次找 vendor/mihomo、data/mihomo，都没有则自动下载）
+MIHOMO_PATH = os.environ.get("MIHOMO_PATH", "")
+# 外部 Clash/ShellCrash 控制器（CLASH_ENABLED=1 显式启用；未启用也会自动探测本机常见端口）
+CLASH_ENABLED = os.environ.get("CLASH_ENABLED", "") == "1"
+CLASH_API_URL = os.environ.get("CLASH_API_URL", "http://127.0.0.1:9090")
+CLASH_SECRET = os.environ.get("CLASH_SECRET", "")
+CLASH_GROUP = os.environ.get("CLASH_GROUP", "")            # 轮换节点组名（内置核心默认 profiler）
+CLASH_PROXY_URL = os.environ.get("CLASH_PROXY_URL", "http://127.0.0.1:7890")
+# 单任务单元允许的兜底冷却圈数（整圈账号全风控 → 长冷却为最后手段）
+MAX_RISK_ROUNDS = 2
+
 # ========== 破解配置 ==========
 MITM_MAX_UID = 10_000_000_000   # MITM 反查覆盖上限：全部 ≤10 位 UID（16位随机长UID不可解）
 

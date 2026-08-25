@@ -96,6 +96,10 @@ class ProxyCore:
                 print(f"[ProxyCore] 警告：第 {i} 条订阅链接含非法字符（引号/换行），已剔除")
             else:
                 self.sub_urls.append(u)
+        # 组名同样要进 yaml：含引号/换行会生成非法配置，回退默认组名
+        if '"' in group or "\n" in group or "\r" in group or not group:
+            print("[ProxyCore] 警告：节点组名含非法字符（引号/换行），回退默认组名 profiler")
+            group = "profiler"
         self.group = group
         self.mix_port = _free_port()
         self.api_port = _free_port()
@@ -125,11 +129,11 @@ class ProxyCore:
             f"log-level: warning\n"
             f"proxy-providers:\n{providers}\n"
             f"proxy-groups:\n"
-            f"  - name: {self.group}\n"
+            f'  - name: "{self.group}"\n'
             f"    type: select\n"
             f"    use: [{uses}]\n"
             f"rules:\n"
-            f"  - MATCH,{self.group}\n"
+            f'  - "MATCH,{self.group}"\n'
         )
 
     def start(self, allow_download: bool = True) -> ClashCtl | None:

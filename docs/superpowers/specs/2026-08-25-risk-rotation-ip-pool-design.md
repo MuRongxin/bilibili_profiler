@@ -112,16 +112,20 @@ class ComboPool:
             └─ 连续 2 圈仍失败 → 跳过当前任务单元（流水线继续，进程不退出）
 ```
 
-### 4. 各采集阶段接入（任务单元粒度，断点不丢）
+### 4. 各采集阶段接入（鸭子类型透明接管，零签名改动）
 
-手法统一：采集函数签名 `client` → `pool: ComboPool`，函数**内部**把每个请求单元用 `pool.run(lambda c: ..., desc)` 包裹——翻页游标（评论页码、历史弹幕日期循环）保留在函数内，换组合后从断点继续，不重跑已采部分。
+实现手法（相对初稿的修正）：`ComboPool` 鸭子类型模拟 `BiliAPIClient`
+（`get/post/get_raw/update_cookies`），各采集函数**签名不变**，调用点把
+`client` 实参换成 `pool` 即可。每个请求经 `pool.run()` 包装，风控时换
+"新号+新IP"后**原请求**重试——轮换粒度为单请求，比"任务单元"更细，
+翻页游标/日期循环天然保留在采集函数内，断点不丢、已采部分不重跑。
 
-- 阶段1 弹幕 `fetch_danmaku` / `collect_danmaku_data`：单请求单元，重跑成本 1 次请求。
-- 历史弹幕 `fetch_history_danmaku`：按天循环，单元=一天。
-- 阶段3 评论 `_fetch_comments_wbi` / `_fetch_sub_replies`：翻页循环，单元=一页。
-- 阶段4 UID 解析 `resolve_all_senders`：按发送者循环，单元=一人（`verify_uid_exists`/`_batch_verify_uids` 批次）。
-- 阶段5 用户采集 `phase_collect_users`：per-uid 循环改用 `pool.run(collect_user_data, ...)`，删除现有的"风控换号"手工分支（组合池统一接管；刚改的"不剔除"语义由池内游标天然继承）。
-- 互动弹幕/充电名单（`fetch_command_dms`/`fetch_charge_uid_map`）：单请求单元。
+- 阶段1 弹幕 / 历史弹幕 / 互动弹幕：调用点换 pool，无函数改动；
+- 阶段3 评论 / 充电名单：同上；
+- 阶段4 UID 解析（resolve_all_senders / web 端 resolve_sender）：同上；
+- 阶段5 用户采集 `phase_collect_users`：删除手工选号分支，`collect_user_data(uid, pool)`，
+  池兜底耗尽抛 `RiskControlError` → 该 uid 按失败跳过；
+- `web.py` 手动分析 job：建池后同样换 pool。
 
 ### 5. 边界
 

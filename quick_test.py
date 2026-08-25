@@ -11,6 +11,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 from config import LLM_API_KEY, HISTORY_DANMAKU_ENABLED
 from auth import get_auth_client
+from api_client import RiskControlError
 from combo_pool import build_pool
 from danmaku import collect_danmaku_data
 from spam_detector import batch_detect_spam
@@ -27,8 +28,8 @@ from web_autostart import maybe_launch_web
 
 def main():
     parser = argparse.ArgumentParser(description="快速分析 - 只分析刷屏得分最高的前N个发送者")
-    parser.add_argument("bvid", nargs="?", default="BV1vu4y1b7Y9",
-                        help="视频BV号 (默认 BV1vu4y1b7Y9)")
+    parser.add_argument("bvid", nargs="?", default="BV1ebg16jEhp",
+                        help="视频BV号 (默认 BV1ebg16jEhp)")
     parser.add_argument("--top", "-n", type=int, default=1,
                         help="分析刷屏得分最高的前N个发送者 (默认 1)")
     args = parser.parse_args()
@@ -157,4 +158,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RiskControlError as e:
+        # 对齐 main.py：组合池兜底耗尽（整圈账号全风控+长冷却后仍失败）时非零退出
+        print(f"\n[退出] 风控兜底耗尽（{e}），快速分析终止")
+        raise SystemExit(1)
