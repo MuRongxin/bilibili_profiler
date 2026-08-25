@@ -58,7 +58,7 @@ python run.py --batch videos.txt
 
 首次运行会提示扫码登录，请使用B站APP扫描终端显示的二维码。
 
-可选小号池（分摊账号维度风控压力）：`python login.py alt1` 扫码登录小号（存 `data/cookies/alt1.json`），`run.py` 阶段5用户采集自动发现并按 uid 轮转分摊，触发风控的号当场剔除、换号重试。
+可选小号池（分摊账号维度风控压力）：`python login.py alt1` 扫码登录小号（存 `data/cookies/alt1.json`），`run.py` 阶段5用户采集自动发现并按 uid 轮转分摊，触发风控的号不剔除、仅换号重试（该号保留在轮询池）。
 
 ## 断点续采机制
 

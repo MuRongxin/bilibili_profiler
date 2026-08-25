@@ -395,7 +395,8 @@ def phase_collect_users(resolved: dict, client, max_users: int | None = None, fo
 
     账号池（extra_clients）：主号+小号按 uid 轮转分摊采集——每个 uid 的全部接口由
     同一账号连续打完（行为更像真人），各号限速/冷却独立，分摊账号维度风控压力；
-    某号触发风控当场剔除，该 uid 换号重试，全部不可用才按失败跳过。"""
+    某号触发风控不剔除，仅该 uid 换下一账号重试（该号保留在轮询池，后续 uid 仍会轮到，
+    风控后的降速/冷却由各号 api_client 自身的自适应机制承担），全部账号试过仍失败才跳过。"""
     print("\n[Phase 5/6] 深度采集用户信息...")
 
     # 筛选需要采集的用户（有UID且置信度 acceptable）
@@ -430,9 +431,8 @@ def phase_collect_users(resolved: dict, client, max_users: int | None = None, fo
     user_data_map = {}
     processed = set()
 
-    # 账号池轮转状态：pool[0] 恒为主号；healthy 标记某号是否已被风控剔除
+    # 账号池轮转状态：pool[0] 恒为主号；风控不剔除账号，仅换号继续轮询
     pool = [("主号", client)] + list(extra_clients or [])
-    healthy = [True] * len(pool)
     rr = 0
 
     for idx, (mid_hash, uid) in enumerate(uids_to_collect, 1):
@@ -447,7 +447,7 @@ def phase_collect_users(resolved: dict, client, max_users: int | None = None, fo
                 processed.add(uid)
                 continue
 
-        # 选一个健康账号采集；触发风控则剔除该号并换号重试，非风控错误不换号
+        # 选一个账号采集；触发风控则换号重试（不剔除，该号保留在轮询池），非风控错误不换号
         tried: set[int] = set()
         data = {"error": "无可用账号"}
         while True:
@@ -455,7 +455,7 @@ def phase_collect_users(resolved: dict, client, max_users: int | None = None, fo
             for _ in range(len(pool)):
                 cand = rr
                 rr = (rr + 1) % len(pool)
-                if healthy[cand] and cand not in tried:
+                if cand not in tried:
                     ci = cand
                     break
             if ci < 0:
@@ -471,8 +471,7 @@ def phase_collect_users(resolved: dict, client, max_users: int | None = None, fo
             if "error" not in data:
                 break
             if "风控" in data["error"] or "412" in data["error"]:
-                healthy[ci] = False
-                print(f"  [账号:{cname}] 触发风控，本视频剩余采集剔除该号")
+                print(f"  [账号:{cname}] 触发风控，换号重试（该号保留在轮询池）")
                 continue
             break
 

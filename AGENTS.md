@@ -54,7 +54,7 @@ src/
 ├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（10万条内存小表，覆盖全部 ≤10 位 UID，秒级）
 ├── spam_detector.py     # 刷屏检测：只标记风险等级（高/中/低），绝不删除弹幕数据
 ├── cringe_detector.py   # LLM 问题弹幕检测（八类判定+发送者聚合+llm_cache缓存，key 带口径版本号 v3）+ 问题评论检测（同口径，按 rpid 标注回写 comments.problem，未配置 LLM_API_KEY 自动跳过）
-├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；阶段5支持主号+小号池按 uid 轮转分摊，风控号当场剔除换号重试）
+├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；阶段5支持主号+小号池按 uid 轮转分摊，风控号不剔除、仅换号重试）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
 ├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存；全员粗筛已砍，未配置 Key 自动跳过）
 ├── up_analyzer.py       # UP 主相关分析
