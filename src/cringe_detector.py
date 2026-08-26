@@ -19,7 +19,8 @@ import openai
 from openai import OpenAI
 
 from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_CONCURRENCY,
-                    CRINGE_BATCH_SIZE, COMMENT_CRINGE_BATCH_SIZE, COMMENT_CRINGE_MAX_ITEMS)
+                    LLM_FALLBACK, CRINGE_BATCH_SIZE, COMMENT_CRINGE_BATCH_SIZE,
+                    COMMENT_CRINGE_MAX_ITEMS)
 from storage import load_llm_cache, save_llm_cache
 
 # 问题弹幕类别（prompt 与聚合均引用，勿散落硬编码字符串）
@@ -89,30 +90,52 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
     """并发执行 LLM 判定批次，返回 (原始verdicts, 失败批次数, 总批次数)。
 
     实际并发路数 = min(批次数, LLM_CONCURRENCY)——判定阶段无缓存命中，越早判完越好，
-    批次少时不空占线程、批次多时打满上限。单批触发 429 限速自动退避重试，
-    仍失败仅计数跳过、不中断整体，全部失败由调用方降级。
+    批次少时不空占线程、批次多时打满上限。失败重试链：主厂商 429 退避重试 2 次
+    → 仍失败换备用厂商（LLM_FALLBACK，双厂商 key 都配了才启用）再退避重试
+    → 仍失败仅计数跳过、不中断整体，全部失败由调用方降级。
     """
-    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    # 厂商链：主用 + 备用（备用 key 为空则不启用）
+    providers = [(LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, "主用")]
+    if LLM_FALLBACK[0]:
+        providers.append(LLM_FALLBACK)
+    clients = {}    # 惰性建 client，线程间共享（openai client 线程安全）
+
+    def client_of(pi: int) -> OpenAI:
+        if pi not in clients:
+            key, base, _, _ = providers[pi]
+            clients[pi] = OpenAI(api_key=key, base_url=base)
+        return clients[pi]
+
     batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
     total = len(batches)
     workers = max(1, min(total, LLM_CONCURRENCY))
 
     def work(bi: int) -> str:
-        for retry in range(3):      # 限速退避：429 时等一会再试，最多 2 次重试
-            try:
-                resp = client.chat.completions.create(
-                    model=LLM_MODEL,
-                    messages=[{"role": "user", "content": prompt_builder(batches[bi], bi * batch_size, video_info)}],
-                    max_tokens=LLM_MAX_TOKENS,
-                    temperature=0.3,  # 判定类任务低温，减少格式漂移
-                )
-                return resp.choices[0].message.content or ""
-            except openai.RateLimitError:
-                if retry == 2:
-                    raise
-                wait = 10 * (retry + 1) + random.uniform(0, 3)
-                print(f"[{label}] 批次 {bi + 1} 触发限速，{wait:.0f}s 后重试...")
-                time.sleep(wait)
+        prompt = prompt_builder(batches[bi], bi * batch_size, video_info)
+        last_err = None
+        for pi, (_, _, model, tag) in enumerate(providers):
+            if pi > 0:
+                print(f"[{label}] 批次 {bi + 1} 主厂商失败，换备用厂商（{tag}）重试...")
+            for retry in range(3):      # 限速退避：429 时等一会再试，最多 2 次重试
+                try:
+                    resp = client_of(pi).chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=LLM_MAX_TOKENS,
+                        temperature=0.3,  # 判定类任务低温，减少格式漂移
+                    )
+                    return resp.choices[0].message.content or ""
+                except openai.RateLimitError as e:
+                    last_err = e
+                    if retry == 2:
+                        break           # 本厂商限速重试耗尽，换下一厂商
+                    wait = 10 * (retry + 1) + random.uniform(0, 3)
+                    print(f"[{label}] 批次 {bi + 1} 触发限速，{wait:.0f}s 后重试...")
+                    time.sleep(wait)
+                except Exception as e:
+                    last_err = e
+                    break               # 非限速错误重试同厂商无意义，直接换下一厂商
+        raise last_err
 
     verdicts, failed = [], 0
     print(f"[{label}] 判定 {total} 批（并发 {workers} 路，LLM请求中）...")

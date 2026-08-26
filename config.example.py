@@ -178,4 +178,9 @@ MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
 MIMO_BASE_URL = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
 MIMO_MODEL = os.environ.get("MIMO_MODEL", "mimo-v2.5")
 if LLM_PROVIDER == "mimo":
+    # 主用切到 MiMo 前，先记下 DeepSeek 原始配置作失败兜底
+    LLM_FALLBACK = (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, "deepseek")
     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL = MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL
+else:
+    # 主用 DeepSeek，MiMo 兜底（key 为空则不启用兜底）
+    LLM_FALLBACK = (MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, "mimo")
