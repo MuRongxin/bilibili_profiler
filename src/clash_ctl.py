@@ -2,7 +2,10 @@
 
 所有失败静默降级（返回 False/[]/None），不抛给上层——IP 池不可用时由 ComboPool 走降级链。
 注意：直连控制器（requests 裸调用），不走 BiliAPIClient（无 B 站限速语义）。
+线程安全：多号并行分片采集时多个池共享同一控制器，节点轮换由锁串行化。
 """
+import threading
+
 import requests
 
 # 组内伪节点/内置策略名，不进入轮换
@@ -16,6 +19,7 @@ class ClashCtl:
         self.group = group          # 为空时首次读组自动挑选第一个非 GLOBAL 的 Selector 组
         self._nodes: list[str] = []
         self._cursor = 0
+        self._lock = threading.Lock()   # 节点轮换串行化：多号并行分片共享同一控制器
 
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self.secret}"} if self.secret else {}
@@ -68,33 +72,35 @@ class ClashCtl:
     def pick_next_node(self) -> str | None:
         """组内轮询推进：游标先对齐当前节点再取其下一个；
         节点为空、或单节点组（唯一节点即当前节点）无节点可换时返回 None"""
-        if not self._nodes:
-            self.refresh_nodes()
-        if not self._nodes:
-            return None
-        cur = self.current_node()
-        if cur and cur in self._nodes:
-            self._cursor = self._nodes.index(cur)   # 游标对齐真实当前节点，轮换从下一个开始
-        if len(self._nodes) == 1 and self._nodes[0] == cur:
-            return None                              # 单节点组：无节点可换，让消费方感知
-        self._cursor = (self._cursor + 1) % len(self._nodes)
-        return self._nodes[self._cursor]
+        with self._lock:
+            if not self._nodes:
+                self.refresh_nodes()
+            if not self._nodes:
+                return None
+            cur = self.current_node()
+            if cur and cur in self._nodes:
+                self._cursor = self._nodes.index(cur)   # 游标对齐真实当前节点，轮换从下一个开始
+            if len(self._nodes) == 1 and self._nodes[0] == cur:
+                return None                              # 单节点组：无节点可换，让消费方感知
+            self._cursor = (self._cursor + 1) % len(self._nodes)
+            return self._nodes[self._cursor]
 
     def switch_node(self, name: str) -> bool:
         """切换节点组选择（换出口 IP）；失败返回 False"""
         if not name:
             return False
         try:
-            g = self._fetch_group()
-            if not g["name"]:
+            with self._lock:
+                g = self._fetch_group()
+                if not g["name"]:
+                    return False
+                r = requests.put(
+                    f"{self.api_url}/proxies/{requests.utils.quote(g['name'], safe='')}",
+                    headers=self._headers(), json={"name": name}, timeout=5)
+                if r.status_code in (200, 204):
+                    if name in self._nodes:
+                        self._cursor = self._nodes.index(name)   # 切换成功后游标同步到新节点
+                    return True
                 return False
-            r = requests.put(
-                f"{self.api_url}/proxies/{requests.utils.quote(g['name'], safe='')}",
-                headers=self._headers(), json={"name": name}, timeout=5)
-            if r.status_code in (200, 204):
-                if name in self._nodes:
-                    self._cursor = self._nodes.index(name)   # 切换成功后游标同步到新节点
-                return True
-            return False
         except requests.RequestException:
             return False

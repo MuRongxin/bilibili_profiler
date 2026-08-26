@@ -146,6 +146,28 @@ class ComboPool:
         for _, c in self._accounts:
             c.set_proxy(None)
 
+    def shard_pools(self) -> list["ComboPool"]:
+        """按账号分片：每账号一个独立子池（共享 clash/IP 池），供多线程并行采集。
+
+        限速是 per-client 实例的，N 个账号并行 ≈ N 倍吞吐。子池风控轮换只切节点
+        不换号（其它号正被别的分片占用），整圈风控的长冷却兜底逻辑照旧。
+        共享 clash 的切节点对所有分片同时生效（mixed 端口全局路由），属预期。
+        子池构造走 __new__ 跳过 __init__：raise_on_risk/set_proxy 副作用已由主池施加。
+        """
+        pools = []
+        for name, client in self._accounts:
+            p = ComboPool.__new__(ComboPool)
+            p._accounts = [(name, client)]
+            p._clash = self._clash
+            p._proxy_url = self._proxy_url
+            p._idx = 0
+            p._risk_marks = [False]
+            p._rounds = 0
+            p._proxy_fail_streak = 0
+            p._lock = threading.Lock()
+            pools.append(p)
+        return pools
+
 
 def _discover_ip_pool():
     """IP 池来源自动发现：外部控制器（显式配置优先，再探测本机常见端口）→ SUB_URLS 内置核心 → 无"""
@@ -205,7 +227,7 @@ def build_pool(main_client) -> ComboPool:
     accounts = [("主号", main_client)] + load_extra_clients()
     if len(accounts) > 1:
         names = "、".join(n for n, _ in accounts[1:])
-        print(f"[Pool] 小号池: {len(accounts) - 1} 个可用（{names}），风控时轮换兜底（无风控仅主号采集）")
+        print(f"[Pool] 小号池: {len(accounts) - 1} 个可用（{names}），采集阶段多号并行分片，风控时换号+切节点")
 
     clash, proxy_url = _discover_ip_pool()
     pool = ComboPool(accounts, clash=clash, proxy_url=proxy_url)

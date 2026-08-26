@@ -430,33 +430,54 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
     user_data_map = {}
     processed = set()
 
-    for idx, (mid_hash, uid) in enumerate(uids_to_collect, 1):
-        print(f"\n  [{idx}/{total}] 采集 UID:{uid}...")
-
+    def collect_one(mid_hash, uid, sub_pool, idx):
+        """采集单个用户：缓存命中跳过；成功立即落库（断点续采），降速倍率回落一档。
+        组合池接管风控轮换与兜底冷却；兜底耗尽抛 RiskControlError，按失败跳过本 uid。
+        返回 (uid, data|None)。"""
+        print(f"  [{idx}/{total}] 采集 UID:{uid}...")
         # 检查是否已缓存（--force 时跳过缓存强制重采，结果覆盖写 users 表）
         if not force and has_user_data(uid):
             cached = load_user_data(uid)
             if cached:
-                user_data_map[uid] = cached[0]
-                print(f"  [缓存] 使用已采集数据")
-                processed.add(uid)
-                continue
-
-        # 组合池接管风控轮换与兜底冷却；兜底耗尽抛 RiskControlError，按失败跳过本 uid
+                print(f"  [缓存] UID:{uid} 使用已采集数据")
+                return uid, cached[0]
         try:
-            data = collect_user_data(uid, pool)
+            data = collect_user_data(uid, sub_pool)
         except Exception as e:
             data = {"error": str(e)}
-
-        if "error" not in data:
-            user_data_map[uid] = data
-            processed.add(uid)
-            # 立即落库：Ctrl+C 中断后已采集数据不丢失，重跑时命中上方缓存跳过。
-            # profile 暂存空 dict，阶段6分析后以 INSERT OR REPLACE 覆盖
-            save_user_data(uid, data.get("name", ""), data.get("level", 0), data, {})
-        else:
+        if "error" in data:
             # 失败不落库，重跑时会重新采集
-            print(f"  [失败] {data['error']}")
+            print(f"  [失败] UID:{uid} {data['error']}")
+            return uid, None
+        # 立即落库：Ctrl+C 中断后已采集数据不丢失，重跑时命中上方缓存跳过。
+        # profile 暂存空 dict，阶段6分析后以 INSERT OR REPLACE 覆盖
+        save_user_data(uid, data.get("name", ""), data.get("level", 0), data, {})
+        # 单元级成功：降速倍率回落一档（sub_pool 可能是裸 client，做鸭子兼容）
+        used = sub_pool.current[1] if hasattr(sub_pool, "current") else sub_pool
+        if hasattr(used, "reward_throttle_batch"):
+            used.reward_throttle_batch()
+        return uid, data
+
+    # 多号并行分片：限速是 per-client 实例的，N 个账号并行 ≈ N 倍吞吐；
+    # 子池风控只切节点不换号（其它号正被别的分片占用），长冷却兜底照旧
+    shards = pool.shard_pools() if hasattr(pool, "shard_pools") else [pool]
+    if len(shards) > 1 and total > 1:
+        print(f"[Phase 5] 多号并行分片: {len(shards)} 个账号并行采集（限速按号独立）")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=len(shards)) as ex:
+            futures = [ex.submit(collect_one, mh, uid, shards[i % len(shards)], idx)
+                       for i, (idx, (mh, uid)) in enumerate(enumerate(uids_to_collect, 1))]
+            for fut in as_completed(futures):
+                uid, data = fut.result()
+                if data is not None:
+                    user_data_map[uid] = data
+                    processed.add(uid)
+    else:
+        for idx, (mid_hash, uid) in enumerate(uids_to_collect, 1):
+            uid, data = collect_one(mid_hash, uid, shards[0], idx)
+            if data is not None:
+                user_data_map[uid] = data
+                processed.add(uid)
 
     print(f"\n[Phase 5] 采集完成: {len(processed)}/{total}")
     return user_data_map

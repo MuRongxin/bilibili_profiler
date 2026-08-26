@@ -167,6 +167,15 @@ class BiliAPIClient:
         """业务成功请求：倍率缓慢衰减回 1.0（约40次成功回落一半）"""
         self._throttle = max(1.0, self._throttle * ADAPTIVE_THROTTLE_DECAY)
 
+    def reward_throttle_batch(self):
+        """一个采集单元（如一个用户）成功完成：倍率直接回落一档（除以增幅因子）。
+        每请求的 0.99 缓慢回落不变，这里给单元级成功一条更快的回落通道——
+        采集中途撞一次风控后不必拖着高倍率跑完全场。"""
+        old = self._throttle
+        self._throttle = max(1.0, self._throttle / ADAPTIVE_THROTTLE_FACTOR)
+        if self._throttle < old:
+            print(f"[API] 单元采集成功，降速倍率回落: {old:.2f} → {self._throttle:.2f}")
+
     def _sleep_if_needed(self, url: str):
         # -412 全局冷却：本方法在 _request_locked 的锁内执行，
         # 冷却等待会阻塞其他线程拿锁，即所有请求一起暂停（全局冷却的预期语义）
@@ -396,4 +405,10 @@ class BiliAPIClient:
         self.session.cookies.update(cookies)
 
     def get_cookies_dict(self) -> dict:
-        return dict(self.session.cookies)
+        """jar 中可能存在同名不同域的重复 cookie（如 spi 写入的 buvid3 与登录
+        态文件里的 buvid3 域不同），dict(jar) 会抛 CookieConflictError；
+        逐条遍历按名去重（后写覆盖先写），规避冲突。"""
+        result = {}
+        for c in self.session.cookies:
+            result[c.name] = c.value
+        return result
