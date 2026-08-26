@@ -4,12 +4,30 @@
 注意：直连控制器（requests 裸调用），不走 BiliAPIClient（无 B 站限速语义）。
 线程安全：多号并行分片采集时多个池共享同一控制器，节点轮换由锁串行化。
 """
+import re
 import threading
 
 import requests
 
 # 组内伪节点/内置策略名，不进入轮换
 _PSEUDO = {"DIRECT", "REJECT", "PASS", "GLOBAL", "COMPATIBLE"}
+
+# 地区识别：旗帜 emoji（区域指示符对）优先，其次节点名中的地区关键字
+_REGION_FLAG_RE = re.compile(r"[\U0001F1E6-\U0001F1FF]{2}")
+_REGION_WORDS = ["香港", "台湾", "澳门", "日本", "韩国", "新加坡", "美国", "加拿大",
+                 "英国", "德国", "法国", "荷兰", "俄罗斯", "澳大利亚", "印度", "土耳其",
+                 "泰国", "越南", "马来西亚", "菲律宾", "印尼", "巴西", "阿根廷"]
+
+
+def _region_of(name: str) -> str:
+    """从节点名提取地区标识（旗帜 emoji 或地区关键字）；识别不出返回空串"""
+    m = _REGION_FLAG_RE.search(name or "")
+    if m:
+        return m.group(0)
+    for w in _REGION_WORDS:
+        if w in (name or ""):
+            return w
+    return ""
 
 
 class ClashCtl:
@@ -18,7 +36,7 @@ class ClashCtl:
         self.secret = secret
         self.group = group          # 为空时首次读组自动挑选第一个非 GLOBAL 的 Selector 组
         self._nodes: list[str] = []
-        self._cursor = 0
+        self._region_cursor: dict[str, int] = {}   # 各地区内部轮换位置
         self._lock = threading.Lock()   # 节点轮换串行化：多号并行分片共享同一控制器
 
     def _headers(self) -> dict:
@@ -70,7 +88,8 @@ class ClashCtl:
             return None
 
     def pick_next_node(self) -> str | None:
-        """组内轮询推进：游标先对齐当前节点再取其下一个；
+        """组内轮换推进，**跨地区跳跃**：同机场同地区节点常共享出口 IP，
+        顺序轮换等于白换，故优先切到不同地区的节点（地区内再轮询）。
         节点为空、或单节点组（唯一节点即当前节点）无节点可换时返回 None"""
         with self._lock:
             if not self._nodes:
@@ -78,12 +97,24 @@ class ClashCtl:
             if not self._nodes:
                 return None
             cur = self.current_node()
-            if cur and cur in self._nodes:
-                self._cursor = self._nodes.index(cur)   # 游标对齐真实当前节点，轮换从下一个开始
             if len(self._nodes) == 1 and self._nodes[0] == cur:
                 return None                              # 单节点组：无节点可换，让消费方感知
-            self._cursor = (self._cursor + 1) % len(self._nodes)
-            return self._nodes[self._cursor]
+            cur_region = _region_of(cur) if cur else None
+            # 地区循环顺序（按节点列表首次出现排序，去重），从当前地区的下一个开始
+            regions = list(dict.fromkeys(_region_of(n) for n in self._nodes))
+            if cur_region in regions:
+                i = regions.index(cur_region)
+                ordered = regions[i + 1:] + regions[:i + 1]
+            else:
+                ordered = regions
+            for region in ordered:
+                candidates = [n for n in self._nodes if _region_of(n) == region and n != cur]
+                if not candidates:
+                    continue
+                pos = self._region_cursor.get(region, 0) % len(candidates)
+                self._region_cursor[region] = pos + 1
+                return candidates[pos]
+            return None
 
     def switch_node(self, name: str) -> bool:
         """切换节点组选择（换出口 IP）；失败返回 False"""
@@ -98,8 +129,6 @@ class ClashCtl:
                     f"{self.api_url}/proxies/{requests.utils.quote(g['name'], safe='')}",
                     headers=self._headers(), json={"name": name}, timeout=5)
                 if r.status_code in (200, 204):
-                    if name in self._nodes:
-                        self._cursor = self._nodes.index(name)   # 切换成功后游标同步到新节点
                     return True
                 return False
         except requests.RequestException:
