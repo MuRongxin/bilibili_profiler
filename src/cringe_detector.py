@@ -4,7 +4,8 @@
 对合并去重后的全部弹幕按批喂给 LLM，判定八类问题弹幕：
 中二抒情 / 尬夸捧杀 / 引战阴阳 / 人身攻击 / 恶意剧透 / 广告引流 / 键政敏感 / 批评吐槽。
 按发送者聚合输出，驱动兴趣分选人与报告问题弹幕榜。
-未配置 LLM_API_KEY 或全部批次失败时返回空 dict（降级不中断）。
+未配置 LLM_API_KEY 时返回空 dict（降级不中断）；失败批次不放弃——
+429 退避 → 换备用厂商 → 整轮等待重试，直到全部判定成功。
 
 历史说明：模块与函数名沿用 cringe（尬语）命名是兼容旧调用方的最小改动，
 实际判定范围已扩展为"问题弹幕"。
@@ -90,9 +91,10 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
     """并发执行 LLM 判定批次，返回 (原始verdicts, 失败批次数, 总批次数)。
 
     实际并发路数 = min(批次数, LLM_CONCURRENCY)——判定阶段无缓存命中，越早判完越好，
-    批次少时不空占线程、批次多时打满上限。失败重试链：主厂商 429 退避重试 2 次
-    → 仍失败换备用厂商（LLM_FALLBACK，双厂商 key 都配了才启用）再退避重试
-    → 仍失败仅计数跳过、不中断整体，全部失败由调用方降级。
+    批次少时不空占线程、批次多时打满上限。单批失败重试链：主厂商 429 退避 2 次
+    → 换备用厂商（LLM_FALLBACK，双厂商 key 都配了才启用）→ 仍失败进入整轮
+    等待重试（60s×轮次递增、封顶 300s），不放弃任何批次直到成功，
+    因此返回的失败批次数恒为 0（保留三元组仅维持调用方签名）。
     """
     # 厂商链：主用 + 备用（备用 key 为空则不启用）
     providers = [(LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, "主用")]
@@ -137,24 +139,39 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                     break               # 非限速错误重试同厂商无意义，直接换下一厂商
         raise last_err
 
-    verdicts, failed = [], 0
+    verdicts = []
+
+    def run_pass(pending: list[int]) -> list[int]:
+        """跑一轮并发判定，返回仍失败的批次下标"""
+        still_failed = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(work, bi): bi for bi in pending}
+            for fut in as_completed(futures):
+                bi = futures[fut]
+                try:
+                    raw = fut.result()
+                except Exception as e:
+                    print(f"[{label}] 警告: 批次 {bi + 1} 请求失败（{e}），稍后重试")
+                    still_failed.append(bi)
+                    continue
+                batch_verdicts = _parse_verdicts(raw)
+                if not batch_verdicts and raw.strip() not in ("", "[]"):
+                    print(f"[{label}] 警告: 批次 {bi + 1} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
+                verdicts.extend(batch_verdicts)
+                print(f"[{label}] 批次 {bi + 1}/{total} 完成（解析 {len(batch_verdicts)} 条）")
+        return still_failed
+
+    # 失败批次不放弃：等待递增（60s×轮次，封顶 300s）后整轮重试，直到全部成功
     print(f"[{label}] 判定 {total} 批（并发 {workers} 路，LLM请求中）...")
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(work, bi): bi for bi in range(total)}
-        for fut in as_completed(futures):
-            bi = futures[fut]
-            try:
-                raw = fut.result()
-            except Exception as e:
-                print(f"[{label}] 警告: 批次 {bi + 1} 请求失败（{e}），跳过该批")
-                failed += 1
-                continue
-            batch_verdicts = _parse_verdicts(raw)
-            if not batch_verdicts and raw.strip() not in ("", "[]"):
-                print(f"[{label}] 警告: 批次 {bi + 1} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
-            verdicts.extend(batch_verdicts)
-            print(f"[{label}] 批次 {bi + 1}/{total} 完成（解析 {len(batch_verdicts)} 条）")
-    return verdicts, failed, total
+    pending = run_pass(list(range(total)))
+    round_no = 1
+    while pending:
+        wait = min(60 * round_no, 300) + random.uniform(0, 10)
+        print(f"[{label}] {len(pending)} 个批次未成功，{wait:.0f}s 后重试（第 {round_no} 轮）...")
+        time.sleep(wait)
+        pending = run_pass(pending)
+        round_no += 1
+    return verdicts, 0, total
 
 
 def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dict],
@@ -207,11 +224,8 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
         for c in group.get("contents", []):
             content_senders.setdefault((c or "").strip(), set()).add(mid_hash)
 
-    raw_verdicts, failed, total = _judge_batches(items, CRINGE_BATCH_SIZE, video_info,
-                                                 _build_prompt, "问题弹幕")
-    if failed == total:
-        print("[问题弹幕] 警告: 全部批次失败，问题弹幕检测降级为空")
-        return {}
+    raw_verdicts, _, total = _judge_batches(items, CRINGE_BATCH_SIZE, video_info,
+                                            _build_prompt, "问题弹幕")
 
     verdicts = []
     for v in raw_verdicts:
@@ -245,11 +259,7 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
                 ent["examples"].append(item)
 
     if cache_key:
-        if failed > 0:
-            # 部分批次失败时聚合结果不完整，不写缓存避免瞬态波动被冻结复用
-            print(f"[问题弹幕] {failed} 个批次失败，本次结果不写入缓存")
-        else:
-            save_llm_cache(cache_key, json.dumps(results, ensure_ascii=False))
+        save_llm_cache(cache_key, json.dumps(results, ensure_ascii=False))
 
     print(f"[问题弹幕] 检测完成: {len(verdicts)} 条问题弹幕，涉及 {len(results)} 个发送者")
     return results
@@ -337,11 +347,8 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
             except (json.JSONDecodeError, ValueError, TypeError):
                 print("[问题评论] 警告: 缓存内容损坏，重新判定")
 
-    raw_verdicts, failed, total = _judge_batches(items, COMMENT_CRINGE_BATCH_SIZE, video_info,
-                                                 _build_comment_prompt, "问题评论")
-    if failed == total:
-        print("[问题评论] 警告: 全部批次失败，问题评论检测降级为空")
-        return {}
+    raw_verdicts, _, total = _judge_batches(items, COMMENT_CRINGE_BATCH_SIZE, video_info,
+                                            _build_comment_prompt, "问题评论")
 
     results: dict[int, dict] = {}
     for v in raw_verdicts:
@@ -359,11 +366,7 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
     print(f"[问题评论] 全部 {total} 批完成：标注 {len(results)} 条")
 
     if cache_key:
-        if failed > 0:
-            # 部分批次失败时结果不完整，不写缓存避免瞬态波动被冻结复用
-            print(f"[问题评论] {failed} 个批次失败，本次结果不写入缓存")
-        else:
-            save_llm_cache(cache_key, json.dumps(results, ensure_ascii=False))
+        save_llm_cache(cache_key, json.dumps(results, ensure_ascii=False))
 
     print(f"[问题评论] 检测完成: {len(results)} 条问题评论")
     return results

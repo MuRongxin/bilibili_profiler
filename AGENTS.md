@@ -88,6 +88,6 @@ src/
 ## 安全注意事项
 
 - `src/config.py` 含 LLM API Key 默认值、`data/cookie.json` 与 `data/cookies/`（小号池）含 B站登录凭证，以上连同 `data/profiler.db`、`data/reports/`、`data/qrcode.png` 均已在 `.gitignore` 中排除——**不要把它们提交进仓库或打印到日志**。
-- LLM 配置走环境变量覆盖：`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_MAX_TOKENS`，优先用环境变量而非改 `config.py` 里的硬编码 Key。双厂商：`LLM_PROVIDER=mimo` 切换到小米 MiMo（`MIMO_API_KEY` / `MIMO_BASE_URL` / `MIMO_MODEL`，默认 mimo-v2.5），llm_cache key 含模型名，两厂商缓存互不污染可 A/B 对比；判定批次失败会自动换备用厂商（`LLM_FALLBACK`，另一套）兜底重试，双 key 都配置才启用。
+- LLM 配置走环境变量覆盖：`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_MAX_TOKENS`，优先用环境变量而非改 `config.py` 里的硬编码 Key。双厂商：`LLM_PROVIDER=mimo` 切换到小米 MiMo（`MIMO_API_KEY` / `MIMO_BASE_URL` / `MIMO_MODEL`，默认 mimo-v2.5），llm_cache key 含模型名，两厂商缓存互不污染可 A/B 对比；判定批次失败会自动换备用厂商（`LLM_FALLBACK`，另一套）兜底重试，双 key 都配置才启用；仍失败则整轮等待重试（60s×轮次递增、封顶 300s），不放弃任何批次。
 - Cookie 等于账号登录态，泄露即等于账号被盗，处理 `data/` 目录文件时保持谨慎。
 - 机场订阅链接（config.py SUB_URLS / 环境变量）与 data/mihomo_runtime/config.yaml 含凭证，均不入库、不打印；内置核心二进制在 data/ 或 vendor/（gitignore）。
