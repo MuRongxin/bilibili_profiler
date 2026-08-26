@@ -92,7 +92,7 @@ CLASH_SECRET = os.environ.get("CLASH_SECRET", "")
 CLASH_GROUP = os.environ.get("CLASH_GROUP", "")            # 轮换节点组名（内置核心默认 profiler）
 CLASH_PROXY_URL = os.environ.get("CLASH_PROXY_URL", "http://127.0.0.1:7890")
 # 单任务单元允许的兜底冷却圈数（整圈账号全风控 → 长冷却为最后手段）
-MAX_RISK_ROUNDS = 2
+MAX_RISK_ROUNDS = 5
 
 # ========== 破解配置 ==========
 MITM_MAX_UID = 10_000_000_000   # MITM 反查覆盖上限：全部 ≤10 位 UID（16位随机长UID不可解）
