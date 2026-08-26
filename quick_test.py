@@ -9,35 +9,61 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 # 强制行缓冲：输出被重定向/管道时也能实时看到进度（默认块缓冲会长时间无输出）
 sys.stdout.reconfigure(line_buffering=True)
 
-from config import LLM_API_KEY, HISTORY_DANMAKU_ENABLED
+from config import LLM_API_KEY, DATA_DIR
 from auth import get_auth_client
 from api_client import RiskControlError
 from combo_pool import build_pool
-from danmaku import collect_danmaku_data
+from danmaku import collect_danmaku_data, group_by_sender
 from spam_detector import batch_detect_spam
 from cringe_detector import detect_cringe_danmaku
-from comment import collect_comment_data
+from comment import fetch_comments, build_comment_uid_map, build_comment_location_map
 from uid_resolver import resolve_sender
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
-from storage import init_db, save_video_info, save_danmaku, save_comments
-from main import _merge_history_danmaku
+from storage import init_db, save_video_info, save_comments
 from web_autostart import maybe_launch_web
+
+# 冒烟采样上限：不跑全量视频，只取少量数据验证流水线
+QUICK_DANMAKU_LIMIT = 100   # 弹幕只取实时池前 100 条（跳过历史快照合并）
+QUICK_COMMENT_PAGES = 3     # 评论只翻 3 页（≈60 条主评论）
+QUICK_COMMENT_LIMIT = 50    # 评论截断条数
+
+
+class _Tee:
+    """stdout 双写：终端 + data/quick_test.log（冒烟日志可回溯，重定向时也有文件）"""
+
+    def __init__(self, path: str):
+        # buffering=1 行缓冲：日志实时可见（tail -f 可追），避免块缓冲长时间无输出
+        self._file = open(path, "w", encoding="utf-8", buffering=1)
+        self._out = sys.stdout
+
+    def write(self, s):
+        self._out.write(s)
+        self._file.write(s)
+
+    def flush(self):
+        self._out.flush()
+        self._file.flush()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="快速分析 - 只分析刷屏得分最高的前N个发送者")
+    parser = argparse.ArgumentParser(description="快速分析 - 采样少量数据验证流水线（弹幕100/评论50/用户N）")
     parser.add_argument("bvid", nargs="?", default="BV1ebg16jEhp",
                         help="视频BV号 (默认 BV1ebg16jEhp)")
-    parser.add_argument("--top", "-n", type=int, default=1,
-                        help="分析刷屏得分最高的前N个发送者 (默认 1)")
+    parser.add_argument("--top", "-n", type=int, default=10,
+                        help="分析刷屏得分最高的前N个发送者 (默认 10)")
     args = parser.parse_args()
     bvid = args.bvid
     top_n = max(1, args.top)  # 夹紧下限：--top 0/负数无意义
 
+    # 全程日志双写到 data/quick_test.log（后台/重定向运行时也能回看进度）
+    os.makedirs(DATA_DIR, exist_ok=True)
+    sys.stdout = _Tee(os.path.join(DATA_DIR, "quick_test.log"))
+    print(f"[日志] 同步写入 {os.path.join(DATA_DIR, 'quick_test.log')}")
+
     print(f"🎯 快速分析: {bvid}  (刷屏 Top {top_n})")
-    print(f"   策略: 全量弹幕 → 刷屏检测 → 只解 Top{top_n} UID\n")
+    print(f"   策略: 采样弹幕{QUICK_DANMAKU_LIMIT}条/评论{QUICK_COMMENT_LIMIT}条 → 刷屏检测 → 只解 Top{top_n} UID\n")
 
     # 1. 登录
     print("[1/6] 登录...")
@@ -45,24 +71,21 @@ def main():
     # 账号×IP 组合池（同主流程：风控换号+切节点，故障自动降级）
     pool = build_pool(client)
 
-    # 2. 采集全部弹幕
-    print("[2/6] 采集弹幕...")
-    video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, pool)
+    # 2. 采集弹幕（冒烟：只取实时池前 100 条，跳过历史快照合并）
+    print("[2/6] 采集弹幕（采样）...")
+    video_info, danmaku_list, _ = collect_danmaku_data(bvid, pool)
     print(f"   视频: {video_info.get('title')}")
+    danmaku_list = danmaku_list[:QUICK_DANMAKU_LIMIT]
+    sender_groups = group_by_sender(danmaku_list)
 
-    # 对齐主流程：开启历史弹幕时合并每日弹幕池快照，保证刷屏 top-N 口径与 run.py 一致
-    if HISTORY_DANMAKU_ENABLED:
-        danmaku_list, sender_groups = _merge_history_danmaku(video_info, danmaku_list, pool)
-
-    # 弹幕落库（供 web.py 弹幕浏览器查询；失败只警告不中断冒烟流程）
+    # 采样数据不落库（save_danmaku 是先删后插，会清掉该视频已有的全量弹幕）
     try:
         init_db()
         save_video_info(bvid, video_info)
-        save_danmaku(bvid, danmaku_list)
     except Exception as e:
-        print(f"   警告: 弹幕落库失败（{e}），web.py 中将无该视频数据")
+        print(f"   警告: 视频信息落库失败（{e}）")
 
-    print(f"   弹幕: {len(danmaku_list)} 条, 发送者: {len(sender_groups)} 人")
+    print(f"   弹幕采样: {len(danmaku_list)} 条, 发送者: {len(sender_groups)} 人")
 
     # 3. 刷屏检测 + 问题弹幕检测 → 兴趣分 Top N（对齐主流程兴趣口径）
     print("[3/6] 刷屏检测 + 问题弹幕检测...")
@@ -84,11 +107,14 @@ def main():
         grp = sender_groups[mid]
         print(f"   #{i} mid_hash={mid} score={score:.2f} level={level} 弹幕{grp['count']}条")
 
-    # 4. 收集评论
-    print("[4/6] 收集评论...")
+    # 4. 收集评论（冒烟：只翻 3 页再截断 50 条）
+    print("[4/6] 收集评论（采样）...")
     comments = []
     try:
-        comments, comment_uid_map, _ = collect_comment_data(video_info.get("aid", 0), pool)
+        comments = fetch_comments(video_info.get("aid", 0), pool, max_pages=QUICK_COMMENT_PAGES)
+        comments = comments[:QUICK_COMMENT_LIMIT]
+        comment_uid_map = build_comment_uid_map(comments)
+        print(f"   评论采样: {len(comments)} 条, UID映射: {len(comment_uid_map)} 个")
     except Exception as e:
         # 对齐主流程 phase_comment：评论采集失败降级为仅用CRC32破解，只警告不中断
         print(f"   评论采集失败 (将仅用CRC32破解): {e}")
@@ -98,7 +124,7 @@ def main():
         uid_comments.setdefault(c["uid"], []).append(c)
     for lst in uid_comments.values():
         lst.sort(key=lambda x: x.get("like", 0), reverse=True)
-    # 评论落库（跨视频足迹数据源，幂等去重；失败只警告不中断）
+    # 评论落库（INSERT OR IGNORE 幂等追加，不破坏已有数据；失败只警告不中断）
     try:
         save_comments(bvid, comments)
     except Exception as e:
