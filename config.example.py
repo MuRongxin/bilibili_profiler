@@ -168,6 +168,8 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "16384"))
+# LLM 判定并发上限（问题弹幕/问题评论；实际路数=min(批次数, 此值)；触发 429 限速自动退避重试）
+LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "16"))
 
 # 第二套 LLM：小米 MiMo（备选）。LLM_PROVIDER=mimo 切换启用；
 # 两套缓存按模型名隔离（cache key 含模型名），可同视频 A/B 对比判定质量

@@ -11,11 +11,15 @@
 """
 import hashlib
 import json
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import openai
 from openai import OpenAI
 
-from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, CRINGE_BATCH_SIZE,
-                    COMMENT_CRINGE_BATCH_SIZE, COMMENT_CRINGE_MAX_ITEMS)
+from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_CONCURRENCY,
+                    CRINGE_BATCH_SIZE, COMMENT_CRINGE_BATCH_SIZE, COMMENT_CRINGE_MAX_ITEMS)
 from storage import load_llm_cache, save_llm_cache
 
 # 问题弹幕类别（prompt 与聚合均引用，勿散落硬编码字符串）
@@ -80,6 +84,56 @@ def _parse_verdicts(raw_text: str) -> list[dict]:
     return [v for v in data if isinstance(v, dict) and "i" in v]
 
 
+def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
+                   prompt_builder, label: str) -> tuple[list[dict], int, int]:
+    """并发执行 LLM 判定批次，返回 (原始verdicts, 失败批次数, 总批次数)。
+
+    实际并发路数 = min(批次数, LLM_CONCURRENCY)——判定阶段无缓存命中，越早判完越好，
+    批次少时不空占线程、批次多时打满上限。单批触发 429 限速自动退避重试，
+    仍失败仅计数跳过、不中断整体，全部失败由调用方降级。
+    """
+    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+    total = len(batches)
+    workers = max(1, min(total, LLM_CONCURRENCY))
+
+    def work(bi: int) -> str:
+        for retry in range(3):      # 限速退避：429 时等一会再试，最多 2 次重试
+            try:
+                resp = client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": prompt_builder(batches[bi], bi * batch_size, video_info)}],
+                    max_tokens=LLM_MAX_TOKENS,
+                    temperature=0.3,  # 判定类任务低温，减少格式漂移
+                )
+                return resp.choices[0].message.content or ""
+            except openai.RateLimitError:
+                if retry == 2:
+                    raise
+                wait = 10 * (retry + 1) + random.uniform(0, 3)
+                print(f"[{label}] 批次 {bi + 1} 触发限速，{wait:.0f}s 后重试...")
+                time.sleep(wait)
+
+    verdicts, failed = [], 0
+    print(f"[{label}] 判定 {total} 批（并发 {workers} 路，LLM请求中）...")
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(work, bi): bi for bi in range(total)}
+        for fut in as_completed(futures):
+            bi = futures[fut]
+            try:
+                raw = fut.result()
+            except Exception as e:
+                print(f"[{label}] 警告: 批次 {bi + 1} 请求失败（{e}），跳过该批")
+                failed += 1
+                continue
+            batch_verdicts = _parse_verdicts(raw)
+            if not batch_verdicts and raw.strip() not in ("", "[]"):
+                print(f"[{label}] 警告: 批次 {bi + 1} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
+            verdicts.extend(batch_verdicts)
+            print(f"[{label}] 批次 {bi + 1}/{total} 完成（解析 {len(batch_verdicts)} 条）")
+    return verdicts, failed, total
+
+
 def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dict],
                           video_info: dict) -> dict[str, dict]:
     """
@@ -130,40 +184,19 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
         for c in group.get("contents", []):
             content_senders.setdefault((c or "").strip(), set()).add(mid_hash)
 
-    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-    verdicts = []
-    batches = [items[i:i + CRINGE_BATCH_SIZE] for i in range(0, len(items), CRINGE_BATCH_SIZE)]
-    failed = 0
-    for bi, batch in enumerate(batches, 1):
-        start_idx = (bi - 1) * CRINGE_BATCH_SIZE
-        print(f"[问题弹幕] 判定 {bi}/{len(batches)} 批（{len(batch)} 条，LLM请求中）...")
-        try:
-            resp = client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[{"role": "user", "content": _build_prompt(batch, start_idx, video_info)}],
-                max_tokens=LLM_MAX_TOKENS,
-                temperature=0.3,  # 判定类任务低温，减少格式漂移
-            )
-            raw = resp.choices[0].message.content or ""
-        except Exception as e:
-            print(f"[问题弹幕] 警告: 批次 {bi} 请求失败（{e}），跳过该批")
-            failed += 1
-            continue
-        batch_verdicts = _parse_verdicts(raw)
-        if not batch_verdicts and raw.strip() not in ("", "[]"):
-            print(f"[问题弹幕] 警告: 批次 {bi} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
-        accepted = 0
-        for v in batch_verdicts:
-            idx = v.get("i")
-            if isinstance(idx, int) and 0 <= idx < len(items) and v.get("category") in PROBLEM_CATEGORIES:
-                v["_content"] = items[idx]["content"]
-                verdicts.append(v)
-                accepted += 1
-        print(f"[问题弹幕] 批次 {bi}: 采纳 {accepted} 条（解析 {len(batch_verdicts)} 条）")
-
-    if failed == len(batches):
+    raw_verdicts, failed, total = _judge_batches(items, CRINGE_BATCH_SIZE, video_info,
+                                                 _build_prompt, "问题弹幕")
+    if failed == total:
         print("[问题弹幕] 警告: 全部批次失败，问题弹幕检测降级为空")
         return {}
+
+    verdicts = []
+    for v in raw_verdicts:
+        idx = v.get("i")
+        if isinstance(idx, int) and 0 <= idx < len(items) and v.get("category") in PROBLEM_CATEGORIES:
+            v["_content"] = items[idx]["content"]
+            verdicts.append(v)
+    print(f"[问题弹幕] 全部 {total} 批完成：采纳 {len(verdicts)} 条")
 
     # 按发送者聚合
     results: dict[str, dict] = {}
@@ -281,48 +314,26 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
             except (json.JSONDecodeError, ValueError, TypeError):
                 print("[问题评论] 警告: 缓存内容损坏，重新判定")
 
-    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-    results: dict[int, dict] = {}
-    batches = [items[i:i + COMMENT_CRINGE_BATCH_SIZE]
-               for i in range(0, len(items), COMMENT_CRINGE_BATCH_SIZE)]
-    failed = 0
-    for bi, batch in enumerate(batches, 1):
-        start_idx = (bi - 1) * COMMENT_CRINGE_BATCH_SIZE
-        print(f"[问题评论] 判定 {bi}/{len(batches)} 批（{len(batch)} 条，LLM请求中）...")
-        try:
-            resp = client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[{"role": "user", "content": _build_comment_prompt(batch, start_idx, video_info)}],
-                max_tokens=LLM_MAX_TOKENS,
-                temperature=0.3,  # 判定类任务低温，减少格式漂移
-            )
-            raw = resp.choices[0].message.content or ""
-        except Exception as e:
-            print(f"[问题评论] 警告: 批次 {bi} 请求失败（{e}），跳过该批")
-            failed += 1
-            continue
-        batch_verdicts = _parse_verdicts(raw)
-        if not batch_verdicts and raw.strip() not in ("", "[]"):
-            print(f"[问题评论] 警告: 批次 {bi} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
-        accepted = 0
-        for v in batch_verdicts:
-            idx = v.get("i")
-            if not (isinstance(idx, int) and 0 <= idx < len(items)
-                    and v.get("category") in PROBLEM_CATEGORIES):
-                continue
-            sev = v.get("severity", 1)
-            # 归一化：挡 bool/字符串/超界值，钳制到 1-3 的 int
-            sev = sev if isinstance(sev, int) and not isinstance(sev, bool) and 1 <= sev <= 3 else 1
-            verdict = {"category": v["category"], "severity": sev, "reason": v.get("reason", "")}
-            # 同一内容的所有 rpid 都标注（复制粘贴刷屏的评论同源同罪）
-            for rpid in content_rpids.get(items[idx]["content"], []):
-                results[rpid] = verdict
-            accepted += 1
-        print(f"[问题评论] 批次 {bi}: 采纳 {accepted} 条（解析 {len(batch_verdicts)} 条）")
-
-    if failed == len(batches):
+    raw_verdicts, failed, total = _judge_batches(items, COMMENT_CRINGE_BATCH_SIZE, video_info,
+                                                 _build_comment_prompt, "问题评论")
+    if failed == total:
         print("[问题评论] 警告: 全部批次失败，问题评论检测降级为空")
         return {}
+
+    results: dict[int, dict] = {}
+    for v in raw_verdicts:
+        idx = v.get("i")
+        if not (isinstance(idx, int) and 0 <= idx < len(items)
+                and v.get("category") in PROBLEM_CATEGORIES):
+            continue
+        sev = v.get("severity", 1)
+        # 归一化：挡 bool/字符串/超界值，钳制到 1-3 的 int
+        sev = sev if isinstance(sev, int) and not isinstance(sev, bool) and 1 <= sev <= 3 else 1
+        verdict = {"category": v["category"], "severity": sev, "reason": v.get("reason", "")}
+        # 同一内容的所有 rpid 都标注（复制粘贴刷屏的评论同源同罪）
+        for rpid in content_rpids.get(items[idx]["content"], []):
+            results[rpid] = verdict
+    print(f"[问题评论] 全部 {total} 批完成：标注 {len(results)} 条")
 
     if cache_key:
         if failed > 0:
