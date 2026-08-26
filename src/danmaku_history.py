@@ -162,7 +162,8 @@ def _fetch_day_danmaku(cid: int, date: str, client: BiliAPIClient) -> list[dict]
     return parse_danmaku_proto(resp.content)
 
 
-def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int] = None) -> list[dict]:
+def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int] = None,
+                          bvid: str | None = None, seen_dmids: set | None = None) -> list[dict]:
     """
     采集视频历史弹幕（弹幕池快照逐日遍历）
 
@@ -170,11 +171,28 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     返回的是原始快照合并结果（相邻日快照可能重叠），调用方需按 dmid 去重。
     受 HISTORY_MAX_MONTHS / HISTORY_MAX_DAYS 限制；单月/单日失败打印警告跳过，不中断。
 
+    bvid 提供时启用断点续采：逐日增量落库（append_danmaku 按 dmid 去重）+
+    phase_state 记录 last_date 检查点，中断后重跑从下一个日期继续；
+    seen_dmids 为实时池/库中已有 dmid 集合（None 时从库加载），跨调用复用。
+
     Returns:
-        与 danmaku.parse_danmaku_xml 同构的弹幕 dict 列表（另含 weight 字段，实测恒为 0）
+        本轮新采集的弹幕 dict 列表（续采时只含新日期部分；全量请读库）
     """
     if not HISTORY_DANMAKU_ENABLED:
         return []
+
+    last_date = None
+    fetched_before = 0
+    if bvid:
+        from storage import (append_danmaku, get_phase_state, load_danmaku,
+                             set_phase_state)
+        last_date = get_phase_state(bvid, "danmaku", "last_date") or None
+        fetched_before = int(get_phase_state(bvid, "danmaku", "fetched_days") or 0)
+        if seen_dmids is None:
+            seen_dmids = {r["dmid"] for r in load_danmaku(bvid) if r["dmid"]}
+        if last_date:
+            print(f"[历史弹幕] 断点续采：{last_date} 及以前的日期已完成，从下一日期继续")
+    seen_dmids = seen_dmids if seen_dmids is not None else set()
 
     now = time.localtime()
     end_ym = (now.tm_year, now.tm_mon)
@@ -196,7 +214,7 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         print(f"[历史弹幕] 时间跨度超限，仅回溯最近 {HISTORY_MAX_MONTHS} 个月（{months[0]} 起）")
 
     all_danmaku = []
-    fetched_days = 0
+    fetched_days = fetched_before   # 续采时从检查点累计（HISTORY_MAX_DAYS 上限跨运行生效）
     for month in months:
         if fetched_days >= HISTORY_MAX_DAYS:
             print(f"[历史弹幕] 已达天数上限 {HISTORY_MAX_DAYS}，停止回溯更早月份")
@@ -208,6 +226,8 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         for date in dates:
             if fetched_days >= HISTORY_MAX_DAYS:
                 break
+            if last_date and date <= last_date:
+                continue            # 断点续采：该日已在此前运行中落库
             try:
                 dms = _fetch_day_danmaku(cid, date, client)
             except Exception as e:
@@ -217,8 +237,15 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             fetched_days += 1
             month_count += len(dms)
             all_danmaku.extend(dms)
+            if bvid:
+                # 逐日增量落库 + 检查点：中断后重跑从下一日期继续
+                append_danmaku(bvid, dms, seen_dmids)
+                set_phase_state(bvid, "danmaku", "last_date", date)
+                set_phase_state(bvid, "danmaku", "fetched_days", str(fetched_days))
             print(f"[历史弹幕] {date}: {len(dms)} 条（第 {fetched_days} 天，累计 {len(all_danmaku)} 条）")
         print(f"[历史弹幕] {month}: {len(dates)} 天有弹幕，累计 {len(all_danmaku)} 条")
 
+    if bvid:
+        set_phase_state(bvid, "danmaku", "done", "1")
     print(f"[历史弹幕] 共采集 {fetched_days} 天，{len(all_danmaku)} 条历史弹幕")
     return all_danmaku

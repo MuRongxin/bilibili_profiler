@@ -36,7 +36,8 @@ def _dedup_contents(danmaku_list: list[dict]) -> list[dict]:
         if c:
             counts[c] = counts.get(c, 0) + 1
     items = [{"content": c, "count": n} for c, n in counts.items()]
-    items.sort(key=lambda x: x["count"], reverse=True)
+    # 次数相同按内容字典序决胜——保证跨运行排序稳定，批次级缓存才能命中
+    items.sort(key=lambda x: (-x["count"], x["content"]))
     return items
 
 
@@ -87,7 +88,7 @@ def _parse_verdicts(raw_text: str) -> list[dict]:
 
 
 def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
-                   prompt_builder, label: str) -> tuple[list[dict], int, int]:
+                   prompt_builder, label: str, cache_prefix: str = "") -> tuple[list[dict], int, int]:
     """并发执行 LLM 判定批次，返回 (原始verdicts, 失败批次数, 总批次数)。
 
     实际并发路数 = min(批次数, LLM_CONCURRENCY)——判定阶段无缓存命中，越早判完越好，
@@ -95,6 +96,9 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
     → 换备用厂商（LLM_FALLBACK，双厂商 key 都配了才启用）→ 仍失败进入整轮
     等待重试（60s×轮次递增、封顶 300s），不放弃任何批次直到成功，
     因此返回的失败批次数恒为 0（保留三元组仅维持调用方签名）。
+
+    cache_prefix 提供时启用批次级缓存（key 含模型名+批次内容指纹）：
+    判定中途（Ctrl+C/崩溃）重跑时已完成的批次直接命中，零 LLM 调用。
     """
     # 厂商链：主用 + 备用（备用 key 为空则不启用）
     providers = [(LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, "主用")]
@@ -112,7 +116,18 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
     total = len(batches)
     workers = max(1, min(total, LLM_CONCURRENCY))
 
+    def batch_cache_key(bi: int) -> str:
+        digest = hashlib.sha256("\n".join(sorted(
+            it["content"] for it in batches[bi])).encode("utf-8")).hexdigest()[:16]
+        return f"{cache_prefix}@batch:{LLM_MODEL}:{digest}"
+
     def work(bi: int) -> str:
+        bkey = batch_cache_key(bi) if cache_prefix else ""
+        if bkey:
+            cached = load_llm_cache(bkey)
+            if cached is not None:
+                print(f"[{label}] 批次 {bi + 1} 命中批次缓存，跳过 LLM 请求")
+                return cached
         prompt = prompt_builder(batches[bi], bi * batch_size, video_info)
         last_err = None
         for pi, (_, _, model, tag) in enumerate(providers):
@@ -126,7 +141,10 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                         max_tokens=LLM_MAX_TOKENS,
                         temperature=0.3,  # 判定类任务低温，减少格式漂移
                     )
-                    return resp.choices[0].message.content or ""
+                    raw = resp.choices[0].message.content or ""
+                    if bkey:
+                        save_llm_cache(bkey, raw)
+                    return raw
                 except openai.RateLimitError as e:
                     last_err = e
                     if retry == 2:
@@ -225,7 +243,7 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
             content_senders.setdefault((c or "").strip(), set()).add(mid_hash)
 
     raw_verdicts, _, total = _judge_batches(items, CRINGE_BATCH_SIZE, video_info,
-                                            _build_prompt, "问题弹幕")
+                                            _build_prompt, "问题弹幕", cache_prefix=cache_key)
 
     verdicts = []
     for v in raw_verdicts:
@@ -320,7 +338,8 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
         like_of[content] = max(like_of.get(content, 0), c.get("like", 0))
     items = [{"content": c} for c in content_rpids]
     # 评论量比弹幕更难压缩：按最高点赞降序截断，优先判定可见度高的评论
-    items.sort(key=lambda x: -like_of.get(x["content"], 0))
+    # （点赞相同按内容字典序决胜——保证跨运行排序稳定，批次级缓存才能命中）
+    items.sort(key=lambda x: (-like_of.get(x["content"], 0), x["content"]))
     if len(items) > COMMENT_CRINGE_MAX_ITEMS:
         print(f"[问题评论] 去重后 {len(items)} 条超出上限，按点赞截取前 {COMMENT_CRINGE_MAX_ITEMS} 条")
         items = items[:COMMENT_CRINGE_MAX_ITEMS]
@@ -348,7 +367,7 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
                 print("[问题评论] 警告: 缓存内容损坏，重新判定")
 
     raw_verdicts, _, total = _judge_batches(items, COMMENT_CRINGE_BATCH_SIZE, video_info,
-                                            _build_comment_prompt, "问题评论")
+                                            _build_comment_prompt, "问题评论", cache_prefix=cache_key)
 
     results: dict[int, dict] = {}
     for v in raw_verdicts:

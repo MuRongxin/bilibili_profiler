@@ -17,13 +17,17 @@ from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USE
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
-from storage import save_danmaku, save_comments, update_comment_problems
+from storage import save_comments, update_comment_problems
+from storage import load_danmaku, load_comments, append_danmaku
+from storage import get_phase_state, set_phase_state
 from auth import get_auth_client
 from combo_pool import build_pool
 from api_client import RiskControlError
 from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page, fetch_command_dms, build_command_uid_map
+from danmaku import get_video_info
 from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map
+from comment import build_comment_uid_map, build_comment_location_map
 from uid_resolver import resolve_all_senders, calc_crc32, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
 from spam_detector import batch_detect_spam
 from cringe_detector import detect_cringe_danmaku, detect_problem_comments
@@ -47,25 +51,76 @@ def phase_login():
     return get_auth_client()
 
 
-def phase_danmaku(bvid: str, client):
-    """阶段2: 采集弹幕（实时弹幕池 + 可选历史弹幕快照合并 + 互动弹幕明文mid）"""
+def phase_danmaku(bvid: str, client, resume: bool = True):
+    """阶段2: 采集弹幕（实时弹幕池 + 可选历史弹幕快照合并 + 互动弹幕明文mid）
+
+    断点续采（resume=True 的非 --force 路径）：
+    - danmaku 表已有完整数据（done=1，或本功能前旧版的完整落库）→ 直接读库，
+      跳过弹幕网络重采（视频信息/互动弹幕仍新鲜拉取，各 1 个请求）；
+    - 有部分数据（历史逐日检查点存在但无 done）→ 实时池已在库不重新拉，
+      历史弹幕从 last_date 检查点续采（danmaku_history 内逐日增量落库）；
+    - 无数据 → 全新采集：实时池先增量落库，再历史逐日续采，任意时刻中断可续。
+    """
     print("\n[Phase 2/6] 采集弹幕数据...")
+
+    if resume:
+        existing = load_danmaku(bvid)
+        if existing:
+            done = get_phase_state(bvid, "danmaku", "done")
+            last = get_phase_state(bvid, "danmaku", "last_date")
+            video_info = get_video_info(bvid, client)
+            save_video_info(bvid, video_info)
+            command_dms = fetch_command_dms(video_info, client)
+            video_info["command_dms"] = command_dms
+            if done == "1" or (done is None and last is None):
+                # 完整数据：直接读库，跳过弹幕网络重采
+                danmaku_list = existing
+                print(f"[Phase 2] 断点续采：从库读回 {len(danmaku_list)} 条弹幕，跳过弹幕重采")
+            else:
+                # 半成品：历史弹幕从检查点续采（实时池已在库）
+                if HISTORY_DANMAKU_ENABLED:
+                    cid = get_cid_for_page(video_info, 0)
+                    fetch_history_danmaku(cid, client, video_info.get("pubdate", 0), bvid=bvid)
+                else:
+                    set_phase_state(bvid, "danmaku", "done", "1")
+                danmaku_list = load_danmaku(bvid)
+                print(f"[Phase 2] 断点续采：历史弹幕续采完成，库内共 {len(danmaku_list)} 条")
+            return video_info, danmaku_list, group_by_sender(danmaku_list), command_dms
+
     video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, client)
 
-    # 实时弹幕池只保留最近几千条；开启历史弹幕时拉取每日弹幕池快照补全历史
-    if HISTORY_DANMAKU_ENABLED:
-        danmaku_list, sender_groups = _merge_history_danmaku(video_info, danmaku_list, client)
+    # 实时弹幕池先增量落库存底（中断后重跑可基于库内数据续采历史弹幕）
+    seen_dmids: set = set()
+    try:
+        append_danmaku(bvid, danmaku_list, seen_dmids)
+    except Exception as e:
+        print(f"[Phase 2] 警告: 弹幕落库失败（{e}），web.py 弹幕浏览器将无本视频数据")
 
-    # 落库时机在历史合并之后：danmaku_coverage 由 _merge_history_danmaku 写入 video_info，
+    # 实时弹幕池只保留最近几千条；开启历史弹幕时逐日拉取弹幕池快照补全历史
+    # （bvid 传入后逐日增量落库+检查点，中断可续；fetch 内部完成时置 done=1）
+    if HISTORY_DANMAKU_ENABLED:
+        try:
+            cid = get_cid_for_page(video_info, 0)
+            history_list = fetch_history_danmaku(cid, client, video_info.get("pubdate", 0),
+                                                 bvid=bvid, seen_dmids=seen_dmids)
+            merged = load_danmaku(bvid)
+            video_info["danmaku_coverage"] = {
+                "realtime": len(danmaku_list),
+                "history": len(history_list),
+                "history_new": len(merged) - len(danmaku_list),
+                "merged": len(merged),
+            }
+            danmaku_list, sender_groups = merged, group_by_sender(merged)
+        except Exception as e:
+            print(f"[Main] 警告：历史弹幕采集失败，降级为仅实时弹幕池: {e}")
+    else:
+        set_phase_state(bvid, "danmaku", "done", "1")
+
+    # 落库时机在历史合并之后：danmaku_coverage 由上方写入 video_info，
     # 提前保存会导致 Web 概览页拿不到覆盖率
     save_video_info(bvid, video_info)
 
-    # 全量弹幕落库（web.py 弹幕浏览器数据源；失败只警告不中断主流程）
-    try:
-        save_danmaku(bvid, danmaku_list)
-        print(f"[Phase 2] 已落库 {len(danmaku_list)} 条弹幕（danmaku 表）")
-    except Exception as e:
-        print(f"[Phase 2] 警告: 弹幕落库失败（{e}），web.py 弹幕浏览器将无本视频数据")
+    print(f"[Phase 2] 已落库 {len(load_danmaku(bvid))} 条弹幕（danmaku 表）")
 
     # 互动弹幕（含明文mid，需SESSDATA；失败降级不影响主流程）
     command_dms = fetch_command_dms(video_info, client)
@@ -163,23 +218,45 @@ def select_problem_comment_authors(comments: list[dict], comment_problems: dict)
             or st["hits"] >= COMMENT_AUTHOR_MIN_HITS}
 
 
-def phase_comment(video_info: dict, client):
-    """阶段3: 采集评论 + 充电名单（失败不影响后续流程）"""
+def phase_comment(video_info: dict, client, resume: bool = True):
+    """阶段3: 采集评论 + 充电名单（失败不影响后续流程）
+
+    断点续采（resume=True 的非 --force 路径）：comments 表有完整数据
+    （done=1，或本功能前旧版的完整落库）→ 直接读库跳过网络重采；
+    有部分数据（游标检查点存在但无 done）→ collect_comment_data 内部
+    从游标续页，已入库评论靠 UNIQUE 约束去重。"""
     print("\n[Phase 3/6] 采集评论区数据...")
+    bvid = video_info.get("bvid", "")
     aid = video_info.get("aid", 0)
+    # 充电名单（1 个请求，各路径都新鲜拉取）
+    up_mid = (video_info.get("owner") or {}).get("mid", 0)
+
+    if resume and bvid:
+        existing = load_comments(bvid)
+        if existing:
+            done = get_phase_state(bvid, "comment", "done")
+            mode = get_phase_state(bvid, "comment", "mode")
+            if done == "1" or (done is None and mode is None):
+                # 完整数据（含旧版完整落库）：直接读库
+                print(f"[Phase 3] 断点续采：从库读回 {len(existing)} 条评论，跳过评论重采")
+                charge_uid_map = fetch_charge_uid_map(bvid, aid, up_mid, client) if up_mid else {}
+                return (existing, build_comment_uid_map(existing),
+                        build_comment_location_map(existing), charge_uid_map)
+            # 半成品：游标续页（collect_comment_data 返回库内全量）
+            print(f"[Phase 3] 断点续采：评论从检查点续采（库内已有 {len(existing)} 条）")
+
     if not aid:
         print("[Phase 3] 警告: 未获取到有效 aid，跳过评论采集（将仅用CRC32破解）")
         return [], {}, {}, {}
     comments, comment_uid_map, comment_location_map = [], {}, {}
     try:
-        comments, comment_uid_map, comment_location_map = collect_comment_data(aid, client)
+        comments, comment_uid_map, comment_location_map = collect_comment_data(aid, client, bvid=bvid or None)
     except Exception as e:
         print(f"[Phase 3] 评论采集失败 (将仅用其他来源): {e}")
     # 充电名单（独立降级：评论失败也照常尝试）
-    up_mid = (video_info.get("owner") or {}).get("mid", 0)
     charge_uid_map = {}
     if up_mid:
-        charge_uid_map = fetch_charge_uid_map(video_info.get("bvid", ""), aid, up_mid, client)
+        charge_uid_map = fetch_charge_uid_map(bvid, aid, up_mid, client)
     return comments, comment_uid_map, comment_location_map, charge_uid_map
 
 
@@ -586,8 +663,12 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         clear_video_cache(bvid)
         print(f"[Main] --force 已清除 {bvid} 的缓存，全部重新采集")
 
+    # 断点续采：阶段2/3 各自按库内数据存在性独立判断（phase_danmaku/phase_comment
+    # 内部的 resume 逻辑），弹幕/评论/解析/采集任意位置中断后重跑都能续上；
+    # 要刷新数据用 --force（清除该视频全部缓存与检查点）。
+
     # 阶段2: 弹幕
-    video_info, danmaku_list, sender_groups, command_dms = phase_danmaku(bvid, pool)
+    video_info, danmaku_list, sender_groups, command_dms = phase_danmaku(bvid, pool, resume=not force)
 
     # 弹幕为空时提前终止：后续评论/解析/画像均无意义，避免白跑全流程产出空报告
     if not danmaku_list:
@@ -597,22 +678,24 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     # 阶段2.5: 刷屏检测（本地，提前到解析前驱动选人）
     spam_results = phase_spam(bvid, sender_groups)
 
-    # 阶段2.6: 问题弹幕检测（LLM，可降级）
+    # 阶段2.6: 问题弹幕检测（LLM，可降级；批次级缓存，中断后重跑已完成批次直接命中）
     cringe_results = phase_cringe(danmaku_list, sender_groups, video_info)
 
     # 阶段3: 评论 + 充电名单（comment_location_map 为 uid→IP属地，uid_comments 阶段6贯通进画像）
-    comments, comment_uid_map, comment_location_map, charge_uid_map = phase_comment(video_info, pool)
+    comments, comment_uid_map, comment_location_map, charge_uid_map = phase_comment(
+        video_info, pool, resume=not force)
+    # 评论落库（跨视频足迹数据源，幂等去重；失败只警告不中断）
+    try:
+        save_comments(bvid, comments)
+    except Exception as e:
+        print(f"    警告: 评论落库失败（{e}），跨视频足迹将缺评论")
+
     # uid → 该用户在本视频的评论（按点赞降序），供阶段6注入画像与阶段7深掘证据包
     uid_comments: dict[int, list] = {}
     for c in comments:
         uid_comments.setdefault(c["uid"], []).append(c)
     for lst in uid_comments.values():
         lst.sort(key=lambda x: x.get("like", 0), reverse=True)
-    # 评论落库（跨视频足迹数据源，幂等去重；失败只警告不中断）
-    try:
-        save_comments(bvid, comments)
-    except Exception as e:
-        print(f"    警告: 评论落库失败（{e}），跨视频足迹将缺评论")
 
     # 阶段3.5: 问题评论检测（LLM，可降级）：结果回写 comments.problem 列（web 端高回复
     # 评论页标注）并就地注入 comment dict（uid_comments 共享同一批 dict 引用，阶段6画像

@@ -63,10 +63,10 @@ src/
 ├── up_analyzer.py       # UP 主相关分析
 ├── report.py            # 报告渲染函数库（用户卡片/问题弹幕榜/图表统计/基础CSS，被 web.py 复用）
 ├── exporter.py          # CSV/JSON 数据导出（report_{BV号}_{时间} 前缀，Web 报告页提供下载链接）
-└── storage.py           # SQLite 持久化（data/profiler.db），支撑断点续采与 LLM 结果缓存（llm_cache 表、danmaku 全量弹幕表（含 mode/color/pool/dmid 属性列）、comments 评论表（含 uname 昵称、parent_rpid 回复树、problem 问题标注）、false_positive 误报标记表（kind: dm=弹幕内容/cmt=评论rpid，展示层扣除聚合））
+└── storage.py           # SQLite 持久化（data/profiler.db），支撑断点续采与 LLM 结果缓存（llm_cache 表、danmaku 全量弹幕表（含 mode/color/pool/dmid/page 属性列）、comments 评论表（含 uname 昵称、parent_rpid 回复树、problem 问题标注、location IP属地）、false_positive 误报标记表（kind: dm=弹幕内容/cmt=评论rpid，展示层扣除聚合）、phase_state 阶段检查点表（弹幕历史 last_date/评论游标，中断续采））
 ```
 
-数据流：`run.py` → `main.run_analysis(bvid, force, max_users)`，各阶段通过 SQLite 缓存中间结果（已解析的 sender、已采集的 user_data），阶段5采集成功立即落库，因此 Ctrl+C 中断后重跑可恢复；`--force` 会清除该视频的缓存并强制重采全部用户（llm_cache 中仅清该视频的问题弹幕/问题评论判定缓存 `cringe:{bvid}:*` 与 `cmt:{bvid}:*`，深掘缓存 `deep:{uid}:*` 跨视频复用、保留）。全局映射库 `global_uid_map` 跨视频沉淀可靠 mid_hash→UID 映射（多候选碰撞条目不沉淀），解析率随使用次数累积提升。
+数据流：`run.py` → `main.run_analysis(bvid, force, max_users)`，全阶段断点续采（任意位置 Ctrl+C/崩溃后重跑可续）：弹幕逐日增量落库+phase_state 检查点（danmaku 表 last_date/fetched_days/done，历史快照中断后从下一日期续采）、评论逐页落库+游标检查点（comments 表 mode/page/offset/done，wbi/legacy 双路径续页）、LLM 判定批次级缓存（llm_cache 批次 key=整段缓存key@batch:模型:内容指纹，已完成批次重跑零调用）、senders 逐条落库、users 每人落库；非 --force 重跑时各阶段按库内数据存在性独立跳过（完整判据：done=1 或本功能前的旧版完整落库），`--force` 清除该视频全部缓存与检查点强制重采（llm_cache 中仅清该视频的问题弹幕/问题评论判定缓存 `cringe:{bvid}:*` 与 `cmt:{bvid}:*`，深掘缓存 `deep:{uid}:*` 跨视频复用、保留）。全局映射库 `global_uid_map` 跨视频沉淀可靠 mid_hash→UID 映射（多候选碰撞条目不沉淀），解析率随使用次数累积提升。
 
 ## 开发约定
 

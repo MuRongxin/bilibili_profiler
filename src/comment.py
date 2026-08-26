@@ -12,6 +12,7 @@ import zlib
 from api_client import BiliAPIClient
 from config import COMMENT_MAIN_WBI_URL, COMMENT_MAIN_URL, COMMENT_REPLY_URL
 from config import MAX_COMMENT_PAGES, COMMENT_REPLY_MAX_PAGES, CHARGE_LIST_URL
+from storage import get_phase_state, load_comments, save_comments, set_phase_state
 from uid_resolver import calc_crc32
 
 
@@ -127,14 +128,24 @@ def _collect_page(replies: list, oid: int, client: BiliAPIClient) -> list[dict]:
     return comments
 
 
-def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list[dict] | None:
-    """wbi/main 游标翻页采集主评论。首页即失败返回 None（调用方降级旧接口）"""
+def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
+                        bvid: str | None = None, resume_offset: str = "",
+                        resume_page: int = 0) -> list[dict] | None:
+    """wbi/main 游标翻页采集主评论。首页即失败返回 None（调用方降级旧接口）。
+
+    bvid 提供时启用断点续采：每页落库 + phase_state 记录游标/页码/模式，
+    中断后重跑从 resume_offset 继续翻页（已入库评论靠 UNIQUE 约束去重）。
+    自然终止（is_end/无新评论/页数耗尽）才写 done=1；中途失败不写，
+    下次重跑仍从最后游标续采。"""
     all_comments = []
-    offset = ""
+    offset = resume_offset
+    natural_end = True   # 错误中断时不写 done，下次重跑续采
     seen_rpids = set()  # 已采评论的 rpid：该接口的 next_offset 可能连续多页相同但内容不同（实测），
                         # 只有"整页无新 rpid"才是真的重复页
+    if resume_offset:
+        print(f"[Comment] 断点续采：从第 {resume_page + 1} 页的游标继续")
 
-    for page in range(1, max_pages + 1):
+    for page in range(resume_page + 1, max_pages + 1):
         data = client.get(COMMENT_MAIN_WBI_URL, params={
             "oid": oid,
             "type": 1,
@@ -145,9 +156,10 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list
 
         if data.get("code") != 0:
             print(f"[Comment] wbi/main 获取评论失败 (第{page}页): {data.get('message')}")
-            if page == 1:
+            natural_end = False
+            if page == 1 and not resume_offset:
                 return None  # 首页即失败（签名/风控等），整体降级旧接口
-            break            # 中途失败保留已采部分
+            break            # 中途失败保留已采部分（不写 done，下次重跑续采）
 
         # 防御 data["data"] 为 None（风控/空结果时 API 会返回 data: null）
         page_data = data.get("data") or {}
@@ -166,7 +178,14 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list
         cursor = page_data.get("cursor") or {}
         next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
 
-        all_comments.extend(_collect_page(new_replies, oid, client))
+        page_comments = _collect_page(new_replies, oid, client)
+        all_comments.extend(page_comments)
+        if bvid:
+            # 整页采完（含子评论补采）才落库+推进检查点：页内中断重跑会整页重采（UNIQUE 去重兜底）
+            save_comments(bvid, page_comments)
+            set_phase_state(bvid, "comment", "mode", "wbi")
+            set_phase_state(bvid, "comment", "page", str(page))
+            set_phase_state(bvid, "comment", "offset", next_offset or offset)
         print(f"[Comment] 第 {page}/{max_pages} 页: +{len(new_replies)} 条主评论（累计 {len(all_comments)} 条含子评论）")
 
         if cursor.get("is_end", False) or not next_offset:
@@ -176,15 +195,23 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int) -> list
         # 循环耗尽（未提前终止）：评论区被采集上限截断
         print(f"[Comment] 已达采集上限 {max_pages} 页，评论区可能未采完（可调大 MAX_COMMENT_PAGES）")
 
+    if bvid and natural_end:
+        set_phase_state(bvid, "comment", "done", "1")
     return all_comments
 
 
-def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int) -> list[dict]:
-    """旧接口 /x/v2/reply/main（next 游标）采集，作为 wbi/main 失败时的降级路径"""
+def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int,
+                           bvid: str | None = None, resume_next: int = 0,
+                           resume_page: int = 0) -> list[dict]:
+    """旧接口 /x/v2/reply/main（next 游标）采集，作为 wbi/main 失败时的降级路径。
+    断点续采语义同 _fetch_comments_wbi（next 为整数页游标）。"""
     all_comments = []
-    next_page = 0
+    next_page = resume_next
+    natural_end = True
+    if resume_next:
+        print(f"[Comment] 断点续采：从旧接口第 {resume_page + 1} 页继续")
 
-    for page in range(1, max_pages + 1):
+    for page in range(resume_page + 1, max_pages + 1):
         data = client.get(COMMENT_MAIN_URL, params={
             "type": 1,
             "oid": oid,
@@ -195,6 +222,7 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int) -> l
 
         if data.get("code") != 0:
             print(f"[Comment] 获取评论失败: {data.get('message')}")
+            natural_end = False
             break
 
         # 防御 data["data"] 为 None（风控/空结果时 API 会返回 data: null）
@@ -203,21 +231,30 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int) -> l
         if not replies:
             break
 
-        all_comments.extend(_collect_page(replies, oid, client))
-        print(f"[Comment] 旧接口第 {page}/{max_pages} 页: +{len(replies)} 条主评论（累计 {len(all_comments)} 条含子评论）")
-
+        page_comments = _collect_page(replies, oid, client)
+        all_comments.extend(page_comments)
         cursor = page_data.get("cursor") or {}
         next_page = cursor.get("next", 0)
+        if bvid:
+            save_comments(bvid, page_comments)
+            set_phase_state(bvid, "comment", "mode", "legacy")
+            set_phase_state(bvid, "comment", "page", str(page))
+            set_phase_state(bvid, "comment", "offset", str(next_page))
+        print(f"[Comment] 旧接口第 {page}/{max_pages} 页: +{len(replies)} 条主评论（累计 {len(all_comments)} 条含子评论）")
+
         if cursor.get("is_end", False) or not next_page:
             break
     else:
         # 循环耗尽（未提前终止）：评论区被采集上限截断
         print(f"[Comment] 已达采集上限 {max_pages} 页，评论区可能未采完（可调大 MAX_COMMENT_PAGES）")
 
+    if bvid and natural_end:
+        set_phase_state(bvid, "comment", "done", "1")
     return all_comments
 
 
-def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT_PAGES) -> list[dict]:
+def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT_PAGES,
+                   bvid: str | None = None) -> list[dict]:
     """
     获取视频评论列表（主评论+子评论）
 
@@ -226,14 +263,28 @@ def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT
     Args:
         oid: 视频aid
         max_pages: 最大翻页数
+        bvid: 提供时启用断点续采（每页落库 + phase_state 游标检查点）；
+              此前中断的采集从检查点续页，已入库评论靠 UNIQUE 约束去重。
+              检查点模式与本次实际走通的接口不同（wbi/legacy 互换）时忽略游标从头翻页。
 
     Returns:
-        评论列表，每条包含uid、uname、level、content、location等
+        本轮新采评论列表（续采时只含新页部分；全量请用 load_comments 读库）
     """
-    comments = _fetch_comments_wbi(oid, client, max_pages)
+    resume_offset, resume_next, resume_page = "", 0, 0
+    if bvid:
+        mode = get_phase_state(bvid, "comment", "mode")
+        resume_page = int(get_phase_state(bvid, "comment", "page") or 0)
+        offset_ck = get_phase_state(bvid, "comment", "offset") or ""
+        if mode == "wbi":
+            resume_offset = offset_ck
+        elif mode == "legacy":
+            resume_next = int(offset_ck or 0)
+    comments = _fetch_comments_wbi(oid, client, max_pages, bvid=bvid,
+                                   resume_offset=resume_offset, resume_page=resume_page)
     if comments is None:
         print("[Comment] wbi/main 接口不可用，降级为旧版 /x/v2/reply/main")
-        comments = _fetch_comments_legacy(oid, client, max_pages)
+        comments = _fetch_comments_legacy(oid, client, max_pages, bvid=bvid,
+                                          resume_next=resume_next, resume_page=resume_page)
     return comments
 
 
@@ -279,15 +330,24 @@ def build_comment_location_map(comments: list[dict]) -> dict[int, str]:
     return location_map
 
 
-def collect_comment_data(aid: int, client: BiliAPIClient) -> tuple[list[dict], dict[str, int], dict[int, str]]:
+def collect_comment_data(aid: int, client: BiliAPIClient,
+                         bvid: str | None = None) -> tuple[list[dict], dict[str, int], dict[int, str]]:
     """
     采集评论数据并构建UID映射与IP属地映射
+
+    Args:
+        bvid: 提供时启用断点续采（fetch_comments 内部逐页落库+游标检查点），
+              返回值为库存全量评论（含此前已入库部分）
 
     Returns:
         (comments_list, crc32_to_uid_map, uid_to_location_map)
     """
     print(f"[Comment] 获取评论区 (AID:{aid})...")
-    comments = fetch_comments(aid, client)
+    comments = fetch_comments(aid, client, bvid=bvid)
+    if bvid:
+        # 续采路径 fetch 只返回本轮新页；全量从库读回
+        comments = load_comments(bvid)
+    uid_map = build_comment_uid_map(comments)
     uid_map = build_comment_uid_map(comments)
     location_map = build_comment_location_map(comments)
     sub_count = sum(1 for c in comments if c.get("is_sub"))

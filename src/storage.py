@@ -119,6 +119,9 @@ def init_db():
             cursor.execute("ALTER TABLE danmaku ADD COLUMN pool INTEGER NOT NULL DEFAULT 0")
         if "dmid" not in dm_cols:
             cursor.execute("ALTER TABLE danmaku ADD COLUMN dmid INTEGER NOT NULL DEFAULT 0")
+        # 旧库迁移：danmaku 表补 page 列（分P序号，断点续采从库读回后 group_by_sender 要用）
+        if "page" not in dm_cols:
+            cursor.execute("ALTER TABLE danmaku ADD COLUMN page INTEGER NOT NULL DEFAULT 1")
 
         # 评论表（跨视频足迹 + 高回复评论页数据源；reply_count 只对主评论有意义，
         # root_rpid 记录子评论所属主评论的 rpid，供「高回复评论」页关联争议主楼与回复）
@@ -157,6 +160,9 @@ def init_db():
         # 旧库迁移：comments 表补 uname（高回复评论树直接显示用户名）
         if "uname" not in comment_cols:
             cursor.execute("ALTER TABLE comments ADD COLUMN uname TEXT NOT NULL DEFAULT ''")
+        # 旧库迁移：comments 表补 location（IP 属地，断点续采从库读回评论时画像地域维度用）
+        if "location" not in comment_cols:
+            cursor.execute("ALTER TABLE comments ADD COLUMN location TEXT NOT NULL DEFAULT ''")
 
         # 误报标记表（P2-a）：人工标注 LLM 误判的问题弹幕/评论。
         # kind: dm=问题弹幕（target=弹幕内容，判定按内容去重故同内容同源同罪）
@@ -182,12 +188,43 @@ def init_db():
             )
         ''')
 
+        # 阶段检查点表（断点续采）：弹幕历史逐日进度、评论翻页游标等，
+        # 任意位置中断（Ctrl+C/崩溃）后重跑从检查点继续
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS phase_state (
+                bvid TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (bvid, phase, key)
+            )
+        ''')
+
         conn.commit()
 
         # 清理旧版本的 progress 表（断点续采已改为纯 senders/users 缓存机制）
         cursor.execute("DROP TABLE IF EXISTS progress")
         conn.commit()
     print("[Storage] 数据库初始化完成")
+
+
+def get_phase_state(bvid: str, phase: str, key: str) -> str | None:
+    """读检查点；无记录返回 None"""
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT value FROM phase_state WHERE bvid=? AND phase=? AND key=?",
+            (bvid, phase, key)).fetchone()
+    return row["value"] if row else None
+
+
+def set_phase_state(bvid: str, phase: str, key: str, value: str):
+    """写检查点（幂等覆盖）"""
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO phase_state (bvid, phase, key, value) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(bvid, phase, key) DO UPDATE SET value=excluded.value",
+            (bvid, phase, key, value))
+        conn.commit()
 
 
 # ========== 视频数据 ==========
@@ -315,20 +352,44 @@ def has_user_data(uid: int) -> bool:
 def save_danmaku(bvid: str, danmaku_list: list[dict]):
     """阶段2弹幕合并后批量落库：先删该 bvid 旧行再插入，幂等可重跑。
 
-    存 bvid/mid_hash/content/time/timestamp/mode/color/pool/dmid 九列；
-    Web API 直接 SQL 查询，无 load_danmaku。
+    存 bvid/mid_hash/content/time/timestamp/mode/color/pool/dmid/page 十列。
     """
     rows = [(bvid, dm["mid_hash"], dm["content"], dm["time"], dm["timestamp"],
-             dm.get("mode", 1), dm.get("color", ""), dm.get("pool", 0), dm.get("dmid", 0))
+             dm.get("mode", 1), dm.get("color", ""), dm.get("pool", 0), dm.get("dmid", 0),
+             dm.get("page", 1))
             for dm in danmaku_list]
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
         cursor.executemany(
-            "INSERT INTO danmaku (bvid, mid_hash, content, time, timestamp, mode, color, pool, dmid) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO danmaku (bvid, mid_hash, content, time, timestamp, mode, color, pool, dmid, page) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows)
         conn.commit()
+
+
+def append_danmaku(bvid: str, danmaku_list: list[dict], seen_dmids: set) -> int:
+    """增量落库（断点续采用）：按 dmid 去重——已见过的 dmid（含库中已有与本次新插入）
+    跳过，dmid=0 无法判重直接插入（历史快照 dmid 恒非 0，实时池个别为 0）。
+    seen_dmids 由调用方持有并在调用间复用；返回实际插入条数。"""
+    rows = []
+    for dm in danmaku_list:
+        dmid = dm.get("dmid", 0)
+        if dmid and dmid in seen_dmids:
+            continue
+        if dmid:
+            seen_dmids.add(dmid)
+        rows.append((bvid, dm["mid_hash"], dm["content"], dm["time"], dm["timestamp"],
+                     dm.get("mode", 1), dm.get("color", ""), dm.get("pool", 0), dmid,
+                     dm.get("page", 1)))
+    if rows:
+        with closing(get_db()) as conn:
+            conn.executemany(
+                "INSERT INTO danmaku (bvid, mid_hash, content, time, timestamp, mode, color, pool, dmid, page) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows)
+            conn.commit()
+    return len(rows)
 
 
 def save_comments(bvid: str, comments: list[dict]):
@@ -336,25 +397,55 @@ def save_comments(bvid: str, comments: list[dict]):
 
     UNIQUE(bvid, rpid, uid) + INSERT OR IGNORE 幂等去重：同一次分析重复落库、
     --force 重采（清缓存后重采同一批评论）都不会产生重复行。
-    只存基础列；sign/avatar/location 等仅用于当次运行的内存流程，不入库。
+    只存基础列；sign/avatar 等仅用于当次运行的内存流程，不入库。
+    location（IP属地）入库：断点续采从库读回评论时画像地域维度要用。
     problem 列由 LLM 问题评论检测后经 update_comment_problems 回写。
-    uname 在冲突时回填（旧行无昵称时补上），其余列冲突不覆盖（首采快照为准）。
+    uname/location 在冲突时回填（旧行缺时补上），其余列冲突不覆盖（首采快照为准）。
     """
     rows = [(bvid, c["uid"], c.get("uname", ""), c.get("rpid", 0), c.get("content", ""),
              c.get("ctime", 0), c.get("like", 0), 1 if c.get("is_sub") else 0,
-             c.get("reply_count", 0), c.get("root_rpid", 0), c.get("parent_rpid", 0))
+             c.get("reply_count", 0), c.get("root_rpid", 0), c.get("parent_rpid", 0),
+             c.get("location", ""))
             for c in comments if c.get("uid") and c.get("content")]
     if not rows:
         return
     with closing(get_db()) as conn:
         conn.executemany(
             "INSERT INTO comments "
-            "(bvid, uid, uname, rpid, content, ctime, like, is_sub, reply_count, root_rpid, parent_rpid) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "(bvid, uid, uname, rpid, content, ctime, like, is_sub, reply_count, root_rpid, parent_rpid, location) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(bvid, rpid, uid) DO UPDATE SET "
-            "uname = CASE WHEN excluded.uname != '' THEN excluded.uname ELSE comments.uname END",
+            "uname = CASE WHEN excluded.uname != '' THEN excluded.uname ELSE comments.uname END, "
+            "location = CASE WHEN excluded.location != '' THEN excluded.location ELSE comments.location END",
             rows)
         conn.commit()
+
+
+def load_danmaku(bvid: str) -> list[dict]:
+    """从库读回某视频的全部弹幕（断点续采用：跳过阶段2网络重采）。
+    返回与采集侧同形的 dict 列表。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT mid_hash, content, time, timestamp, mode, color, pool, dmid, page "
+            "FROM danmaku WHERE bvid = ?", (bvid,)).fetchall()
+    return [{"mid_hash": r["mid_hash"], "content": r["content"], "time": r["time"],
+             "timestamp": r["timestamp"], "mode": r["mode"], "color": r["color"],
+             "pool": r["pool"], "dmid": r["dmid"], "page": r["page"]} for r in rows]
+
+
+def load_comments(bvid: str) -> list[dict]:
+    """从库读回某视频的全部评论（断点续采用：跳过阶段3网络重采）。
+    返回与采集侧同形的 dict 列表（problem 列带出 LLM 标注；location 旧行可能为空）。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT uid, uname, rpid, content, ctime, like, is_sub, reply_count, "
+            "root_rpid, parent_rpid, problem, location "
+            "FROM comments WHERE bvid = ?", (bvid,)).fetchall()
+    return [{"uid": r["uid"], "uname": r["uname"], "rpid": r["rpid"],
+             "content": r["content"], "ctime": r["ctime"], "like": r["like"],
+             "is_sub": bool(r["is_sub"]), "reply_count": r["reply_count"],
+             "root_rpid": r["root_rpid"], "parent_rpid": r["parent_rpid"],
+             "problem": r["problem"], "location": r["location"]} for r in rows]
 
 
 def update_comment_problems(bvid: str, verdicts: dict):
@@ -466,6 +557,7 @@ def clear_video_cache(bvid: str):
         cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,))
+        cursor.execute("DELETE FROM phase_state WHERE bvid = ?", (bvid,))
         # 该视频的问题弹幕/问题评论判定缓存一并清除（key 前缀 cringe:/cmt: + {bvid}:）；
         # 深掘缓存 key 为 deep:{uid}:...，按用户跨视频复用，不清
         cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cringe:{bvid}:%",))
@@ -501,6 +593,8 @@ def delete_video_data(bvid: str) -> dict:
         counts["false_positive"] = cursor.execute(
             "DELETE FROM false_positive WHERE bvid = ?", (bvid,)).rowcount
         counts["videos"] = cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,)).rowcount
+        counts["phase_state"] = cursor.execute(
+            "DELETE FROM phase_state WHERE bvid = ?", (bvid,)).rowcount
         counts["cringe_cache"] = cursor.execute(
             "DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cringe:{bvid}:%",)).rowcount
         counts["cmt_cache"] = cursor.execute(
