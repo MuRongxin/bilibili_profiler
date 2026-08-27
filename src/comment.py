@@ -343,11 +343,14 @@ def collect_comment_data(aid: int, client: BiliAPIClient,
         (comments_list, crc32_to_uid_map, uid_to_location_map)
     """
     print(f"[Comment] 获取评论区 (AID:{aid})...")
+    if bvid:
+        # 新格式哨兵：先于首页落库写标记，与"本功能前旧版完整落库"区分开——
+        # 否则中断点早于首个游标检查点时，重跑会被误判为完整而跳过剩余翻页
+        set_phase_state(bvid, "comment", "format", "v2")
     comments = fetch_comments(aid, client, bvid=bvid)
     if bvid:
         # 续采路径 fetch 只返回本轮新页；全量从库读回
         comments = load_comments(bvid)
-    uid_map = build_comment_uid_map(comments)
     uid_map = build_comment_uid_map(comments)
     location_map = build_comment_location_map(comments)
     sub_count = sum(1 for c in comments if c.get("is_sub"))

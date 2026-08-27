@@ -15,6 +15,7 @@ from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USE
                     LLM_API_KEY, HISTORY_DANMAKU_ENABLED, REPORT_DIR,
                     COMMENT_AUTHOR_MIN_SEVERITY, COMMENT_AUTHOR_MIN_HITS)
 from storage import init_db, save_video_info, save_sender, save_user_data
+from storage import load_video_info
 from storage import load_user_data, has_user_data, load_senders
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
 from storage import save_comments, update_comment_problems
@@ -55,10 +56,11 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
     """阶段2: 采集弹幕（实时弹幕池 + 可选历史弹幕快照合并 + 互动弹幕明文mid）
 
     断点续采（resume=True 的非 --force 路径）：
-    - danmaku 表已有完整数据（done=1，或本功能前旧版的完整落库）→ 直接读库，
-      跳过弹幕网络重采（视频信息/互动弹幕仍新鲜拉取，各 1 个请求）；
-    - 有部分数据（历史逐日检查点存在但无 done）→ 实时池已在库不重新拉，
-      历史弹幕从 last_date 检查点续采（danmaku_history 内逐日增量落库）；
+    - danmaku 表已有完整数据（done=1，或旧版落库——判据为新格式哨兵 format 缺失）
+      → 直接读库，跳过弹幕网络重采（视频信息/互动弹幕仍新鲜拉取，各 1 个请求）；
+    - 有部分数据（哨兵 format 存在但无 done）→ 实时池已在库不重新拉，
+      历史弹幕从 last_date 检查点续采（danmaku_history 内逐日增量落库，
+      last_date 也缺失则从头逐日采集，与库内已有 dmid 去重）；
     - 无数据 → 全新采集：实时池先增量落库，再历史逐日续采，任意时刻中断可续。
     """
     print("\n[Phase 2/6] 采集弹幕数据...")
@@ -68,11 +70,20 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
         if existing:
             done = get_phase_state(bvid, "danmaku", "done")
             last = get_phase_state(bvid, "danmaku", "last_date")
+            fmt = get_phase_state(bvid, "danmaku", "format")
             video_info = get_video_info(bvid, client)
+            # 续采不重新计算覆盖率，沿用上次已落库的展示数据（只有全新路径会写），
+            # 必须在 save_video_info 覆盖前取出
+            prev_info = load_video_info(bvid) or {}
+            if prev_info.get("danmaku_coverage"):
+                video_info["danmaku_coverage"] = prev_info["danmaku_coverage"]
             save_video_info(bvid, video_info)
             command_dms = fetch_command_dms(video_info, client)
             video_info["command_dms"] = command_dms
-            if done == "1" or (done is None and last is None):
+            # 哨兵 format 存在说明是新流程落的数据：有它而无 done 必为半成品；
+            # 三者皆无才是本功能上线前的旧版完整落库。否则中断点早于首个检查点时
+            # （库里只有实时池、无任何 danmaku 检查点）会被误判为完整而永久跳过历史补采
+            if done == "1" or (done is None and last is None and fmt is None):
                 # 完整数据：直接读库，跳过弹幕网络重采
                 danmaku_list = existing
                 print(f"[Phase 2] 断点续采：从库读回 {len(danmaku_list)} 条弹幕，跳过弹幕重采")
@@ -88,6 +99,10 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
             return video_info, danmaku_list, group_by_sender(danmaku_list), command_dms
 
     video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, client)
+
+    # 新格式哨兵：必须先于任何数据落库写入（先于实时池 append 与历史逐日检查点），
+    # 否则中断点早于首个检查点时重跑无法与旧版完整落库区分
+    set_phase_state(bvid, "danmaku", "format", "v2")
 
     # 实时弹幕池先增量落库存底（中断后重跑可基于库内数据续采历史弹幕）
     seen_dmids: set = set()
@@ -222,8 +237,8 @@ def phase_comment(video_info: dict, client, resume: bool = True):
     """阶段3: 采集评论 + 充电名单（失败不影响后续流程）
 
     断点续采（resume=True 的非 --force 路径）：comments 表有完整数据
-    （done=1，或本功能前旧版的完整落库）→ 直接读库跳过网络重采；
-    有部分数据（游标检查点存在但无 done）→ collect_comment_data 内部
+    （done=1，或旧版落库——判据为新格式哨兵 format 缺失）→ 直接读库跳过网络重采；
+    有部分数据（哨兵 format 存在但无 done）→ collect_comment_data 内部
     从游标续页，已入库评论靠 UNIQUE 约束去重。"""
     print("\n[Phase 3/6] 采集评论区数据...")
     bvid = video_info.get("bvid", "")
@@ -236,7 +251,10 @@ def phase_comment(video_info: dict, client, resume: bool = True):
         if existing:
             done = get_phase_state(bvid, "comment", "done")
             mode = get_phase_state(bvid, "comment", "mode")
-            if done == "1" or (done is None and mode is None):
+            fmt = get_phase_state(bvid, "comment", "format")
+            # 哨兵 format 存在而无 done 必为半成品；三者皆无才是旧版完整落库。
+            # 否则中断点早于首个游标检查点时会被误判为完整而永久跳过剩余翻页
+            if done == "1" or (done is None and mode is None and fmt is None):
                 # 完整数据（含旧版完整落库）：直接读库
                 print(f"[Phase 3] 断点续采：从库读回 {len(existing)} 条评论，跳过评论重采")
                 charge_uid_map = fetch_charge_uid_map(bvid, aid, up_mid, client) if up_mid else {}

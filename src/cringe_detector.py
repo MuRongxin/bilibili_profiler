@@ -116,6 +116,8 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
     total = len(batches)
     workers = max(1, min(total, LLM_CONCURRENCY))
 
+    # 注意：key 固定嵌主用厂商的 LLM_MODEL——备用厂商兜底产出的判定也会存进该命名空间
+    # （跨厂商略有混样，换取中断重跑时的缓存命中率；判定口径以内容为准，与厂商基本无关，可接受）
     def batch_cache_key(bi: int) -> str:
         digest = hashlib.sha256("\n".join(sorted(
             it["content"] for it in batches[bi])).encode("utf-8")).hexdigest()[:16]

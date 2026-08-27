@@ -40,3 +40,4 @@ data/cookies/
 # 内置 mihomo 核心（二进制 + 运行时配置含订阅凭证）
 vendor/mihomo*
 data/mihomo*
+data/*.log
