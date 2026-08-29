@@ -14,11 +14,36 @@ from datetime import datetime
 
 from config import DB_PATH
 
+# uid/content 为空的评论被 save_comments 静默丢弃时的累计计数（debug 统计用）
+_dropped_comment_count = 0
+
+# 全局映射来源覆盖优先级：明文来源（评论区验证/充电名单/互动弹幕/视频信息）
+# 可靠度高于 CRC32 破解；冲突时仅当新来源优先级 >= 旧来源才覆盖 uid/source。
+# 未列出的来源（如旧版遗留值）按最低档处理，保证明文凭据永不被未知来源冲掉
+_GLOBAL_UID_SOURCE_PRIORITY = {
+    "评论区验证": 2,
+    "充电名单": 2,
+    "互动弹幕": 2,
+    "视频信息": 2,
+    "CRC32破解": 1,
+}
+
+
+def _like_escape(s: str) -> str:
+    """LIKE 模式串转义（配合 ESCAPE '\\'）：\\ % _ 前置反斜杠，防 bvid 含通配符误匹配"""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
 
 def get_db() -> sqlite3.Connection:
-    """获取数据库连接"""
+    """获取数据库连接（每连接设置并发相关 PRAGMA）"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # 并发友好：写入遇锁等待 10s 而非立即报 database is locked（web.py 后台 job 与
+    # 前台渲染会并发访问同一库）；WAL 允许读写并发，属库级持久设置，此处幂等执行
+    # 以覆盖现网仍为 delete 模式的旧库；synchronous=NORMAL 在 WAL 下安全且更快
+    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -26,6 +51,8 @@ def init_db():
     """初始化数据库表结构"""
     with closing(get_db()) as conn:
         cursor = conn.cursor()
+        # 库级持久设置：WAL 日志模式（get_db 中已幂等执行，此处建表时显式设置一次）
+        cursor.execute("PRAGMA journal_mode=WAL")
 
         # 视频信息表
         cursor.execute('''
@@ -108,6 +135,8 @@ def init_db():
             )
         ''')
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_danmaku_bvid ON danmaku(bvid)")
+        # 复合索引：弹幕浏览器按发送者+时间排序、报告按 bvid 聚合发送者用
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_danmaku_bvid_hash_time ON danmaku(bvid, mid_hash, time)")
 
         # 旧库迁移：danmaku 表补 mode/color/pool/dmid 列（弹幕属性统计：滚动占比/颜色分布/顶底弹幕）
         dm_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(danmaku)").fetchall()}
@@ -145,6 +174,8 @@ def init_db():
         ''')
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_bvid ON comments(bvid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_uid ON comments(uid)")
+        # 复合索引：问题评论榜/问题作者直引按 (bvid, problem) 过滤用
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_bvid_problem ON comments(bvid, problem)")
 
         # 旧库迁移：comments 表补 reply_count / root_rpid 列（高回复评论功能）
         comment_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(comments)").fetchall()}
@@ -235,8 +266,12 @@ def save_video_info(bvid: str, video_info: dict):
         cursor = conn.cursor()
         stat = video_info.get("stat", {})
         cursor.execute('''
-            INSERT OR REPLACE INTO videos (bvid, title, aid, cid, duration, view_count, danmaku_count, reply_count, video_info_json)
+            INSERT INTO videos (bvid, title, aid, cid, duration, view_count, danmaku_count, reply_count, video_info_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bvid) DO UPDATE SET
+                title=excluded.title, aid=excluded.aid, cid=excluded.cid, duration=excluded.duration,
+                view_count=excluded.view_count, danmaku_count=excluded.danmaku_count,
+                reply_count=excluded.reply_count, video_info_json=excluded.video_info_json
         ''', (
             bvid,
             video_info.get("title", ""),
@@ -271,9 +306,13 @@ def save_sender(bvid: str, mid_hash: str, uid: int | None, confidence: str,
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO senders
+            INSERT INTO senders
             (bvid, mid_hash, uid, confidence, method, danmaku_count, contents_json, spam_level, spam_score)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bvid, mid_hash) DO UPDATE SET
+                uid=excluded.uid, confidence=excluded.confidence, method=excluded.method,
+                danmaku_count=excluded.danmaku_count, contents_json=excluded.contents_json,
+                spam_level=excluded.spam_level, spam_score=excluded.spam_score
         ''', (bvid, mid_hash, uid, confidence, method, danmaku_count,
               json.dumps(contents, ensure_ascii=False), spam_level, spam_score))
         conn.commit()
@@ -349,25 +388,6 @@ def has_user_data(uid: int) -> bool:
 
 # ========== 全量弹幕（Web 弹幕浏览器数据源） ==========
 
-def save_danmaku(bvid: str, danmaku_list: list[dict]):
-    """阶段2弹幕合并后批量落库：先删该 bvid 旧行再插入，幂等可重跑。
-
-    存 bvid/mid_hash/content/time/timestamp/mode/color/pool/dmid/page 十列。
-    """
-    rows = [(bvid, dm["mid_hash"], dm["content"], dm["time"], dm["timestamp"],
-             dm.get("mode", 1), dm.get("color", ""), dm.get("pool", 0), dm.get("dmid", 0),
-             dm.get("page", 1))
-            for dm in danmaku_list]
-    with closing(get_db()) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
-        cursor.executemany(
-            "INSERT INTO danmaku (bvid, mid_hash, content, time, timestamp, mode, color, pool, dmid, page) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            rows)
-        conn.commit()
-
-
 def append_danmaku(bvid: str, danmaku_list: list[dict], seen_dmids: set) -> int:
     """增量落库（断点续采用）：按 dmid 去重——已见过的 dmid（含库中已有与本次新插入）
     跳过，dmid=0 无法判重直接插入（历史快照 dmid 恒非 0，实时池个别为 0）。
@@ -400,13 +420,20 @@ def save_comments(bvid: str, comments: list[dict]):
     只存基础列；sign/avatar 等仅用于当次运行的内存流程，不入库。
     location（IP属地）入库：断点续采从库读回评论时画像地域维度要用。
     problem 列由 LLM 问题评论检测后经 update_comment_problems 回写。
-    uname/location 在冲突时回填（旧行缺时补上），其余列冲突不覆盖（首采快照为准）。
+    uname/location 在冲突时回填（旧行缺时补上），like/reply_count 冲突时刷新
+    （热度榜不停在首采快照），其余列冲突不覆盖（首采快照为准）。
     """
+    global _dropped_comment_count
     rows = [(bvid, c["uid"], c.get("uname", ""), c.get("rpid", 0), c.get("content", ""),
              c.get("ctime", 0), c.get("like", 0), 1 if c.get("is_sub") else 0,
              c.get("reply_count", 0), c.get("root_rpid", 0), c.get("parent_rpid", 0),
              c.get("location", ""))
             for c in comments if c.get("uid") and c.get("content")]
+    # uid/content 为空的评论静默丢弃，累计计数并打印一条 debug 统计（不中断采集）
+    dropped = len(comments) - len(rows)
+    if dropped:
+        _dropped_comment_count += dropped
+        print(f"[Storage] 评论落库：跳过 {dropped} 条 uid/content 为空的评论（累计 {_dropped_comment_count} 条）")
     if not rows:
         return
     with closing(get_db()) as conn:
@@ -416,7 +443,8 @@ def save_comments(bvid: str, comments: list[dict]):
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(bvid, rpid, uid) DO UPDATE SET "
             "uname = CASE WHEN excluded.uname != '' THEN excluded.uname ELSE comments.uname END, "
-            "location = CASE WHEN excluded.location != '' THEN excluded.location ELSE comments.location END",
+            "location = CASE WHEN excluded.location != '' THEN excluded.location ELSE comments.location END, "
+            "like = excluded.like, reply_count = excluded.reply_count",
             rows)
         conn.commit()
 
@@ -465,22 +493,22 @@ def update_comment_problems(bvid: str, verdicts: dict):
 # ========== 误报标记（P2-a：人工纠偏 LLM 判定，展示层扣除聚合，可撤销） ==========
 
 def toggle_false_positive(bvid: str, kind: str, target: str) -> bool:
-    """切换误报标记，返回切换后的状态（True=已标记）。kind: dm=弹幕内容 / cmt=评论rpid"""
+    """切换误报标记，返回切换后的状态（True=已标记）。kind: dm=弹幕内容 / cmt=评论rpid
+
+    原子操作：INSERT OR IGNORE 命中已有行时 rowcount=0，据此判定原状态再 DELETE，
+    避免先查后插在并发点击下的竞态（主键冲突不再抛异常）。"""
     with closing(get_db()) as conn:
         cursor = conn.cursor()
-        row = cursor.execute(
-            "SELECT 1 FROM false_positive WHERE bvid = ? AND kind = ? AND target = ?",
-            (bvid, kind, target)).fetchone()
-        if row:
+        cursor.execute(
+            "INSERT OR IGNORE INTO false_positive (bvid, kind, target, created_at) VALUES (?, ?, ?, ?)",
+            (bvid, kind, target, int(time.time())))
+        if cursor.rowcount:
+            marked = True
+        else:
             cursor.execute(
                 "DELETE FROM false_positive WHERE bvid = ? AND kind = ? AND target = ?",
                 (bvid, kind, target))
             marked = False
-        else:
-            cursor.execute(
-                "INSERT INTO false_positive (bvid, kind, target, created_at) VALUES (?, ?, ?, ?)",
-                (bvid, kind, target, int(time.time())))
-            marked = True
         conn.commit()
     return marked
 
@@ -560,8 +588,8 @@ def clear_video_cache(bvid: str):
         cursor.execute("DELETE FROM phase_state WHERE bvid = ?", (bvid,))
         # 该视频的问题弹幕/问题评论判定缓存一并清除（key 前缀 cringe:/cmt: + {bvid}:）；
         # 深掘缓存 key 为 deep:{uid}:...，按用户跨视频复用，不清
-        cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cringe:{bvid}:%",))
-        cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cmt:{bvid}:%",))
+        cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ? ESCAPE '\\'", (f"cringe:{_like_escape(bvid)}:%",))
+        cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ? ESCAPE '\\'", (f"cmt:{_like_escape(bvid)}:%",))
 
         for uid in uids:
             cursor.execute("SELECT 1 FROM senders WHERE uid = ? LIMIT 1", (uid,))
@@ -596,13 +624,16 @@ def delete_video_data(bvid: str) -> dict:
         counts["phase_state"] = cursor.execute(
             "DELETE FROM phase_state WHERE bvid = ?", (bvid,)).rowcount
         counts["cringe_cache"] = cursor.execute(
-            "DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cringe:{bvid}:%",)).rowcount
+            "DELETE FROM llm_cache WHERE cache_key LIKE ? ESCAPE '\\'",
+            (f"cringe:{_like_escape(bvid)}:%",)).rowcount
         counts["cmt_cache"] = cursor.execute(
-            "DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"cmt:{bvid}:%",)).rowcount
+            "DELETE FROM llm_cache WHERE cache_key LIKE ? ESCAPE '\\'",
+            (f"cmt:{_like_escape(bvid)}:%",)).rowcount
         counts["deep_cache"] = 0
         for uid in uids:
             counts["deep_cache"] += cursor.execute(
-                "DELETE FROM llm_cache WHERE cache_key LIKE ?", (f"deep:{uid}:%",)).rowcount
+                "DELETE FROM llm_cache WHERE cache_key LIKE ? ESCAPE '\\'",
+                (f"deep:{uid}:%",)).rowcount
         counts["global_uid_map"] = 0
         for mh in mid_hashes:
             counts["global_uid_map"] += cursor.execute(
@@ -619,18 +650,36 @@ def delete_video_data(bvid: str) -> dict:
 def save_global_uid(mid_hash: str, uid: int, source: str):
     """
     upsert 全局映射：新条目 hit_count=1；重复命中 hit_count+1 并刷新 last_seen
-    source: 评论区验证 / CRC32破解 / 充电名单 / 互动弹幕
+    source: 评论区验证 / CRC32破解 / 充电名单 / 互动弹幕 / 视频信息
+
+    冲突覆盖按来源优先级（见 _GLOBAL_UID_SOURCE_PRIORITY）：明文来源 > CRC32破解，
+    仅当新来源优先级 >= 旧来源才覆盖 uid/source，防止破解结果被低置信来源反复冲掉；
+    先查旧 source 再决定，同一连接事务内完成。
     """
     now = datetime.now().isoformat()
     with closing(get_db()) as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO global_uid_map (mid_hash, uid, source, first_seen, last_seen, hit_count)
-            VALUES (?, ?, ?, ?, ?, 1)
-            ON CONFLICT(mid_hash) DO UPDATE SET
-                uid=excluded.uid, source=excluded.source,
-                last_seen=excluded.last_seen, hit_count=hit_count+1
-        ''', (mid_hash, uid, source, now, now))
+        new_pri = _GLOBAL_UID_SOURCE_PRIORITY.get(source, 0)
+        row = cursor.execute(
+            "SELECT source FROM global_uid_map WHERE mid_hash = ?", (mid_hash,)).fetchone()
+        if row is None:
+            cursor.execute('''
+                INSERT INTO global_uid_map (mid_hash, uid, source, first_seen, last_seen, hit_count)
+                VALUES (?, ?, ?, ?, ?, 1)
+            ''', (mid_hash, uid, source, now, now))
+        else:
+            old_pri = _GLOBAL_UID_SOURCE_PRIORITY.get(row["source"], 0)
+            if new_pri >= old_pri:
+                cursor.execute('''
+                    UPDATE global_uid_map SET uid=?, source=?, last_seen=?, hit_count=hit_count+1
+                    WHERE mid_hash=?
+                ''', (uid, source, now, mid_hash))
+            else:
+                # 低优先级来源不覆盖 uid/source，只累计命中并刷新 last_seen
+                cursor.execute('''
+                    UPDATE global_uid_map SET last_seen=?, hit_count=hit_count+1
+                    WHERE mid_hash=?
+                ''', (now, mid_hash))
         conn.commit()
 
 
@@ -658,8 +707,8 @@ def load_llm_cache(cache_key: str) -> str | None:
         return None
 
 
-def save_llm_cache(cache_key: str, result_json: str):
-    """写入 LLM 缓存；异常只打印警告（缓存失败不影响主流程）"""
+def save_llm_cache(cache_key: str, result_json: str) -> bool:
+    """写入 LLM 缓存，返回是否成功；失败只告警不中断主流程（调用方按返回值决定是否提示）"""
     try:
         with closing(get_db()) as conn:
             cursor = conn.cursor()
@@ -668,5 +717,8 @@ def save_llm_cache(cache_key: str, result_json: str):
                 VALUES (?, ?, ?)
             ''', (cache_key, result_json, datetime.now().isoformat()))
             conn.commit()
+        return True
     except Exception as e:
-        print(f"[Storage] 警告: LLM 缓存写入失败（{e}），忽略")
+        print(f"[Storage] 警告: LLM 缓存写入失败（key={cache_key[:40]}，{e}），"
+              f"缓存未写入，重跑将重复消耗 LLM token")
+        return False

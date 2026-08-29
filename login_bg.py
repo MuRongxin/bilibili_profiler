@@ -44,10 +44,11 @@ def main():
             print("[Login] 已有有效Cookie")
             return
 
-    # 生成二维码
+    # 生成二维码（路径按账号名区分，主号保持 data/qrcode.png，小号 qrcode_{name}.png）
     print("[Login] 获取二维码...")
     url, qrcode_key = get_qrcode()
-    qr_path = os.path.join(os.path.dirname(COOKIE_PATH), "qrcode.png")
+    qr_name = f"qrcode_{name}.png" if name else "qrcode.png"
+    qr_path = os.path.join(os.path.dirname(COOKIE_PATH), qr_name)
     
     from auth import generate_qrcode_image
     generate_qrcode_image(url, qr_path)
@@ -74,6 +75,11 @@ def main():
             print("\n[Login] 登录成功!")
             save_cookie(client, cookie_path)
             print(f"[Login] Cookie已保存: {cookie_path}")
+            # 登录成功后顺手删除临时二维码图片（避免残留过期二维码造成混淆）
+            try:
+                os.remove(qr_path)
+            except OSError:
+                pass
             return
         elif code == 86101:
             if last_status != 86101:

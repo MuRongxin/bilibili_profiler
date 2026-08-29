@@ -97,9 +97,10 @@ def load_cookie(path: str | None = None) -> dict | None:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        # cookie 文件损坏（如上次写入被中断或编码异常），降级为重新登录而非崩溃
-        print(f"[Auth] 警告: Cookie文件损坏（{path}），请重新登录")
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        # cookie 文件损坏（如上次写入被中断或编码异常）或读取失败（权限/IO 错误），
+        # 均降级为重新登录而非崩溃
+        print(f"[Auth] 警告: Cookie文件损坏或读取失败（{path}），请重新登录")
         return None
     if not isinstance(data, dict):
         # 合法 JSON 但不是 cookie dict（如被误写成数组/字符串），同样按损坏处理
@@ -118,18 +119,6 @@ def verify_cookie(client: BiliAPIClient) -> bool:
     except Exception as e:
         print(f"[Auth] Cookie验证异常: {e}")
     return False
-
-
-def _check_needs_refresh(client: BiliAPIClient) -> bool:
-    """检查 cookie 是否需要刷新（还没完全过期但快过期）"""
-    try:
-        data = client.get(
-            "https://passport.bilibili.com/x/passport-login/web/cookie/info",
-        )
-        # get() 降级返回 {"code": -1} 时 data 字段为 None，用 or {} 防御
-        return (data.get("data") or {}).get("refresh", False)
-    except Exception:
-        return False
 
 
 def _get_correspond_path() -> str:
@@ -189,17 +178,28 @@ def _try_refresh_cookie(client: BiliAPIClient, path: str | None = None) -> bool:
         new_cookies = client.get_cookies_dict()
         new_refresh_token = (data.get("data") or {}).get("refresh_token", "")
 
-        # Step 5: 确认刷新
-        client.post(
+        client._refresh_token = new_refresh_token or refresh_token
+        # 先落盘再 confirm：窗口期崩溃也不丢登录态。
+        # save_cookie 单独 try：落盘失败时服务端轮换已完成、内存态有效，
+        # 仍按刷新成功返回 True，只醒目告警（不兜成 False 让调用方误判重扫）
+        try:
+            save_cookie(client, path)
+        except Exception as e:
+            print(f"[Auth] !!!警告!!! Cookie刷新成功但落盘失败（{path or COOKIE_PATH}）: {e}；"
+                  f"本次会话不受影响，重启后需重新扫码登录")
+
+        # Step 5: 确认刷新（按B站协议用旧 refresh_token 确认，保持不变）
+        confirm = client.post(
             "https://passport.bilibili.com/x/passport-login/web/confirm/refresh",
             data={
                 "csrf": new_cookies.get("bili_jct", ""),
                 "refresh_token": refresh_token,
             },
         )
+        if confirm.get("code") != 0:
+            print(f"[Auth] 警告: 刷新确认接口返回异常: code={confirm.get('code')} "
+                  f"{confirm.get('message', '')}")
 
-        client._refresh_token = new_refresh_token or refresh_token
-        save_cookie(client, path)
         print("[Auth] Cookie刷新成功!")
         return True
 
@@ -290,6 +290,8 @@ def load_extra_clients() -> list[tuple[str, BiliAPIClient]]:
     import glob as _glob
     clients: list[tuple[str, BiliAPIClient]] = []
     for path in sorted(_glob.glob(os.path.join(COOKIES_DIR, "*.json"))):
+        if not os.path.isfile(path):
+            continue  # 同名目录等非文件项直接跳过，避免 open 时炸穿整个小号发现
         name = os.path.splitext(os.path.basename(path))[0]
         cookie_dict = load_cookie(path)
         if not cookie_dict or not cookie_dict.get("SESSDATA"):

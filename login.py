@@ -55,10 +55,11 @@ def main():
             return
         print("\n[!] 已有Cookie已过期，重新登录...")
 
-    # 生成二维码
+    # 生成二维码（路径按账号名区分，主号保持 data/qrcode.png，小号 qrcode_{name}.png）
     print("\n[1] 正在获取登录二维码...")
     url, qrcode_key = get_qrcode()
-    qr_path = os.path.join(os.path.dirname(COOKIE_PATH), "qrcode.png")
+    qr_name = f"qrcode_{name}.png" if name else "qrcode.png"
+    qr_path = os.path.join(os.path.dirname(COOKIE_PATH), qr_name)
     from auth import generate_qrcode_image
     generate_qrcode_image(url, qr_path)
 
@@ -77,36 +78,14 @@ def main():
     # 等待用户确认
     input("\n[2] 完成APP确认后，请按 Enter 键继续...")
 
-    # 验证登录
-    print("\n[3] 正在验证登录状态...")
-    result = poll_qrcode(qrcode_key, client)
-    code = result.get("data", {}).get("code", -1)
-
-    if code == 0:
-        # 从扫码响应中提取 refresh_token（用于后续 cookie 自动刷新）
-        refresh_token = result.get("data", {}).get("refresh_token", "")
-        if refresh_token:
-            client._refresh_token = refresh_token
-        print("[✓] 登录成功!")
-        save_cookie(client, cookie_path)
-        print(f"\n  Cookie已保存到: {cookie_path}")
-        print("  现在可以运行: python run.py BVxxxxxxxx")
-        return
-    elif code == 86090:
-        print("[!] 已扫码但未确认，请先在APP上点击确认")
-    elif code == 86101:
-        print("[!] 尚未扫码，请先扫码")
-    elif code == 86038:
-        print("[✗] 二维码已过期，请重新运行本程序")
-    else:
-        print(f"[✗] 登录失败 (code={code}): {result.get('data', {}).get('message', '未知错误')}")
-
-    # 如果还没成功，再试一次验证
-    if code != 0:
-        print("\n[4] 再次尝试验证...")
-        time.sleep(2)
+    # 验证登录：与 auth 非交互路径一致的限时轮询（180s 内每3秒一次，超时友好退出）
+    print("\n[3] 正在验证登录状态（最长等待3分钟）...")
+    start_time = time.time()
+    last_code = None
+    while True:
         result = poll_qrcode(qrcode_key, client)
         code = result.get("data", {}).get("code", -1)
+
         if code == 0:
             # 从扫码响应中提取 refresh_token（用于后续 cookie 自动刷新）
             refresh_token = result.get("data", {}).get("refresh_token", "")
@@ -116,8 +95,27 @@ def main():
             save_cookie(client, cookie_path)
             print(f"\n  Cookie已保存到: {cookie_path}")
             print("  现在可以运行: python run.py BVxxxxxxxx")
-        else:
-            print("[✗] 登录最终失败，请重新运行本程序")
+            # 登录成功后顺手删除临时二维码图片（避免残留过期二维码造成混淆）
+            try:
+                os.remove(qr_path)
+            except OSError:
+                pass
+            return
+        if code == 86038:
+            print("[✗] 二维码已过期，请重新运行本程序")
+            return
+        if time.time() - start_time >= 180:
+            print("[✗] 等待超时（3分钟），请重新运行本程序")
+            return
+        if code != last_code:
+            if code == 86090:
+                print("[!] 已扫码但未确认，请先在APP上点击确认")
+            elif code == 86101:
+                print("[!] 尚未扫码，请先扫码")
+            else:
+                print(f"[!] 登录状态 (code={code}): {result.get('data', {}).get('message', '未知错误')}")
+            last_code = code
+        time.sleep(3)
 
 
 if __name__ == "__main__":

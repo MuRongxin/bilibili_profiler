@@ -184,3 +184,24 @@ if LLM_PROVIDER == "mimo":
 else:
     # 主用 DeepSeek，MiMo 兜底（key 为空则不启用兜底）
     LLM_FALLBACK = (MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, "mimo")
+
+# === 审查修复新增（2026-08-29） ===
+# 以下常量原分散在各模块内的私有定义，统一迁移至配置文件便于调优
+LLM_DEEP_TIMEOUT = 120             # 深掘单次 LLM 调用超时秒数（原 llm_analyzer._DEEP_TIMEOUT）
+LLM_RETRY_BUDGET_SECONDS = 1800    # 问题弹幕/评论判定整轮重试总耗时熔断（原 cringe_detector._RETRY_BUDGET_SECONDS）
+LLM_TRANSIENT_RETRIES = 2          # 瞬态连接/超时错误同厂商短退避重试次数（原 cringe_detector._TRANSIENT_RETRIES）
+HISTORY_RECENT_REFRESH_DAYS = 3    # 历史弹幕 done=1 后重跑滚动补采最近天数（原 danmaku_history._RECENT_REFRESH_DAYS）
+PROXY_RETRY_AFTER = 600            # IP 池摘代理降级后恢复重探间隔秒数（原 combo_pool._PROXY_RETRY_AFTER）
+SINGLE_ACCOUNT_RISK_COOLDOWN = 120  # 单账号子池风控冷却基准秒数（原 combo_pool._SINGLE_ACCOUNT_COOLDOWN）
+WBI_KEY_FAIL_TTL = 60              # WBI 密钥获取失败负缓存秒数（原 api_client._WBI_KEY_FAIL_TTL）
+CRED_FAIL_TTL = 300                # buvid3/bili_ticket 获取失败重试间隔秒数（原 api_client._CRED_FAIL_TTL）
+REPLY_TREE_MAX_DEPTH = 50          # 高回复评论树渲染递归深度上限（原 web.py _REPLY_TREE_MAX_DEPTH）
+WEB_JOB_MAX_KEPT = 100             # web 内存 job 表淘汰上限（原 web.py _JOB_MAX_KEPT）
+ANALYZE_MAX_TARGETS = 200          # /api/analyze 单次 mid_hashes 上限（原 web.py _ANALYZE_MAX_TARGETS）
+SPAM_BURST_WINDOW_SECONDS = 10     # 刷屏突发检测的滑动窗口长度（秒，原 spam_detector._BURST_WINDOW_SECONDS）
+SPAM_BURST_HIGH_COUNT = 5          # 窗口内 ≥N 条判高强度突发（原 spam_detector._BURST_HIGH_COUNT）
+SPAM_BURST_MEDIUM_COUNT = 3        # 窗口内 ≥N 条判疑似突发（原 spam_detector._BURST_MEDIUM_COUNT）
+SPAM_VARIANT_SIMILARITY = 0.8      # 变种刷屏的平均相似度阈值（原 spam_detector._VARIANT_SPAM_SIMILARITY）
+SPAM_VARIANT_MIN_COUNT = 5         # 变种刷屏判定的最小弹幕数（原 spam_detector._VARIANT_SPAM_MIN_COUNT）
+SPAM_BURST_MIN_COUNT = 10          # 高频爆发判定的最小弹幕数（原 spam_detector._BURST_SPAM_MIN_COUNT）
+SPAM_BURST_MAX_INTERVAL = 2        # 高频爆发的平均间隔阈值（秒，原 spam_detector._BURST_SPAM_MAX_INTERVAL）

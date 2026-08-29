@@ -56,25 +56,40 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
     """阶段2: 采集弹幕（实时弹幕池 + 可选历史弹幕快照合并 + 互动弹幕明文mid）
 
     断点续采（resume=True 的非 --force 路径）：
-    - danmaku 表已有完整数据（done=1，或旧版落库——判据为新格式哨兵 format 缺失）
-      → 直接读库，跳过弹幕网络重采（视频信息/互动弹幕仍新鲜拉取，各 1 个请求）；
+    - danmaku 表已有完整数据（done=1，或旧版完整落库——判据为新格式哨兵 format 缺失
+      且弹幕非空）→ 旧版落库直接读库跳过弹幕网络重采；done=1 仍调用
+      fetch_history_danmaku 做滚动补采（其内部 done 感知：自动回拨 last_date
+      只补采最近几天、无新增时幂等快速返回），随后读库
+      （视频信息/互动弹幕仍新鲜拉取，各 1 个请求）；
     - 有部分数据（哨兵 format 存在但无 done）→ 实时池已在库不重新拉，
       历史弹幕从 last_date 检查点续采（danmaku_history 内逐日增量落库，
       last_date 也缺失则从头逐日采集，与库内已有 dmid 去重）；
     - 无数据 → 全新采集：实时池先增量落库，再历史逐日续采，任意时刻中断可续。
+
+    resume 判据依据 phase_state 哨兵而非弹幕非空：空弹幕视频早退路径也写 done=1
+    哨兵，若按 load_danmaku 非空判定会对空列表恒 falsy 而永远全量重采。
     """
     print("\n[Phase 2/6] 采集弹幕数据...")
 
     if resume:
+        done = get_phase_state(bvid, "danmaku", "done")
+        last = get_phase_state(bvid, "danmaku", "last_date")
+        fmt = get_phase_state(bvid, "danmaku", "format")
         existing = load_danmaku(bvid)
-        if existing:
-            done = get_phase_state(bvid, "danmaku", "done")
-            last = get_phase_state(bvid, "danmaku", "last_date")
-            fmt = get_phase_state(bvid, "danmaku", "format")
-            video_info = get_video_info(bvid, client)
-            # 续采不重新计算覆盖率，沿用上次已落库的展示数据（只有全新路径会写），
-            # 必须在 save_video_info 覆盖前取出
+        if existing or done == "1":
             prev_info = load_video_info(bvid) or {}
+            try:
+                video_info = get_video_info(bvid, client)
+            except Exception as e:
+                # 拉取失败（接口风控/网络异常）回退已落库的旧视频信息继续续采，
+                # 本地也无缓存可回退时才报错退出
+                if not prev_info:
+                    print(f"[Phase 2] 错误: 获取视频信息失败（{e}），且本地无缓存可回退")
+                    raise SystemExit(1)
+                print(f"[Phase 2] 警告: 获取视频信息失败（{e}），回退使用本地缓存的视频信息")
+                video_info = dict(prev_info)
+            # 续采不重新计算覆盖率，沿用上次已落库的展示数据（半成品续采分支会在
+            # 历史合并后补算缺失的覆盖率），必须在 save_video_info 覆盖前取出
             if prev_info.get("danmaku_coverage"):
                 video_info["danmaku_coverage"] = prev_info["danmaku_coverage"]
             save_video_info(bvid, video_info)
@@ -83,22 +98,53 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
             # 哨兵 format 存在说明是新流程落的数据：有它而无 done 必为半成品；
             # 三者皆无才是本功能上线前的旧版完整落库。否则中断点早于首个检查点时
             # （库里只有实时池、无任何 danmaku 检查点）会被误判为完整而永久跳过历史补采
-            if done == "1" or (done is None and last is None and fmt is None):
-                # 完整数据：直接读库，跳过弹幕网络重采
+            if done == "1":
+                # 已完整采集：仍调用历史采集函数做滚动补采（done 感知：内部自动回拨
+                # last_date 只补采最近几天、幂等快速返回），补采失败降级沿用库内数据；
+                # 落库按 dmid 去重，弹幕总量统计读库重算，重复运行幂等
+                if HISTORY_DANMAKU_ENABLED:
+                    try:
+                        cid = get_cid_for_page(video_info, 0)
+                        fetch_history_danmaku(cid, client, video_info.get("pubdate", 0), bvid=bvid)
+                    except Exception as e:
+                        print(f"[Phase 2] 警告: 历史弹幕滚动补采失败（{e}），沿用库内已有数据")
+                danmaku_list = load_danmaku(bvid)
+                print(f"[Phase 2] 断点续采：从库读回 {len(danmaku_list)} 条弹幕，跳过弹幕重采")
+            elif done is None and last is None and fmt is None:
+                # 旧版完整落库：直接读库，跳过弹幕网络重采
                 danmaku_list = existing
                 print(f"[Phase 2] 断点续采：从库读回 {len(danmaku_list)} 条弹幕，跳过弹幕重采")
             else:
                 # 半成品：历史弹幕从检查点续采（实时池已在库）
                 if HISTORY_DANMAKU_ENABLED:
                     cid = get_cid_for_page(video_info, 0)
-                    fetch_history_danmaku(cid, client, video_info.get("pubdate", 0), bvid=bvid)
+                    history_new_list = fetch_history_danmaku(
+                        cid, client, video_info.get("pubdate", 0), bvid=bvid)
                 else:
+                    history_new_list = []
                     set_phase_state(bvid, "danmaku", "done", "1")
                 danmaku_list = load_danmaku(bvid)
+                # 半成品续采完成后补算覆盖率（此前只有全新路径会写）：沿用全新路径
+                # 同一算法，但实时池数量以续采前库内已有条数近似（含此前已采的部分历史，
+                # 无法精确拆分），history 只含本轮新采快照，merged 为库内全量
+                if "danmaku_coverage" not in video_info:
+                    video_info["danmaku_coverage"] = {
+                        "realtime": len(existing),
+                        "history": len(history_new_list),
+                        "history_new": len(danmaku_list) - len(existing),
+                        "merged": len(danmaku_list),
+                    }
+                    save_video_info(bvid, video_info)
                 print(f"[Phase 2] 断点续采：历史弹幕续采完成，库内共 {len(danmaku_list)} 条")
             return video_info, danmaku_list, group_by_sender(danmaku_list), command_dms
 
-    video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, client)
+    # 视频不存在/已删除或触发风控时给友好中文提示并以非零码退出，不再抛原始 traceback
+    try:
+        video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, client)
+    except Exception as e:
+        print(f"[Phase 2] 错误: 视频信息/弹幕获取失败: {e}")
+        print("[Phase 2] 可能原因: 视频不存在或已删除、BV号错误、或触发风控，请检查后重试")
+        raise SystemExit(1)
 
     # 新格式哨兵：必须先于任何数据落库写入（先于实时池 append 与历史逐日检查点），
     # 否则中断点早于首个检查点时重跑无法与旧版完整落库区分
@@ -402,9 +448,10 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                 spam_level=spam_results.get(mid_hash, {}).get("spam_level", "低"),
                 spam_score=spam_results.get(mid_hash, {}).get("spam_score", 0.0)
             )
-            # 沉淀到全局映射库：多候选取最小的碰撞风险条目不入库（spec 4.2）
-            if info["uid"] is not None and not (
-                    info["method"] == METHOD_CRC32_CRACK and len(info.get("candidates", [])) > 1):
+            # 沉淀到全局映射库：仅明文来源（评论/充电名单/互动弹幕/视频信息）可沉淀；
+            # CRC32破解一律不沉淀——单候选也可能是16位长UID撞 hash 的错误归因，
+            # 一旦入库会跨视频放大误识别（spec 4.2）
+            if info["uid"] is not None and info["method"] != METHOD_CRC32_CRACK:
                 save_global_uid(mid_hash, info["uid"], info["method"])
     else:
         new_resolved = {}
@@ -528,11 +575,16 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
     def collect_one(mid_hash, uid, sub_pool, idx):
         """采集单个用户：缓存命中跳过；成功立即落库（断点续采），降速倍率回落一档。
         组合池接管风控轮换与兜底冷却；兜底耗尽抛 RiskControlError，按失败跳过本 uid。
-        返回 (uid, data|None)。"""
+        缓存读写（sqlite）异常同样纳入逐人容错：打印警告降级处理，
+        不得从 fut.result() 炸穿整个阶段5。返回 (uid, data|None)。"""
         print(f"  [{idx}/{total}] 采集 UID:{uid}...")
         # 检查是否已缓存（--force 时跳过缓存强制重采，结果覆盖写 users 表）
-        if not force and has_user_data(uid):
-            cached = load_user_data(uid)
+        if not force:
+            try:
+                cached = load_user_data(uid) if has_user_data(uid) else None
+            except Exception as e:
+                cached = None
+                print(f"  [警告] UID:{uid} 缓存读取失败（{e}），按未缓存处理")
             if cached:
                 print(f"  [缓存] UID:{uid} 使用已采集数据")
                 return uid, cached[0]
@@ -546,7 +598,11 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
             return uid, None
         # 立即落库：Ctrl+C 中断后已采集数据不丢失，重跑时命中上方缓存跳过。
         # profile 暂存空 dict，阶段6分析后以 INSERT OR REPLACE 覆盖
-        save_user_data(uid, data.get("name", ""), data.get("level", 0), data, {})
+        try:
+            save_user_data(uid, data.get("name", ""), data.get("level", 0), data, {})
+        except Exception as e:
+            # 落库失败不丢内存数据：本轮画像分析仍可用，仅重跑时会重新采集
+            print(f"  [警告] UID:{uid} 落库失败（{e}），本轮继续使用内存数据，重跑将重新采集")
         # 单元级成功：降速倍率回落一档（sub_pool 可能是裸 client，做鸭子兼容）
         used = sub_pool.current[1] if hasattr(sub_pool, "current") else sub_pool
         if hasattr(used, "reward_throttle_batch"):
@@ -559,14 +615,39 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
     if len(shards) > 1 and total > 1:
         print(f"[Phase 5] 多号并行分片: {len(shards)} 个账号并行采集（限速按号独立）")
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=len(shards)) as ex:
-            futures = [ex.submit(collect_one, mh, uid, shards[i % len(shards)], idx)
-                       for i, (idx, (mh, uid)) in enumerate(enumerate(uids_to_collect, 1))]
+
+        def run_shard(sub_pool, tasks):
+            """单个 worker 线程固定串行消费一个分片的全部任务。
+            线程↔分片绑定：若共享提交队列按任务逐个分配子池，某线程长冷却时
+            其它线程仍会用同一子池打请求，限速按号独立即失效；按分片分组后
+            每组 submit 一个串行处理函数，保证一个子池同一时刻只被一个线程使用。"""
+            return [collect_one(mh, uid, sub_pool, idx) for idx, (mh, uid) in tasks]
+
+        # 任务按分片轮询分组（与原按提交序分配相同的分布），保留全局进度序号
+        groups = [[] for _ in shards]
+        for i, task in enumerate(enumerate(uids_to_collect, 1)):
+            groups[i % len(shards)].append(task)
+
+        # 手动管理 executor：正常路径 wait=True 收尾；Ctrl+C 时 cancel_futures
+        # 取消未开始的排队任务并立即 re-raise，避免 with 语义的 shutdown(wait=True)
+        # 把排队任务全跑完才退出（挂死）
+        ex = ThreadPoolExecutor(max_workers=len(shards))
+        interrupted = False
+        try:
+            futures = [ex.submit(run_shard, sp, g) for sp, g in zip(shards, groups) if g]
             for fut in as_completed(futures):
-                uid, data = fut.result()
-                if data is not None:
-                    user_data_map[uid] = data
-                    processed.add(uid)
+                for uid, data in fut.result():
+                    if data is not None:
+                        user_data_map[uid] = data
+                        processed.add(uid)
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
+        finally:
+            if interrupted:
+                ex.shutdown(wait=False, cancel_futures=True)
+            else:
+                ex.shutdown(wait=True)
     else:
         for idx, (mid_hash, uid) in enumerate(uids_to_collect, 1):
             uid, data = collect_one(mid_hash, uid, shards[0], idx)
@@ -668,6 +749,10 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     # 初始化数据库
     init_db()
 
+    # --max-users 夹紧到 >=1（对齐 quick_test）：0/负数会让下游切片语义反转
+    if max_users is not None:
+        max_users = max(1, max_users)
+
     # 阶段1: 登录
     client = phase_login()
 
@@ -690,6 +775,10 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
 
     # 弹幕为空时提前终止：后续评论/解析/画像均无意义，避免白跑全流程产出空报告
     if not danmaku_list:
+        # 空弹幕也落 done=1/format 哨兵（参照 phase_danmaku 正常路径写法）：
+        # 否则重跑时 resume 判据对空库恒 falsy，永远全量重采
+        set_phase_state(bvid, "danmaku", "format", "v2")
+        set_phase_state(bvid, "danmaku", "done", "1")
         print("[Main] 弹幕为空，终止分析")
         return
 
@@ -808,13 +897,14 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
 
 
 def load_batch_bvids(path: str) -> list[str]:
-    """读取批量 BV 号清单：逐行读取，忽略空行与 # 注释行，去重保持顺序"""
+    """读取批量 BV 号清单：逐行读取，忽略空行与 # 注释（含行内注释，
+    如 "BV1xxx # 备注"），去重保持顺序"""
     bvids = []
     seen = set()
     with open(path, encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or line in seen:
+            line = line.split("#", 1)[0].strip()
+            if not line or line in seen:
                 continue
             seen.add(line)
             bvids.append(line)

@@ -97,25 +97,41 @@ function hotToggle(btn) {
 }
 
 // 误报标记（P2-a）：问题弹幕（kind=dm，target=内容）/问题评论（kind=cmt，target=rpid）
-// 切换人工误报标记；标记后该条不再计入聚合与用户疑似分，可撤销
+// 切换人工误报标记；标记后该条不再计入聚合与用户疑似分，可撤销。
+// kind=dm 按内容全文标记：一次标记隐藏全部同名弹幕，confirm 前先做只读查询提示影响面
 function fpToggle(btn) {
     const kind = btn.dataset.kind, target = btn.dataset.target;
     const willMark = !btn.classList.contains('fp-btn-marked');
     const shown = target.length > 50 ? target.slice(0, 50) + '…' : target;
-    const msg = willMark
-        ? '将该条' + (kind === 'dm' ? '弹幕内容' : '评论') + '标记为误报？标记后不再计入聚合。\n\n' + shown
-        : '撤销该条的误报标记？撤销后重新计入聚合。\n\n' + shown;
-    if (!confirm(msg)) return;
-    btn.disabled = true;
-    fetch('/api/video/' + encodeURIComponent(BVID) + '/false_positive', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({kind: kind, target: target})
-    }).then(r => r.json().then(j => ({ok: r.ok, j})))
-      .then(({ok, j}) => {
-          if (!ok) { alert(j.error || '标记失败'); btn.disabled = false; return; }
-          location.reload();   // 聚合已变（页缓存服务端已失效），整页刷新最简且一致
-      })
-      .catch(() => { alert('网络错误'); btn.disabled = false; });
+    const doToggle = affected => {
+        // 影响面提示：kind=dm 时一次操作作用于全部同名弹幕
+        const impact = (kind === 'dm' && affected > 1)
+            ? '\n注意：将' + (willMark ? '隐藏' : '恢复') + '本视频全部 ' + affected + ' 条同名弹幕。' : '';
+        const msg = willMark
+            ? '将该条' + (kind === 'dm' ? '弹幕内容' : '评论') + '标记为误报？标记后不再计入聚合。' + impact + '\n\n' + shown
+            : '撤销该条的误报标记？撤销后重新计入聚合。' + impact + '\n\n' + shown;
+        if (!confirm(msg)) return;
+        btn.disabled = true;
+        fetch('/api/video/' + encodeURIComponent(BVID) + '/false_positive', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({kind: kind, target: target})
+        }).then(r => r.json().then(j => ({ok: r.ok, j})))
+          .then(({ok, j}) => {
+              if (!ok) { alert(j.error || '标记失败'); btn.disabled = false; return; }
+              location.reload();   // 聚合已变（页缓存服务端已失效），整页刷新最简且一致
+          })
+          .catch(() => { alert('网络错误'); btn.disabled = false; });
+    };
+    if (kind === 'dm') {
+        // 先只读查询影响面（count_only），confirm 文案带上将隐藏/恢复的同名弹幕条数
+        fetch('/api/video/' + encodeURIComponent(BVID) + '/false_positive', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({kind: kind, target: target, count_only: true})
+        }).then(r => r.json()).then(j => doToggle(j.affected || 0))
+          .catch(() => doToggle(0));   // 查询失败降级为不带条数的确认框
+    } else {
+        doToggle(1);   // kind=cmt 只影响该条评论本身
+    }
 }
 
 // UP主悬停词云弹窗
@@ -172,6 +188,18 @@ document.querySelectorAll('.hot-item[data-wc]').forEach(item => {
 
 // ===== 争执焦点：关系图画布（多圆簇：受害者居中、攻击者环绕；同一人只画一个节点，
 // 既攻击又被攻击的"链条"节点通过指向ta的边+ta发出的边体现） =====
+// 共享交互状态：drawAfEdges 每次重画（切标签页/resize）只更新 af.* 引用，
+// box 级（拖拽/缩放）与 window 级（节点拖动）监听只绑一次——此前每次重画都
+// 重复 addEventListener 到持久的 box 与 window 上，造成监听器泄漏
+const af = {box: null, content: null, st: null, edgeD: null, edgeRecs: [], rOf: null,
+            nodeDrag: null, nlx: 0, nly: 0, dragging: false, moved: false, lx: 0, ly: 0,
+            winBound: false};
+
+function afApply() {
+    if (af.content && af.st)
+        af.content.setAttribute('transform', `translate(${af.st.x} ${af.st.y}) scale(${af.st.k})`);
+}
+
 function drawAfEdges() {
     const box = document.querySelector('.af-graph');
     if (!box) return;
@@ -373,7 +401,7 @@ function drawAfEdges() {
     });
 
     // 节点：头像+名字×次数；居中受害者标签放正上/下方，环上标签沿切线旋转
-    let nodeDrag = null, nlx = 0, nly = 0;   // 节点拖动状态（pointermove 在 st 定义后注册）
+    // 节点拖动状态存共享 af（window 级 pointermove 监听只绑一次，见函数尾部）
     g.nodes.forEach(n => {
         const gEl = document.createElementNS(svgNS, 'g');
         gEl.setAttribute('class', 'af-node');
@@ -427,9 +455,9 @@ function drawAfEdges() {
         // 节点单独拖动：按下节点只拖节点（不动画布），边随动重算；拖动后吞掉 click
         gEl.addEventListener('pointerdown', e => {
             e.stopPropagation();
-            nodeDrag = {n, c, img: gEl.querySelector('image'), t,
-                        tx, ty, deg: t.getAttribute('transform') || ''};
-            nlx = e.clientX; nly = e.clientY;
+            af.nodeDrag = {n, c, img: gEl.querySelector('image'), t,
+                           tx, ty, deg: t.getAttribute('transform') || ''};
+            af.nlx = e.clientX; af.nly = e.clientY;
         });
         gEl.addEventListener('mouseenter', () => {
             // 单节点：高亮与 ta 相关的全部边（发出的+指向的，链条节点两侧关系一起亮）
@@ -455,68 +483,78 @@ function drawAfEdges() {
     // 视口交互：拖动平移 + 滚轮缩放（以光标为中心）。
     // 默认缩放：内容恰好撑满视口宽度（k = W/LW ≈ 0.74），顶对齐；内容矮时垂直居中
     const vh = box.clientHeight || 520;
-    const st = {x: 0, y: 16, k: Math.min(1, W / LW)};
-    st.x = (W - LW * st.k) / 2;   // 水平居中（k<1 时内容恰满宽，x≈0）
-    if (H * st.k < vh) st.y = (vh - H * st.k) / 2;
-    const apply = () => content.setAttribute('transform', `translate(${st.x} ${st.y}) scale(${st.k})`);
-    apply();
-    let dragging = false, moved = false, lx = 0, ly = 0;
-    box.addEventListener('pointerdown', e => {
-        dragging = true; moved = false;
-        lx = e.clientX; ly = e.clientY;
-        box.setPointerCapture(e.pointerId);
-    });
-    box.addEventListener('pointermove', e => {
-        if (!dragging) return;
-        const dx = e.clientX - lx, dy = e.clientY - ly;
-        if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
-        lx = e.clientX; ly = e.clientY;
-        st.x += dx; st.y += dy;
-        apply();
-    });
-    box.addEventListener('pointerup', () => { dragging = false; });
-    box.addEventListener('wheel', e => {
-        e.preventDefault();
-        const rect = box.getBoundingClientRect();
-        const px = e.clientX - rect.left, py = e.clientY - rect.top;
-        const k2 = Math.min(4, Math.max(0.2, st.k * (e.deltaY < 0 ? 1.12 : 1 / 1.12)));
-        // 以光标为中心缩放：光标下的内容点保持不动
-        st.x = px - (px - st.x) * (k2 / st.k);
-        st.y = py - (py - st.y) * (k2 / st.k);
-        st.k = k2;
-        apply();
-    }, {passive: false});
-    // 拖拽后的抬起会紧跟一次 click：吞掉它，避免误触节点的"定位到明细"
-    box.addEventListener('click', e => {
-        if (moved) { e.stopPropagation(); e.preventDefault(); moved = false; }
-    }, true);
-
-    // 节点拖动：屏幕位移 ÷ 缩放系数换算回内容坐标；相连的边随动重算
-    window.addEventListener('pointermove', e => {
-        if (!nodeDrag) return;
-        const dx = (e.clientX - nlx) / st.k, dy = (e.clientY - nly) / st.k;
-        nlx = e.clientX; nly = e.clientY;
-        if (Math.abs(dx) + Math.abs(dy) > 0.5) moved = true;   // 触发 click 吞没
-        const n = nodeDrag.n;
-        n.x += dx; n.y += dy;
-        nodeDrag.c.setAttribute('cx', n.x);
-        nodeDrag.c.setAttribute('cy', n.y);
-        if (nodeDrag.img) {
-            nodeDrag.img.setAttribute('x', n.x - (rOf(n) - 1.5));
-            nodeDrag.img.setAttribute('y', n.y - (rOf(n) - 1.5));
-        }
-        nodeDrag.tx += dx; nodeDrag.ty += dy;
-        nodeDrag.t.setAttribute('x', nodeDrag.tx);
-        nodeDrag.t.setAttribute('y', nodeDrag.ty);
-        if (nodeDrag.deg)   // 旋转标签的旋转中心跟随
-            nodeDrag.t.setAttribute('transform',
-                nodeDrag.deg.replace(/rotate\((\S+) \S+ \S+\)/,
-                    (m, d) => `rotate(${d} ${nodeDrag.tx.toFixed(1)} ${nodeDrag.ty.toFixed(1)})`));
-        edgeRecs.forEach(r => {
-            if (r.a === n || r.v === n) r.p.setAttribute('d', edgeD(r.a, r.v, r.off));
+    af.st = {x: 0, y: 16, k: Math.min(1, W / LW)};
+    af.st.x = (W - LW * af.st.k) / 2;   // 水平居中（k<1 时内容恰满宽，x≈0）
+    if (H * af.st.k < vh) af.st.y = (vh - H * af.st.k) / 2;
+    // 重画只更新共享引用，监听器回调全部读写 af.*（下方 if 守卫保证只绑一次）
+    af.content = content;
+    af.edgeD = edgeD;
+    af.edgeRecs = edgeRecs;
+    af.rOf = rOf;
+    afApply();
+    if (af.box !== box) {
+        // box 是服务端渲染的持久元素（重画只清空内部 SVG）：监听只绑一次
+        af.box = box;
+        box.addEventListener('pointerdown', e => {
+            af.dragging = true; af.moved = false;
+            af.lx = e.clientX; af.ly = e.clientY;
+            box.setPointerCapture(e.pointerId);
         });
-    });
-    window.addEventListener('pointerup', () => { nodeDrag = null; });
+        box.addEventListener('pointermove', e => {
+            if (!af.dragging || !af.st) return;
+            const dx = e.clientX - af.lx, dy = e.clientY - af.ly;
+            if (Math.abs(dx) + Math.abs(dy) > 3) af.moved = true;
+            af.lx = e.clientX; af.ly = e.clientY;
+            af.st.x += dx; af.st.y += dy;
+            afApply();
+        });
+        box.addEventListener('pointerup', () => { af.dragging = false; });
+        box.addEventListener('wheel', e => {
+            if (!af.st) return;
+            e.preventDefault();
+            const rect = box.getBoundingClientRect();
+            const px = e.clientX - rect.left, py = e.clientY - rect.top;
+            const k2 = Math.min(4, Math.max(0.2, af.st.k * (e.deltaY < 0 ? 1.12 : 1 / 1.12)));
+            // 以光标为中心缩放：光标下的内容点保持不动
+            af.st.x = px - (px - af.st.x) * (k2 / af.st.k);
+            af.st.y = py - (py - af.st.y) * (k2 / af.st.k);
+            af.st.k = k2;
+            afApply();
+        }, {passive: false});
+        // 拖拽后的抬起会紧跟一次 click：吞掉它，避免误触节点的"定位到明细"
+        box.addEventListener('click', e => {
+            if (af.moved) { e.stopPropagation(); e.preventDefault(); af.moved = false; }
+        }, true);
+    }
+    if (!af.winBound) {
+        // 节点拖动：屏幕位移 ÷ 缩放系数换算回内容坐标；相连的边随动重算
+        af.winBound = true;
+        window.addEventListener('pointermove', e => {
+            if (!af.nodeDrag || !af.st) return;
+            const dx = (e.clientX - af.nlx) / af.st.k, dy = (e.clientY - af.nly) / af.st.k;
+            af.nlx = e.clientX; af.nly = e.clientY;
+            if (Math.abs(dx) + Math.abs(dy) > 0.5) af.moved = true;   // 触发 click 吞没
+            const n = af.nodeDrag.n;
+            n.x += dx; n.y += dy;
+            af.nodeDrag.c.setAttribute('cx', n.x);
+            af.nodeDrag.c.setAttribute('cy', n.y);
+            if (af.nodeDrag.img) {
+                af.nodeDrag.img.setAttribute('x', n.x - (af.rOf(n) - 1.5));
+                af.nodeDrag.img.setAttribute('y', n.y - (af.rOf(n) - 1.5));
+            }
+            af.nodeDrag.tx += dx; af.nodeDrag.ty += dy;
+            af.nodeDrag.t.setAttribute('x', af.nodeDrag.tx);
+            af.nodeDrag.t.setAttribute('y', af.nodeDrag.ty);
+            if (af.nodeDrag.deg)   // 旋转标签的旋转中心跟随
+                af.nodeDrag.t.setAttribute('transform',
+                    af.nodeDrag.deg.replace(/rotate\((\S+) \S+ \S+\)/,
+                        (m, d) => `rotate(${d} ${af.nodeDrag.tx.toFixed(1)} ${af.nodeDrag.ty.toFixed(1)})`));
+            af.edgeRecs.forEach(r => {
+                if (r.a === n || r.v === n) r.p.setAttribute('d', af.edgeD(r.a, r.v, r.off));
+            });
+        });
+        window.addEventListener('pointerup', () => { af.nodeDrag = null; });
+    }
     // 明细列表的挑事者条目前缀同色圆点：图与列表颜色互参
     colorNodes.forEach(n => {
         const item = document.querySelector(`.af-item[data-side="a"][data-uid="${n.id}"]`);
@@ -976,7 +1014,10 @@ function restoreViewState() {
     const flashMsg = sessionStorage.getItem('dmFlashMsg_' + BVID);
     if (flashMsg) {
         sessionStorage.removeItem('dmFlashMsg_' + BVID);
-        const uids = JSON.parse(sessionStorage.getItem('dmFlash_' + BVID) || '[]');
+        // 损坏数据回退 []（防 sessionStorage 内容异常导致整段恢复逻辑中断）
+        let uids = [];
+        try { uids = JSON.parse(sessionStorage.getItem('dmFlash_' + BVID) || '[]'); } catch { uids = []; }
+        if (!Array.isArray(uids)) uids = [];
         sessionStorage.removeItem('dmFlash_' + BVID);
         restoreViewState();            // 恢复重载前的标签页/筛选/排序/分页/滚动
         switchTab('users');

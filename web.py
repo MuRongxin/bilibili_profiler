@@ -16,6 +16,7 @@ import glob
 import re
 import argparse
 import atexit
+import functools
 import signal
 import sqlite3
 import threading
@@ -36,7 +37,8 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      USER_TIMELINE_MAX_VIDEOS, USER_TIMELINE_SAMPLES,
                      CROSS_VIDEO_MIN_VIDEOS, CROSS_VIDEO_MAX_USERS, DENSITY_BUCKETS,
                      COMMENT_HEAT_REPLY_WEIGHT, PROBLEM_COMMENT_TOP_N,
-                     ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_MAX_N, USER_CARD_URL)
+                     ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_MAX_N, USER_CARD_URL,
+                     REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, ANALYZE_MAX_TARGETS)
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
 from storage import get_db, init_db
@@ -58,6 +60,62 @@ from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summa
 
 app = Flask(__name__)
 PAGE_SIZE = 100  # 弹幕 API 默认/回退每页条数（可选 50/100/200，spec 3）
+_PORT = int(os.environ.get("PROFILER_PORT", "8000"))   # 监听端口（PROFILER_PORT 可覆盖）
+# 评论树递归深度上限 / job 表淘汰上限 / 单次分析目标上限已迁移至
+# config.REPLY_TREE_MAX_DEPTH / config.WEB_JOB_MAX_KEPT / config.ANALYZE_MAX_TARGETS
+
+
+@app.before_request
+def _loopback_guard():
+    """本机回环校验：写接口无防护时任意网页可借浏览器跨站调用本服务的删除/重跑等
+    破坏性接口（CSRF），DNS rebinding 还可整站读取。对所有非 GET/HEAD/OPTIONS 请求：
+    Origin 头存在时必须等于本服务回环源，Host 头必须是 127.0.0.1/localhost 系，否则 403。"""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    host = (request.host or "").split(":")[0]
+    if host not in ("127.0.0.1", "localhost"):
+        abort(403)
+    origin = request.headers.get("Origin")
+    if origin is not None and origin not in (f"http://127.0.0.1:{_PORT}",
+                                             f"http://localhost:{_PORT}"):
+        abort(403)
+    return None
+
+
+def _db_error_page() -> str:
+    """数据库锁定/异常时的 503 友好页（对齐 api_danmaku 的降级口径：提示而非白屏）"""
+    return f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="no-referrer">
+<title>503 - B站弹幕用户画像分析</title>
+<style>{REPORT_CSS}</style>
+<link rel="stylesheet" href="/static/report.css">
+</head>
+<body>
+<div class="container">
+    <div class="header"><h1>503</h1><div class="meta">数据库暂不可用</div></div>
+    <div class="nf-card">
+        <p>数据库正被占用或查询失败（可能有分析任务正在写入），请稍后刷新重试。</p>
+        <p><a class="filter-btn" href="/">返回首页</a></p>
+    </div>
+</div>
+</body>
+</html>'''
+
+
+def _db_guard(view):
+    """sqlite3.Error → 503 友好页（数据库锁定多发生在分析任务写入期，提示刷新重试）"""
+    @functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        try:
+            return view(*args, **kwargs)
+        except sqlite3.Error as e:
+            print(f"[Web] 数据库查询失败（{view.__name__}）: {e}")
+            return _db_error_page(), 503
+    return wrapper
 
 # 报告页整页 HTML 内存缓存：bvid → (数据指纹, HTML)。避免每次刷新重跑
 # _load_profiles/_attach_other_videos 逐用户查询串；job 完成/删除/误报标记时主动失效，
@@ -73,8 +131,8 @@ def _invalidate_page_cache(bvid: str):
 
 
 def _page_fingerprint(bvid: str) -> tuple:
-    """报告页数据指纹：覆盖 senders/users/comments/danmaku/false_positive/face_cache 六张表的
-    量与最新写入时间。全部走 bvid 索引的 COUNT/MAX/SUM 聚合，本地 SQLite 毫秒级。
+    """报告页数据指纹：覆盖 senders/users/comments/danmaku/false_positive/face_cache/videos
+    七张表的量与最新写入时间。全部走 bvid 索引的 COUNT/MAX/SUM 聚合，本地 SQLite 毫秒级。
     外部进程（run.py 分析、--force 重跑）落库后指纹即变，下次访问自动重渲染，
     不依赖进程内主动失效（_invalidate_page_cache 仍保留作为即时手段）。"""
     with closing(get_db()) as conn:
@@ -91,7 +149,10 @@ def _page_fingerprint(bvid: str) -> tuple:
         f_cnt = conn.execute(
             "SELECT COUNT(*) FROM false_positive WHERE bvid = ?", (bvid,)).fetchone()[0]
         face_cnt = conn.execute("SELECT COUNT(*) FROM face_cache").fetchone()[0]
-    return (s_cnt, s_uid_cnt, u_cnt, u_max, c_cnt, c_prob, d_cnt, f_cnt, face_cnt)
+        # videos 表（标题/元信息更新）也纳入指纹：外部进程重写该行时报告页需重渲染
+        v_cnt, v_max = conn.execute("SELECT COUNT(*), MAX(rowid) FROM videos").fetchone()
+    return (s_cnt, s_uid_cnt, u_cnt, u_max, c_cnt, c_prob, d_cnt, f_cnt, face_cnt,
+            v_cnt, v_max)
 
 
 # ========== 手动勾选分析 job（spec B；状态存内存 dict，服务重启即失效——spec 已接受） ==========
@@ -239,7 +300,7 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
             stats = _sender_danmaku_stats(bvid, mid_hash)
             if uid is None:
                 # 1. UID 解析：全局库明文命中优先，CRC32 彩虹表破解兜底；失败记 errors 继续
-                uid, confidence, method, _info, collision_risk, candidates = resolve_sender(
+                uid, confidence, method, _info, collision_risk, _candidates = resolve_sender(
                     mid_hash, stats["contents"], plain_uid_map, pool, method_map=method_map)
                 if uid is None:
                     add_error(f"UID 解析失败（{method}）", mid_hash)
@@ -250,8 +311,9 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
                             stats["count"], stats["contents"],
                             (row["spam_level"] if row else None) or "低",
                             (row["spam_score"] if row else None) or 0.0)
-                # 沉淀全局映射库：多候选碰撞条目不沉淀（对齐 main.phase_resolve 口径）
-                if not (method == METHOD_CRC32_CRACK and len(candidates) > 1):
+                # 沉淀全局映射库：CRC32 反查结果一律不沉淀（存在碰撞误识别风险，
+                # 污染全局库会跨视频放大；仅明文交叉验证来源可靠）
+                if method != METHOD_CRC32_CRACK:
                     save_global_uid(mid_hash, uid, method)
             else:
                 # senders 有 uid 但 users 无数据的中间态：跳过解析直接采集；
@@ -313,14 +375,13 @@ def _load_profiles(bvid: str) -> list[dict]:
     （卡片解析徽标 tooltip），collected_at 来自 users 表（基础信息采集时间），
     school 在旧缓存画像缺省时从 data_json 回退提取（毕业院校徽标）。
     GROUP BY u.uid 下 method/confidence 取该 uid 任一行（同 uid 多 mid_hash 极少见，可接受）。"""
-    conn = get_db()
-    rows = conn.execute('''
-        SELECT u.profile_json, u.data_json, s.method, s.confidence, u.collected_at
-        FROM senders s JOIN users u ON u.uid = s.uid
-        WHERE s.bvid = ? AND s.uid IS NOT NULL
-        GROUP BY u.uid
-    ''', (bvid,)).fetchall()
-    conn.close()
+    with closing(get_db()) as conn:
+        rows = conn.execute('''
+            SELECT u.profile_json, u.data_json, s.method, s.confidence, u.collected_at
+            FROM senders s JOIN users u ON u.uid = s.uid
+            WHERE s.bvid = ? AND s.uid IS NOT NULL
+            GROUP BY u.uid
+        ''', (bvid,)).fetchall()
     profiles = []
     for r in rows:
         try:
@@ -435,8 +496,11 @@ def _attach_other_videos(bvid: str, profiles: list[dict]):
 def _sender_meta(bvid: str) -> dict:
     """发送者联查（spec 5）：mid_hash → {uid, name, spam_level, categories}。
     uid/name/spam_level 来自 senders LEFT JOIN users；categories 从 users.profile_json
-    的 cringe 字段 Python 侧解析（非 SQL）。senders 无行的 mid_hash 不在此表 → 未分析。
+    的 cringe 字段 Python 侧解析（非 SQL），并按内容扣除已标记误报的弹幕
+    （与 video_page 的 _apply_danmaku_fp 同口径——UI 文案承诺「标记后不计入聚合」）。
+    senders 无行的 mid_hash 不在此表 → 未分析。
     连接用 closing 保证异常路径也关闭（参照 storage.py 模式）。"""
+    fp_dm = {t for k, t in load_false_positives(bvid) if k == "dm"}
     with closing(get_db()) as conn:
         rows = conn.execute('''
         SELECT s.mid_hash, s.uid, s.spam_level, u.name, u.profile_json
@@ -448,7 +512,17 @@ def _sender_meta(bvid: str) -> dict:
         categories = []
         if r["profile_json"]:
             try:
-                categories = json.loads(r["profile_json"]).get("cringe", {}).get("categories", []) or []
+                cringe = json.loads(r["profile_json"]).get("cringe", {})
+                categories = cringe.get("categories", []) or []
+                if fp_dm and categories:
+                    # 误报按内容去重扣除：仅当该画像 items/examples 命中误报内容时重算类别
+                    items = cringe.get("items") or cringe.get("examples") or []
+                    kept = [it for it in items if it.get("content") not in fp_dm]
+                    if len(kept) != len(items):
+                        categories = []
+                        for it in kept:
+                            if it.get("category") and it["category"] not in categories:
+                                categories.append(it["category"])
             except Exception:
                 categories = []
         meta[r["mid_hash"]] = {"uid": r["uid"], "name": r["name"],
@@ -459,23 +533,21 @@ def _sender_meta(bvid: str) -> dict:
 def _danmaku_panel_stats(bvid: str) -> dict:
     """弹幕浏览器统计面板（spec 4）：总弹幕数/合并后行数/独立发送者数/已解析发送者数
     + 问题弹幕类别分布 + 发送者弹幕数 Top10。无弹幕数据时只返回 {"total": 0}。"""
-    conn = get_db()
-    total = conn.execute("SELECT COUNT(*) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
-    if total == 0:
-        conn.close()
-        return {"total": 0}
-    merged = conn.execute(
-        "SELECT COUNT(*) FROM (SELECT 1 FROM danmaku WHERE bvid = ? GROUP BY mid_hash, content)",
-        (bvid,)).fetchone()[0]
-    senders_total = conn.execute(
-        "SELECT COUNT(DISTINCT mid_hash) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
-    resolved = conn.execute(
-        "SELECT COUNT(*) FROM senders WHERE bvid = ? AND uid IS NOT NULL", (bvid,)).fetchone()[0]
-    top10 = conn.execute('''
-        SELECT mid_hash, COUNT(*) AS cnt FROM danmaku WHERE bvid = ?
-        GROUP BY mid_hash ORDER BY cnt DESC LIMIT 10
-    ''', (bvid,)).fetchall()
-    conn.close()
+    with closing(get_db()) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
+        if total == 0:
+            return {"total": 0}
+        merged = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM danmaku WHERE bvid = ? GROUP BY mid_hash, content)",
+            (bvid,)).fetchone()[0]
+        senders_total = conn.execute(
+            "SELECT COUNT(DISTINCT mid_hash) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
+        resolved = conn.execute(
+            "SELECT COUNT(*) FROM senders WHERE bvid = ? AND uid IS NOT NULL", (bvid,)).fetchone()[0]
+        top10 = conn.execute('''
+            SELECT mid_hash, COUNT(*) AS cnt FROM danmaku WHERE bvid = ?
+            GROUP BY mid_hash ORDER BY cnt DESC LIMIT 10
+        ''', (bvid,)).fetchall()
     meta = _sender_meta(bvid)
     cat_counts = {}
     for m in meta.values():
@@ -667,7 +739,11 @@ def _backfill_faces(uids: list[int]):
                     print(f"[Face] 触发风控，停止本次补采（剩 {len(todo) - todo.index(uid)} 个下次再采）")
                     break
                 face = ((data.get("data") or {}).get("card") or {}).get("face", "")
-                save_face(uid, face)   # 空串也落库：标记查过，避免每次渲染重复请求
+                try:
+                    save_face(uid, face)   # 空串也落库：标记查过，避免每次渲染重复请求
+                except Exception as e:
+                    # 写库失败（如数据库锁定）不得让补采线程崩溃：跳过本次，下次渲染再试
+                    print(f"[Face] UID:{uid} 头像落库失败（{e}），跳过该条")
             print(f"[Face] 头像补采完成 {len(todo)} 个")
         finally:
             with _FACE_BACKFILL_LOCK:
@@ -762,7 +838,7 @@ def _attack_focus(bvid: str, fp_cmt: set[str]) -> dict:
     uids = list(set(attackers) | set(victims))
     faces = _faces_for(uids)
     # 展示名额随攻击边数浮动：保底 ATTACK_FOCUS_TOP_N，每 10 条攻击边 +1，封顶 ATTACK_FOCUS_MAX_N
-    top_n = min(ATTACK_FOCUS_MAX_N, max(ATTACK_FOCUS_TOP_N, 5 + edge_cnt // 10))
+    top_n = min(ATTACK_FOCUS_MAX_N, max(ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_TOP_N + edge_cnt // 10))
     return {
         "attackers": sorted(attackers.values(), key=lambda e: -e["count"]),
         "victims": sorted(victims.values(), key=lambda e: -e["count"]),
@@ -846,7 +922,9 @@ def _attack_focus_html(data: dict) -> str:
     graph = {"nodes": graph_nodes, "links": graph_links}
     graph_html = ""
     if graph_links:
-        graph_html = (f'<div class="af-graph" data-af-graph=\'{json.dumps(graph, ensure_ascii=False)}\'>'
+        # 双引号属性 + esc() 整段转义：节点 name 来自外部可控昵称，
+        # 单引号属性直拼 json.dumps 会被引号闭合注入（存储型 XSS）
+        graph_html = (f'<div class="af-graph" data-af-graph="{esc(json.dumps(graph, ensure_ascii=False))}">'
                       f'<div class="af-graph-hint">🖱 拖空白平移 · 滚轮缩放 · 拖头像调位置</div>'
                       f'</div>')
     a_html = "".join(_item(e, "攻击 {} 次", "主要对象：", _opp_text(e["victims"]), "攻击")
@@ -1033,7 +1111,9 @@ def _export_links(bvid: str) -> tuple[list[tuple[str, str]], list[tuple[str, str
     文件名含时间戳，按文件名倒序即时间倒序；每种格式第一个为最新，其余收进历史折叠块。"""
     latest, history = [], []
     for ext in ("csv", "json"):
-        files = sorted(glob.glob(os.path.join(REPORT_DIR, f"report_{bvid}_*.{ext}")), reverse=True)
+        # bvid 来自路由参数：glob.escape 防通配符注入匹配到他视频文件
+        files = sorted(glob.glob(os.path.join(REPORT_DIR, f"report_{glob.escape(bvid)}_*.{ext}")),
+                       reverse=True)
         for i, f in enumerate(files):
             (latest if i == 0 else history).append((os.path.basename(f), ext.upper()))
     return latest, history
@@ -1124,19 +1204,27 @@ def _reply_tree_html(subs: list[dict], root_uid: int, up_mid: int, fp_cmt: set[s
 
     楼主（root_uid）/UP主（up_mid）出现时加身份徽标；问题评论带误报标记按钮（P2-a）。
     parent_rpid 指向的父级不在已采集集合内（补采截断/旧库无该字段为 0）时挂到主楼下，
-    保证不丢任何一条回复。"""
+    保证不丢任何一条回复。脏数据 parent 成环时：visited 集合防重复渲染 +
+    REPLY_TREE_MAX_DEPTH 深度上限，环内从 roots 不可达的节点平铺挂到末尾兜底（不静默丢弃）。"""
     nodes = {s["rpid"]: s for s in subs}
     children: dict[int, list[dict]] = {}
     roots = []
     for s in subs:
         p = s["parent_rpid"]
-        if p and p in nodes:
+        if p and p in nodes and p != s["rpid"]:
             children.setdefault(p, []).append(s)
         else:
-            roots.append(s)   # 直接回复主楼（parent=0/=root）或父级缺失
+            roots.append(s)   # 直接回复主楼（parent=0/=root）、父级缺失或自指
 
-    def render(node: dict) -> str:
-        kids = "".join(render(ch) for ch in children.get(node["rpid"], []))
+    rendered: set = set()   # 已渲染 rpid：环上二次到达直接跳过（首次到达的实例已渲染）
+
+    def render(node: dict, depth: int) -> str:
+        if node["rpid"] in rendered:
+            return ""
+        rendered.add(node["rpid"])
+        kids = ""
+        if depth < REPLY_TREE_MAX_DEPTH:
+            kids = "".join(render(ch, depth + 1) for ch in children.get(node["rpid"], []))
         sub_ul = f"<ul>{kids}</ul>" if kids else ""
         marked = str(node["rpid"]) in fp_cmt
         fp = _fp_btn("cmt", node["rpid"], marked) if node["problem"] else ""
@@ -1145,7 +1233,12 @@ def _reply_tree_html(subs: list[dict], root_uid: int, up_mid: int, fp_cmt: set[s
                 f'：{esc(node["content"])} <span class="dm-time">👍{node["like"]:,}</span>'
                 f'{_problem_chip(node["problem"], marked)}{fp}</div>{sub_ul}</li>')
 
-    return "<ul class=\"hot-tree\">" + "".join(render(s) for s in roots) + "</ul>"
+    html = "".join(render(s, 0) for s in roots)
+    # 环内节点兜底：parent 指针成环导致从 roots 不可达的节点，平铺挂到末尾不静默丢弃
+    leftover = [s for s in subs if s["rpid"] not in rendered]
+    if leftover:
+        html += "".join(render(s, 0) for s in leftover)
+    return "<ul class=\"hot-tree\">" + html + "</ul>"
 
 
 def _attack_focus_tab_html(bvid: str, fp_cmt: set[str] = frozenset()) -> str:
@@ -1336,22 +1429,23 @@ def _user_timeline(uid: int) -> dict:
 # ========== 路由 ==========
 
 @app.route("/")
+@_db_guard
 def index():
     """首页：已分析视频列表（标题/BV号/时长/播放量/分析时间/弹幕数/画像人数/高/中风险人数）。
 
     搜索/列头排序/分页由 static/index.js 前端实现：每行带 data-title（标题+BV号小写）、
-    data-time/data-dm/data-profiles 供排序；超 20 条分页。"""
-    conn = get_db()
-    rows = conn.execute('''
-        SELECT v.bvid, v.title, v.created_at, v.duration, v.view_count,
-               (SELECT COUNT(*) FROM danmaku d WHERE d.bvid = v.bvid) AS dm_count,
-               (SELECT COUNT(DISTINCT s.uid) FROM senders s
-                WHERE s.bvid = v.bvid AND s.uid IS NOT NULL) AS profile_count,
-               (SELECT COUNT(*) FROM senders s WHERE s.bvid = v.bvid AND s.spam_level = '高') AS spam_high,
-               (SELECT COUNT(*) FROM senders s WHERE s.bvid = v.bvid AND s.spam_level = '中') AS spam_mid
-        FROM videos v ORDER BY v.created_at DESC
-    ''').fetchall()
-    conn.close()
+    data-time/data-dm/data-profiles 供排序；超 20 条分页。
+    数据库锁定（分析任务写入期）由 _db_guard 降级为 503 友好页。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute('''
+            SELECT v.bvid, v.title, v.created_at, v.duration, v.view_count,
+                   (SELECT COUNT(*) FROM danmaku d WHERE d.bvid = v.bvid) AS dm_count,
+                   (SELECT COUNT(DISTINCT s.uid) FROM senders s
+                    WHERE s.bvid = v.bvid AND s.uid IS NOT NULL) AS profile_count,
+                   (SELECT COUNT(*) FROM senders s WHERE s.bvid = v.bvid AND s.spam_level = '高') AS spam_high,
+                   (SELECT COUNT(*) FROM senders s WHERE s.bvid = v.bvid AND s.spam_level = '中') AS spam_mid
+            FROM videos v ORDER BY v.created_at DESC
+        ''').fetchall()
     items = "".join(f'''<tr data-title="{esc(((r["title"] or "") + " " + r["bvid"]).lower())}"
         data-time="{esc(r["created_at"])}" data-dm="{r["dm_count"]}" data-profiles="{r["profile_count"]}">
         <td><a href="/video/{esc(r["bvid"])}">{esc(r["title"] or r["bvid"])}</a></td>
@@ -1439,12 +1533,14 @@ def index():
 
 
 @app.route("/video/<bvid>")
+@_db_guard
 def video_page(bvid: str):
     """报告页：概览/用户画像/弹幕浏览器/问题弹幕榜/争执焦点/问题评论榜/高回复评论 七个标签页。
 
     整页 HTML 按 bvid 内存缓存（_PAGE_CACHE）：避免每次刷新重跑 _load_profiles/
     _attach_other_videos 逐用户查询；job（手动分析/重新生成）完成或删除时主动失效，
-    且每次请求比对数据指纹，外部进程（run.py）落库导致的变化也能检出。"""
+    且每次请求比对数据指纹，外部进程（run.py）落库导致的变化也能检出。
+    数据库锁定（分析任务写入期）由 _db_guard 降级为 503 友好页。"""
     page_fp = _page_fingerprint(bvid)
     with _PAGE_CACHE_LOCK:
         cached = _PAGE_CACHE.get(bvid)
@@ -1544,7 +1640,9 @@ def video_page(bvid: str):
         danmaku_tab = '<p class="empty-note">该视频为旧版本分析，无全量弹幕数据，--force 重采后可浏览</p>'
     else:
         top10_html = "、".join(
-            f"""<a onclick="filterSender('{esc(t["mid_hash"])}')">{esc(t["name"])}({t["count"]})</a>"""
+            # js_json 输出 JS 字符串字面量 + esc 转义属性：esc 的 &#x27; 在 JS 字符串
+            # 上下文中会被 HTML 解码回单引号截断，故不用 esc 包裹单引号写法
+            f"""<a onclick="filterSender({esc(js_json(t["mid_hash"]))})">{esc(t["name"])}({t["count"]})</a>"""
             for t in panel["top10"])
         # 弹幕属性分布（mode/color 已入库）：颜色 Top12 色块并入「问题弹幕类别分布」卡片
         # （同属内容特征维度，合并展示）；模式分布单独成卡
@@ -1813,7 +1911,7 @@ def user_page(uid: int):
 def api_analyze(bvid: str):
     """启动手动勾选发送者分析 job（spec 3.2）。起后台线程立即返回 job_id。
 
-    未知 bvid → 404；空列表 → 400；无有效 Cookie → 503。
+    未知 bvid → 404；空列表 → 400；数量超限 → 400；有任务在跑 → 409；无有效 Cookie → 503。
     """
     if _load_video_row(bvid) is None:
         return jsonify({"error": "未知视频"}), 404
@@ -1823,17 +1921,34 @@ def api_analyze(bvid: str):
         h for h in body.get("mid_hashes", []) if isinstance(h, str) and h))
     if not mid_hashes:
         return jsonify({"error": "mid_hashes 为空"}), 400
+    if len(mid_hashes) > ANALYZE_MAX_TARGETS:
+        return jsonify({"error": f"单次最多分析 {ANALYZE_MAX_TARGETS} 个发送者"}), 400
     try:
         _get_client()
     except CookieInvalidError as e:
         return jsonify({"error": str(e) or "Cookie 失效，请先运行 python login.py"}), 503
-    job_id = uuid.uuid4().hex[:12]
-    with JOBS_LOCK:
-        JOBS[job_id] = {"kind": "analyze", "bvid": bvid, "total": len(mid_hashes), "done": 0, "current": "",
-                        "errors": [], "finished": False, "results": []}
+    # 互斥：该视频已有 job 在跑则拒绝（原子检查+注册，防并发双击重复发起）
+    job_id, reject = _try_register_job("analyze", bvid, total=len(mid_hashes))
+    if job_id is None:
+        return jsonify({"error": reject}), 409
     threading.Thread(target=_run_analysis_job,
                      args=(job_id, bvid, mid_hashes), daemon=True).start()
     return jsonify({"job_id": job_id})
+
+
+@app.route("/api/reload_client", methods=["POST"])
+def api_reload_client():
+    """重新加载登录态（重新登录/更换 Cookie 文件后免重启）：
+    清 _client_failed 粘性标记并重建 client。成功 {"ok": true}；Cookie 仍失效 → 503。"""
+    global _client, _client_failed
+    with _CLIENT_LOCK:
+        _client = None
+        _client_failed = False
+    try:
+        _get_client()
+    except CookieInvalidError as e:
+        return jsonify({"error": str(e) or "Cookie 失效，请先运行 python login.py"}), 503
+    return jsonify({"ok": True})
 
 
 @app.route("/api/job/<job_id>")
@@ -1853,6 +1968,25 @@ def _has_running_job(bvid: str) -> bool:
         return any(j.get("bvid") == bvid and not j.get("finished") for j in JOBS.values())
 
 
+def _try_register_job(kind: str, bvid: str, **extra) -> tuple[str | None, str]:
+    """原子「检查-注册」job：一把锁内完成运行中判定与登记，消除并发双击/多标签页竞态
+    （此前「先 _has_running_job 再写 JOBS」两次加锁之间存在窗口）。
+
+    返回 (job_id, "") 或 (None, 拒绝原因)。JOBS 淘汰：只保留最近 WEB_JOB_MAX_KEPT 个，
+    超出时按登记先后删最旧的已完成 job（运行中的 job 永不淘汰）。"""
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        if any(j.get("bvid") == bvid and not j.get("finished") for j in JOBS.values()):
+            return None, "该视频已有任务在运行，请等待完成"
+        JOBS[job_id] = {"kind": kind, "bvid": bvid, "done": 0, "current": "",
+                        "errors": [], "finished": False, "results": [], **extra}
+        if len(JOBS) > WEB_JOB_MAX_KEPT:
+            done_ids = [jid for jid, j in JOBS.items() if j.get("finished")]
+            for jid in done_ids[:len(JOBS) - WEB_JOB_MAX_KEPT]:
+                JOBS.pop(jid, None)
+    return job_id, ""
+
+
 @app.route("/api/video/<bvid>/delete", methods=["POST"])
 def api_delete_video(bvid: str):
     """删除该视频的全部分析数据与导出文件（spec 9：含共享缓存，不可恢复；有任务在跑则 409）"""
@@ -1864,7 +1998,8 @@ def api_delete_video(bvid: str):
     _invalidate_page_cache(bvid)
     removed_files = 0
     for ext in ("csv", "json"):
-        for f in glob.glob(os.path.join(REPORT_DIR, f"report_{bvid}_*.{ext}")):
+        # bvid 来自路由参数：glob.escape 防通配符注入匹配到他视频文件
+        for f in glob.glob(os.path.join(REPORT_DIR, f"report_{glob.escape(bvid)}_*.{ext}")):
             os.remove(f)
             removed_files += 1
     return jsonify({"ok": True, "removed_files": removed_files, **counts})
@@ -1891,23 +2026,37 @@ def api_regenerate(bvid: str):
     """重新生成报告：后台完整重跑分析流水线（spec 9；已有任务在跑则 409）"""
     if _load_video_row(bvid) is None:
         return jsonify({"error": "未知视频"}), 404
-    if _has_running_job(bvid):
-        return jsonify({"error": "该视频已有任务在运行，请等待完成"}), 409
-    job_id = uuid.uuid4().hex[:12]
-    with JOBS_LOCK:
-        JOBS[job_id] = {"kind": "regen", "bvid": bvid, "total": 1, "done": 0,
-                        "current": "重新生成中（完整流水线）", "errors": [],
-                        "finished": False, "results": []}
+    # 原子「检查-注册」：一把锁内完成运行中判定与登记，消除并发竞态
+    job_id, reject = _try_register_job("regen", bvid, total=1,
+                                       current="重新生成中（完整流水线）")
+    if job_id is None:
+        return jsonify({"error": reject}), 409
     threading.Thread(target=_run_regen_job, args=(job_id, bvid), daemon=True).start()
     return jsonify({"job_id": job_id})
+
+
+def _fp_affected(bvid: str, kind: str, target: str) -> int:
+    """误报影响面：该 (bvid, kind, target) 命中的弹幕/评论条数。
+    kind=dm 按内容全文匹配（误报粒度=内容，一次标记隐藏全部同名弹幕）；
+    kind=cmt 按 rpid 精确命中（comments.rpid 为 INTEGER，需 CAST 后按文本比较）。"""
+    with closing(get_db()) as conn:
+        if kind == "dm":
+            return conn.execute(
+                "SELECT COUNT(*) FROM danmaku WHERE bvid = ? AND content = ?",
+                (bvid, target)).fetchone()[0]
+        return conn.execute(
+            "SELECT COUNT(*) FROM comments WHERE bvid = ? AND CAST(rpid AS TEXT) = ?",
+            (bvid, target)).fetchone()[0]
 
 
 @app.route("/api/video/<bvid>/false_positive", methods=["POST"])
 def api_false_positive(bvid: str):
     """误报标记切换（P2-a）：body {kind: dm|cmt, target: 弹幕内容或评论rpid字符串}。
 
-    幂等切换（已标记则撤销），返回 {"ok": true, "marked": bool}；报告页缓存即时失效。
-    llm_cache 不动——误报是人工覆盖层，跨 --force 重跑保留。"""
+    幂等切换（已标记则撤销），返回 {"ok": true, "marked": bool, "affected": int}；
+    affected 为该标记命中的弹幕/评论条数（kind=dm 一次标记隐藏全部同名弹幕，
+    前端据此在确认框提示影响面）。count_only=true 时只读查询影响面不切换标记。
+    报告页缓存即时失效。llm_cache 不动——误报是人工覆盖层，跨 --force 重跑保留。"""
     if _load_video_row(bvid) is None:
         return jsonify({"error": "未知视频"}), 404
     data = request.get_json(silent=True) or {}
@@ -1915,9 +2064,12 @@ def api_false_positive(bvid: str):
     target = str(data.get("target") or "")
     if kind not in ("dm", "cmt") or not target:
         return jsonify({"error": "参数错误：kind 须为 dm/cmt，target 不能为空"}), 400
+    affected = _fp_affected(bvid, kind, target)
+    if data.get("count_only"):
+        return jsonify({"ok": True, "affected": affected})
     marked = toggle_false_positive(bvid, kind, target)
     _invalidate_page_cache(bvid)
-    return jsonify({"ok": True, "marked": marked})
+    return jsonify({"ok": True, "marked": marked, "affected": affected})
 
 
 @app.route("/api/video/<bvid>/danmaku")
@@ -1932,11 +2084,13 @@ def api_danmaku(bvid: str):
     返回 {rows: [...], total: int, page: int}；每行 content/dup_count/mid_hash/uid/name/
     first_video_time/first_send_time/categories/spam_level/mode/color。
     """
-    # 数据库锁定/查询异常 → 500 JSON（spec 7），与下方主查询同一降级口径
+    # 数据库锁定/查询异常 → 500 JSON（spec 7），与下方主查询同一降级口径；
+    # 详细错误只打控制台，不外透（防内部路径/SQL 细节泄露）
     try:
         video_row = _load_video_row(bvid)
     except sqlite3.Error as e:
-        return jsonify({"error": f"数据库查询失败: {e}"}), 500
+        print(f"[Web] 弹幕查询失败（videos 表）: {e}")
+        return jsonify({"error": "数据库查询失败，请稍后重试"}), 500
     # 返回 None 是"未知视频→404"的正常路径，不能与异常混淆
     if video_row is None:
         return jsonify({"error": "未知视频"}), 404
@@ -1965,14 +2119,17 @@ def api_danmaku(bvid: str):
     try:
         meta = _sender_meta(bvid)
     except sqlite3.Error as e:
-        return jsonify({"error": f"数据库查询失败: {e}"}), 500
+        print(f"[Web] 弹幕查询失败（发送者联查）: {e}")
+        return jsonify({"error": "数据库查询失败，请稍后重试"}), 500
 
     where = ["d.bvid = ?"]
     params: list = [bvid]
 
     if search:
-        where.append("d.content LIKE ?")
-        params.append(f"%{search}%")
+        # LIKE 通配符转义（%/\_）：搜索词按字面匹配，不被当成通配模式
+        like = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where.append("d.content LIKE ? ESCAPE '\\'")
+        params.append(f"%{like}%")
 
     if sender:
         # mid_hash 精确（8位hex小写），否则按昵称/UID 精确匹配反查 mid_hash 集合
@@ -2045,7 +2202,8 @@ def api_danmaku(bvid: str):
             total = conn.execute(count_sql, full_params).fetchone()[0]
             raw_rows = conn.execute(rows_sql, full_params).fetchall()
     except sqlite3.Error as e:
-        return jsonify({"error": f"数据库查询失败: {e}"}), 500
+        print(f"[Web] 弹幕查询失败（主查询）: {e}")
+        return jsonify({"error": "数据库查询失败，请稍后重试"}), 500
 
     rows = []
     for r in raw_rows:
@@ -2160,7 +2318,7 @@ if __name__ == "__main__":
     parser.add_argument("--stop", action="store_true",
                         help="停止本端口（PROFILER_PORT）后台运行的 web 服务并释放端口")
     args = parser.parse_args()
-    port = int(os.environ.get("PROFILER_PORT", "8000"))
+    port = _PORT   # 与 _loopback_guard 同源（PROFILER_PORT 环境变量，模块级已解析）
     if args.stop:
         _stop_server(port)
         sys.exit(0)

@@ -10,7 +10,8 @@ import requests
 from urllib.parse import quote
 from config import (DEFAULT_HEADERS, REQUEST_DELAY, REQUEST_DELAY_LONG, MAX_RETRY,
                     RETRY_BACKOFF, RISK_COOLDOWN, NAV_URL, BILI_TICKET_ENABLED,
-                    ADAPTIVE_THROTTLE_FACTOR, ADAPTIVE_THROTTLE_MAX, ADAPTIVE_THROTTLE_DECAY)
+                    ADAPTIVE_THROTTLE_FACTOR, ADAPTIVE_THROTTLE_MAX, ADAPTIVE_THROTTLE_DECAY,
+                    WBI_KEY_FAIL_TTL, CRED_FAIL_TTL)
 
 
 # WBI 密钥混淆数组（来自 biliscope）
@@ -19,6 +20,9 @@ WBI_OE = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45,
           41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60,
           51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36,
           20, 34, 44, 52]
+
+# WBI 密钥失败负缓存与 buvid3/bili_ticket 失败重试间隔已迁移至
+# config.WBI_KEY_FAIL_TTL / config.CRED_FAIL_TTL
 
 
 class RiskControlError(Exception):
@@ -61,9 +65,10 @@ class BiliAPIClient:
         self._lock = threading.RLock()
         self._wbi_key = None
         self._wbi_key_date = None  # WBI 密钥缓存日期，img_key/sub_key 全站统一、每日更替
+        self._wbi_key_fail_ts = 0.0  # WBI 密钥获取失败时刻（负缓存，60s 内不再重打 NAV）
         self._buvid3 = None
-        # spi 获取失败置 True，本进程内不再每次 get 重试（对齐 _bili_ticket_ok 每进程一次模式）
-        self._buvid3_failed = False
+        # spi 获取失败记时间戳，CRED_FAIL_TTL 秒后才允许重试（对齐 _bili_ticket 模式）
+        self._buvid3_fail_ts = 0.0
         self._risk_apis = {
             "relation/followings", "relation/followers",
             "space/wbi/arc/search", "polymer/web-dynamic",
@@ -84,6 +89,9 @@ class BiliAPIClient:
         today = time.strftime("%Y-%m-%d")
         if self._wbi_key and self._wbi_key_date == today:
             return self._wbi_key
+        # 失败负缓存：WBI_KEY_FAIL_TTL 秒内直接返回空，不再重打 NAV（NAV 也走限速队列）
+        if not self._wbi_key and time.time() - self._wbi_key_fail_ts < WBI_KEY_FAIL_TTL:
+            return ""
         try:
             resp = self._request_locked("GET", NAV_URL, timeout=10)
             data = resp.json().get("data", {}).get("wbi_img", {})
@@ -94,6 +102,7 @@ class BiliAPIClient:
             self._wbi_key_date = today
         except Exception:
             self._wbi_key = ""
+            self._wbi_key_fail_ts = time.time()
         return self._wbi_key
 
     def _sign_wbi(self, params: dict) -> dict:
@@ -114,9 +123,18 @@ class BiliAPIClient:
         return params
 
     def _ensure_buvid3(self):
-        """获取并缓存 buvid3/buvid4 设备指纹，减少风控；失败置标志，本进程不再重试"""
-        if self._buvid3 or self._buvid3_failed:
-            return self._buvid3 or ""
+        """获取并缓存 buvid3/buvid4 设备指纹，减少风控；cookie jar 已有 buvid3
+        （如登录态文件带入）则直接复用不打 spi；失败记时间戳，CRED_FAIL_TTL
+        秒后才允许重试"""
+        if self._buvid3:
+            return self._buvid3
+        if time.time() - self._buvid3_fail_ts < CRED_FAIL_TTL:
+            return ""
+        for c in self.session.cookies:
+            # jar 中可能有同名不同域的重复 cookie，逐条遍历规避 CookieConflictError
+            if c.name == "buvid3" and c.value:
+                self._buvid3 = c.value
+                return self._buvid3
         try:
             resp = self._request_locked(
                 "GET",
@@ -134,15 +152,17 @@ class BiliAPIClient:
         except Exception:
             pass
         if not self._buvid3:
-            # 异常或响应缺 b_3 均视为失败：本进程内后续 get 不再重复打 spi
-            self._buvid3_failed = True
+            # 异常或响应缺 b_3 均视为失败：记时间戳，TTL 内不再重复打 spi
+            self._buvid3_fail_ts = time.time()
         return self._buvid3 or ""
 
     def _ensure_bili_ticket(self):
-        """申请 bili_ticket（3天有效），降低风控概率；失败静默降级"""
+        """申请 bili_ticket（3天有效），降低风控概率；失败记时间戳静默降级，
+        CRED_FAIL_TTL 秒后允许重试"""
         if not BILI_TICKET_ENABLED or getattr(self, "_bili_ticket_ok", False):
             return
-        self._bili_ticket_ok = True  # 每次会话只尝试一次
+        if time.time() - getattr(self, "_bili_ticket_fail_ts", 0.0) < CRED_FAIL_TTL:
+            return
         try:
             ts = int(time.time())
             hexsign = hmac.new(b"XgwSnGZ1p", f"ts{ts}".encode(), hashlib.sha256).hexdigest()
@@ -153,8 +173,11 @@ class BiliAPIClient:
             ticket = (data.get("data") or {}).get("ticket", "")
             if ticket:
                 self.session.cookies.set("bili_ticket", ticket, domain=".bilibili.com")
+                self._bili_ticket_ok = True
+            else:
+                self._bili_ticket_fail_ts = time.time()
         except Exception:
-            pass  # 非必需，失败不影响主流程
+            self._bili_ticket_fail_ts = time.time()  # 非必需，失败不影响主流程
 
     def _penalize_throttle(self, what: str):
         """触发风控：上调请求间隔倍率（撞一次墙就老实一点）"""
@@ -237,6 +260,21 @@ class BiliAPIClient:
                     return {"code": -412, "message": "风控拦截"}
                 # 签名失效（一般接口 -352、评论 wbi 接口 -403，均伴随 v_voucher）：清缓存强制刷新密钥并重签
                 if data.get("code") in (-352, -403):
+                    if not self._is_wbi_api(url):
+                        # 非 WBI 端点不附加 w_rid/wts，重签无意义：直接按风控流程处理
+                        # （对齐下方"重签后仍 -352/-403"的风控语义，跳过清缓存+重签）
+                        if attempt < MAX_RETRY - 1:
+                            self._penalize_throttle(f"非WBI接口返回 {data.get('code')}")
+                            if self.raise_on_risk:
+                                raise RiskControlError(f"非WBI接口 {data['code']}，判定为风控")
+                            wait = RISK_COOLDOWN + random.uniform(0, 60)
+                            self._risk_cooldown_until = time.time() + wait
+                            print(f"[API] 非WBI接口返回 {data.get('code')}，判定为风控，冷却 {wait:.0f} 秒后重试...")
+                            time.sleep(wait)
+                            continue
+                        if self.raise_on_risk:
+                            raise RiskControlError(f"非WBI接口 {data['code']} 重试耗尽")
+                        return {"code": data["code"], "message": "非WBI接口风控拦截，重试已耗尽"}
                     # 末次 attempt 不再清缓存+退避+重签（重签也是白做）：
                     # 编排层模式抛信号；旧模式返回降级 dict 保留 -352/-403 语义
                     if attempt < MAX_RETRY - 1:
@@ -313,7 +351,9 @@ class BiliAPIClient:
         """POST 请求（限速+重试），返回解析后的 JSON dict
 
         与 get() 同款限速/指数退避重试，耗尽降级返回 {"code": -1, ...} 不 raise。
-        例外：raise_on_risk 模式遇 HTTP 412 抛 RiskControlError；
+        业务码 -412/-352/-403 与 HTTP 412 按与 get() 相同的风控语义处理：
+        计自适应降速、raise_on_risk 模式一次短退避原地重试后抛 RiskControlError、
+        旧模式长冷却后重试、耗尽降级返回；不做 WBI 重签（post 本就不签）。
         任何模式遇代理连接失败抛 ProxyConnError（IP 池故障，立即上报不重试）。
         不走 WBI 签名，也不调用 _ensure_buvid3（cookie 刷新等接口不需要，
         且避免在 buvid3 获取路径中嵌套 POST 造成递归）。
@@ -323,7 +363,24 @@ class BiliAPIClient:
                 resp = self._request_locked("POST", url, data=data, params=params, **kwargs)
                 resp.raise_for_status()
                 data = resp.json()
-                # POST 成功：自适应倍率缓慢回落（post 不做风控码处理，沿用原降级语义）
+                if data.get("code") in (-412, -352, -403):
+                    # 与 get() 相同的风控处理：计圈（自适应降速）、抛信号或冷却重试
+                    self._penalize_throttle(f"触发风控{data.get('code')}(post)")
+                    if self.raise_on_risk:
+                        # 编排层模式：一次短退避原地重试（防瞬时抖动），仍失败抛信号
+                        if attempt == 0:
+                            print(f"[API] 触发风控{data.get('code')}(post)，短退避后原地重试一次...")
+                            time.sleep(RETRY_BACKOFF)
+                            continue
+                        raise RiskControlError(f"{data['code']} 风控拦截(post)")
+                    if attempt < MAX_RETRY - 1:
+                        wait = RISK_COOLDOWN + random.uniform(0, 60)
+                        self._risk_cooldown_until = time.time() + wait
+                        print(f"[API] 触发风控{data.get('code')}(post)，冷却 {wait:.0f} 秒后重试...")
+                        time.sleep(wait)
+                        continue
+                    return {"code": data["code"], "message": "风控拦截(post)"}
+                # POST 成功：自适应倍率缓慢回落
                 self._reward_throttle()
                 return data
             except requests.exceptions.ProxyError as e:
@@ -348,9 +405,23 @@ class BiliAPIClient:
                     return {"code": -1, "message": f"请求异常: {e}"}
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response else 0
-                if status == 412 and self.raise_on_risk:
+                if status == 412:
                     self._penalize_throttle("触发风控HTTP412(post)")
-                    raise RiskControlError("HTTP 412 风控拦截(post)")
+                    if self.raise_on_risk:
+                        # 对齐 get()：一次短退避原地重试（防瞬时抖动），仍失败抛信号
+                        if attempt == 0:
+                            print("[API] 触发风控HTTP412(post)，短退避后原地重试一次...")
+                            time.sleep(RETRY_BACKOFF)
+                            continue
+                        raise RiskControlError("HTTP 412 风控拦截(post)")
+                    # 旧模式：与 get() 同等处理，长冷却重试，耗尽后降级返回
+                    if attempt < MAX_RETRY - 1:
+                        wait = RISK_COOLDOWN + random.uniform(0, 60)
+                        self._risk_cooldown_until = time.time() + wait
+                        print(f"[API] 触发风控HTTP412(post)，冷却 {wait:.0f} 秒后重试...")
+                        time.sleep(wait)
+                        continue
+                    return {"code": -412, "message": "风控拦截"}
                 if attempt < MAX_RETRY - 1 and status >= 500:
                     wait = RETRY_BACKOFF * (2 ** attempt)
                     time.sleep(wait)
@@ -398,11 +469,13 @@ class BiliAPIClient:
 
     def set_proxy(self, url: str | None):
         """设置/清除代理（None 或空串 = 直连）；带认证的代理地址直接内嵌 user:pass@host:port"""
-        self.session.proxies = {"http": url, "https": url} if url else {}
-        self._proxy_active = bool(url)
+        with self._lock:
+            self.session.proxies = {"http": url, "https": url} if url else {}
+            self._proxy_active = bool(url)
 
     def update_cookies(self, cookies: dict):
-        self.session.cookies.update(cookies)
+        with self._lock:
+            self.session.cookies.update(cookies)
 
     def get_cookies_dict(self) -> dict:
         """jar 中可能存在同名不同域的重复 cookie（如 spi 写入的 buvid3 与登录

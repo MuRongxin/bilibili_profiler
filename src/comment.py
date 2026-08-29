@@ -7,12 +7,12 @@
 （reply_control.location）。
 """
 import json
-import zlib
+from contextlib import closing
 
 from api_client import BiliAPIClient
 from config import COMMENT_MAIN_WBI_URL, COMMENT_MAIN_URL, COMMENT_REPLY_URL
 from config import MAX_COMMENT_PAGES, COMMENT_REPLY_MAX_PAGES, CHARGE_LIST_URL
-from storage import get_phase_state, load_comments, save_comments, set_phase_state
+from storage import get_db, get_phase_state, load_comments, save_comments, set_phase_state
 from uid_resolver import calc_crc32
 
 
@@ -34,7 +34,8 @@ def _parse_comment(r: dict, is_sub: bool) -> dict | None:
 
     return {
         "uid": mid,
-        "rpid": r.get("rpid", 0),
+        # rpid 缺失/为0时以 id 字段兜底：多条 rpid=0 会在 UNIQUE(bvid, rpid, uid) 上塌缩互踩
+        "rpid": r.get("rpid") or r.get("id", 0),
         "uname": member.get("uname", ""),
         "sign": member.get("sign", ""),
         "level": (member.get("level_info") or {}).get("current_level", 0),
@@ -63,6 +64,7 @@ def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
 
     print(f"[Comment] 补采子评论 (root={root_rpid} 共{rcount}条)...")
     fetched = []
+    total = 0   # 循环前初始化：首请求即失败 break 时 for-else 不触发，防御引用未赋值
     for pn in range(1, COMMENT_REPLY_MAX_PAGES + 1):
         data = client.get(COMMENT_REPLY_URL, params={
             "type": 1,
@@ -131,21 +133,32 @@ def _collect_page(replies: list, oid: int, client: BiliAPIClient) -> list[dict]:
 def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
                         bvid: str | None = None, resume_offset: str = "",
                         resume_page: int = 0) -> list[dict] | None:
-    """wbi/main 游标翻页采集主评论。首页即失败返回 None（调用方降级旧接口）。
+    """wbi/main 游标翻页采集主评论。本轮首个请求（含续采第一页）失败返回 None
+    （调用方降级旧接口）。
 
     bvid 提供时启用断点续采：每页落库 + phase_state 记录游标/页码/模式，
     中断后重跑从 resume_offset 继续翻页（已入库评论靠 UNIQUE 约束去重）。
-    自然终止（is_end/无新评论/页数耗尽）才写 done=1；中途失败不写，
-    下次重跑仍从最后游标续采。"""
+    自然终止（is_end/无新评论/真重复页）才写 done=1；中途失败、页数耗尽
+    截断（另写 truncated=1 供查询）、本轮 0 请求（resume_page 已达上限）
+    均不写 done，下次重跑仍从最后游标续采。"""
     all_comments = []
     offset = resume_offset
-    natural_end = True   # 错误中断时不写 done，下次重跑续采
-    seen_rpids = set()  # 已采评论的 rpid：该接口的 next_offset 可能连续多页相同但内容不同（实测），
-                        # 只有"整页无新 rpid"才是真的重复页
+    natural_end = True   # 错误中断/截断/零请求时不写 done，下次重跑续采
+    made_request = False      # 本轮是否实际发出过请求（resume_page 已达上限时循环体不执行）
+    first_request = True      # 本轮第一个请求失败即整体降级旧接口
+    # 真重复页检测的 rpid 集合：该接口的 next_offset 可能连续多页相同但内容不同（实测），
+    # 只有"整页无新 rpid"才是真的重复页。续采时从库重建（此前运行已落库的评论也算
+    # "见过"），否则续采首页无法识别为重复页、子评论也会被重复补采
+    seen_rpids = set()
+    if bvid and (resume_offset or resume_page):
+        with closing(get_db()) as conn:
+            seen_rpids = {row["rpid"] for row in conn.execute(
+                "SELECT rpid FROM comments WHERE bvid = ?", (bvid,))}
     if resume_offset:
         print(f"[Comment] 断点续采：从第 {resume_page + 1} 页的游标继续")
 
     for page in range(resume_page + 1, max_pages + 1):
+        made_request = True
         data = client.get(COMMENT_MAIN_WBI_URL, params={
             "oid": oid,
             "type": 1,
@@ -157,9 +170,10 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
         if data.get("code") != 0:
             print(f"[Comment] wbi/main 获取评论失败 (第{page}页): {data.get('message')}")
             natural_end = False
-            if page == 1 and not resume_offset:
-                return None  # 首页即失败（签名/风控等），整体降级旧接口
+            if first_request:
+                return None  # 本轮首个请求即失败（签名/风控等），整体降级旧接口
             break            # 中途失败保留已采部分（不写 done，下次重跑续采）
+        first_request = False
 
         # 防御 data["data"] 为 None（风控/空结果时 API 会返回 data: null）
         page_data = data.get("data") or {}
@@ -192,8 +206,17 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
             break
         offset = next_offset
     else:
-        # 循环耗尽（未提前终止）：评论区被采集上限截断
-        print(f"[Comment] 已达采集上限 {max_pages} 页，评论区可能未采完（可调大 MAX_COMMENT_PAGES）")
+        if made_request:
+            # 循环耗尽（未提前终止）：评论区被采集上限截断——截断不是自然结束，
+            # 只标 truncated=1 供查询，不写 done（重跑从最后游标续采剩余页）
+            print(f"[Comment] 已达采集上限 {max_pages} 页，评论区可能未采完（可调大 MAX_COMMENT_PAGES）")
+            if bvid:
+                set_phase_state(bvid, "comment", "truncated", "1")
+            natural_end = False
+
+    if not made_request:
+        # 本轮实际请求数为 0（resume_page 已达上限）：无法判断是否采完，不写 done
+        natural_end = False
 
     if bvid and natural_end:
         set_phase_state(bvid, "comment", "done", "1")
@@ -208,10 +231,12 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int,
     all_comments = []
     next_page = resume_next
     natural_end = True
+    made_request = False   # 本轮是否实际发出过请求（resume_page 已达上限时循环体不执行）
     if resume_next:
         print(f"[Comment] 断点续采：从旧接口第 {resume_page + 1} 页继续")
 
     for page in range(resume_page + 1, max_pages + 1):
+        made_request = True
         data = client.get(COMMENT_MAIN_URL, params={
             "type": 1,
             "oid": oid,
@@ -245,8 +270,17 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int,
         if cursor.get("is_end", False) or not next_page:
             break
     else:
-        # 循环耗尽（未提前终止）：评论区被采集上限截断
-        print(f"[Comment] 已达采集上限 {max_pages} 页，评论区可能未采完（可调大 MAX_COMMENT_PAGES）")
+        if made_request:
+            # 循环耗尽（未提前终止）：评论区被采集上限截断——截断不是自然结束，
+            # 只标 truncated=1 供查询，不写 done（重跑从最后游标续采剩余页）
+            print(f"[Comment] 已达采集上限 {max_pages} 页，评论区可能未采完（可调大 MAX_COMMENT_PAGES）")
+            if bvid:
+                set_phase_state(bvid, "comment", "truncated", "1")
+            natural_end = False
+
+    if not made_request:
+        # 本轮实际请求数为 0（resume_page 已达上限）：无法判断是否采完，不写 done
+        natural_end = False
 
     if bvid and natural_end:
         set_phase_state(bvid, "comment", "done", "1")
@@ -271,20 +305,34 @@ def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT
         本轮新采评论列表（续采时只含新页部分；全量请用 load_comments 读库）
     """
     resume_offset, resume_next, resume_page = "", 0, 0
+    mode = None
     if bvid:
         mode = get_phase_state(bvid, "comment", "mode")
-        resume_page = int(get_phase_state(bvid, "comment", "page") or 0)
+        try:
+            resume_page = int(get_phase_state(bvid, "comment", "page") or 0)
+        except (TypeError, ValueError):
+            # 检查点脏值：按无续采处理（从头翻页，UNIQUE 约束幂等去重兜底）
+            print("[Comment] 警告：评论页码检查点脏值，忽略续采从头翻页")
+            resume_page = 0
         offset_ck = get_phase_state(bvid, "comment", "offset") or ""
         if mode == "wbi":
             resume_offset = offset_ck
         elif mode == "legacy":
-            resume_next = int(offset_ck or 0)
+            try:
+                resume_next = int(offset_ck or 0)
+            except (TypeError, ValueError):
+                print(f"[Comment] 警告：旧接口游标检查点脏值（{offset_ck!r}），忽略续采从头翻页")
+                resume_next = 0
+                resume_page = 0
+    # 检查点 mode 与本次实际走通的接口不一致时，页码/游标一并归零从头翻页（UNIQUE 幂等）
     comments = _fetch_comments_wbi(oid, client, max_pages, bvid=bvid,
-                                   resume_offset=resume_offset, resume_page=resume_page)
+                                   resume_offset=resume_offset,
+                                   resume_page=resume_page if mode == "wbi" else 0)
     if comments is None:
         print("[Comment] wbi/main 接口不可用，降级为旧版 /x/v2/reply/main")
         comments = _fetch_comments_legacy(oid, client, max_pages, bvid=bvid,
-                                          resume_next=resume_next, resume_page=resume_page)
+                                          resume_next=resume_next,
+                                          resume_page=resume_page if mode == "legacy" else 0)
     return comments
 
 
@@ -305,7 +353,7 @@ def build_comment_uid_map(comments: list[dict]) -> dict[str, int]:
         seen_uids.add(uid)
 
         # 计算该UID的CRC32（B站使用的标准CRC32）
-        crc = format(zlib.crc32(str(uid).encode()) & 0xFFFFFFFF, "08x")
+        crc = calc_crc32(uid)
         # CRC32碰撞时保留先见者并告警，避免弹幕发送者被误归属到后到的用户
         if crc in uid_map and uid_map[crc] != uid:
             print(f"[Comment] 警告: CRC32碰撞 {crc}，已归属UID {uid_map[crc]}，忽略 {uid}")
@@ -378,9 +426,13 @@ def fetch_charge_uid_map(bvid: str, aid: int, up_mid: int, client) -> dict:
                 print(f"[Comment] 充电名单获取失败: {data.get('message')}（降级跳过）")
             return {}
         for item in (data.get("data") or {}).get("list") or []:
-            pay_mid = item.get("pay_mid")
+            # 单条脏数据跳过，不归零整批
+            try:
+                pay_mid = int(item.get("pay_mid") or 0)
+            except (TypeError, ValueError):
+                continue
             if pay_mid:
-                uid_map[calc_crc32(int(pay_mid))] = int(pay_mid)
+                uid_map[calc_crc32(pay_mid)] = pay_mid
         if uid_map:
             print(f"[Comment] 充电名单: {len(uid_map)} 个明文UID")
     except Exception as e:

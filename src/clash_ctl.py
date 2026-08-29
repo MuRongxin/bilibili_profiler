@@ -6,11 +6,15 @@
 """
 import re
 import threading
+from urllib.parse import urlparse
 
 import requests
 
 # 组内伪节点/内置策略名，不进入轮换
 _PSEUDO = {"DIRECT", "REJECT", "PASS", "GLOBAL", "COMPATIBLE"}
+
+# 控制器地址只允许回环：external-controller 无强认证，监听非回环地址会被局域网滥用
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 # 地区识别：旗帜 emoji（区域指示符对）优先，其次节点名中的地区关键字
 _REGION_FLAG_RE = re.compile(r"[\U0001F1E6-\U0001F1FF]{2}")
@@ -33,6 +37,10 @@ def _region_of(name: str) -> str:
 class ClashCtl:
     def __init__(self, api_url: str, secret: str = "", group: str = ""):
         self.api_url = api_url.rstrip("/")
+        host = urlparse(self.api_url).hostname or ""
+        if host not in _LOOPBACK_HOSTS:
+            print(f"[Clash] 安全警告：控制器地址 {self.api_url} 非回环地址，"
+                  f"控制器接口可能被网络内其他主机滥用，建议改用 127.0.0.1")
         self.secret = secret
         self.group = group          # 为空时首次读组自动挑选第一个非 GLOBAL 的 Selector 组
         self._nodes: list[str] = []
@@ -55,14 +63,21 @@ class ClashCtl:
         返回 {"name", "all", "now"}；请求异常向上抛（由调用方静默降级）。"""
         r = requests.get(f"{self.api_url}/proxies", headers=self._headers(), timeout=5)
         r.raise_for_status()
-        proxies = (r.json() or {}).get("proxies") or {}
+        body = r.json()
+        # 防御非预期 JSON 结构（如返回 list/str）：不做 isinstance 检查会让
+        # .get 抛 AttributeError 逃逸出 list_nodes 的 requests.RequestException 兜底
+        proxies = body.get("proxies") if isinstance(body, dict) else None
+        if not isinstance(proxies, dict):
+            return {"name": "", "all": [], "now": ""}
         if self.group:
-            g = proxies.get(self.group) or {}
+            g = proxies.get(self.group)
+            if not isinstance(g, dict):
+                g = {}
             return {"name": self.group, "all": g.get("all") or [], "now": g.get("now", "")}
         for name, g in proxies.items():
-            if name == "GLOBAL":
+            if name == "GLOBAL" or not isinstance(g, dict):
                 continue
-            if (g or {}).get("type") == "Selector" and (g.get("all") or []):
+            if g.get("type") == "Selector" and (g.get("all") or []):
                 self.group = name
                 return {"name": name, "all": g["all"], "now": g.get("now", "")}
         return {"name": "", "all": [], "now": ""}

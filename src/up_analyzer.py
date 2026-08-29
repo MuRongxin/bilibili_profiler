@@ -83,8 +83,8 @@ def analyze_up(uid: int, client) -> dict:
             cdata = card["data"].get("card", {})
             result["name"] = cdata.get("name", "")
             result["follower"] = cdata.get("fans", 0)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [UP] 警告: 名片接口异常（UID:{uid}）: {e}")
 
     # 获取投稿列表（第一页就够了，分析分区分布和最近活跃度）
     now = time.time()
@@ -128,16 +128,17 @@ def analyze_up(uid: int, client) -> dict:
                     result["last_post"] = time.strftime(
                         "%Y-%m-%d", time.localtime(created)
                     )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [UP] 警告: 投稿列表接口异常（UID:{uid}）: {e}")
 
     return result
 
 
-def summarize_followings(followings: list[dict], client, sample_size: int = 0) -> dict:
+def summarize_followings(followings: list[dict], client, sample_size: int = 50) -> dict:
     """
     并行分析关注列表，汇总UP主特征
-    sample_size=0 表示分析全部；调用方应传 config.MAX_UP_SAMPLE 限制请求量。
+    sample_size 默认 50 为安全默认（不传时限制请求量，避免对超长关注列表全量打请求）；
+    传 0 表示分析全部；调用方一般显式传 config.MAX_UP_SAMPLE。
     analyze_up 内部全部使用局部变量，无共享可变状态，线程安全。
     """
     total = len(followings)
@@ -157,8 +158,8 @@ def summarize_followings(followings: list[dict], client, sample_size: int = 0) -
             try:
                 info = future.result()
                 results.append(info)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  [UP] 警告: 分析UP主 UID:{futures[future]} 失败: {e}")
 
     # 汇总 + 聚合词频
     word_freq_all = {}

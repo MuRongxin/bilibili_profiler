@@ -19,6 +19,7 @@ protobuf 结构（DmSegMobileReply）：
 为免引入 protobuf 依赖，wire 格式手写解析。
 """
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from api_client import BiliAPIClient
@@ -28,7 +29,11 @@ from config import (
     HISTORY_DANMAKU_ENABLED,
     HISTORY_MAX_MONTHS,
     HISTORY_MAX_DAYS,
+    HISTORY_RECENT_REFRESH_DAYS,
 )
+
+# done=1 的已完成视频重复调用时，回拨检查点滚动补采最近 HISTORY_RECENT_REFRESH_DAYS
+# 天的弹幕快照（弹幕池每日滚动，旧快照不含新弹幕；dmid 幂等去重，重复调用开销极小）
 
 
 # ========== protobuf wire 手写解析 ==========
@@ -50,23 +55,38 @@ def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
             raise ValueError("varint 过长")
 
 
+def _take_bytes(data: bytes, pos: int, length: int) -> tuple[bytes, int, bool]:
+    """截取 length 字节，返回 (片段, 新位置, 是否被截断)。
+    长度超剩余字节说明流已损坏：截断到末尾（保留已解析部分），由调用方计数告警。"""
+    end = pos + length
+    truncated = end > len(data)
+    if truncated:
+        end = len(data)
+    return data[pos:end], end, truncated
+
+
 def _skip_field(data: bytes, pos: int, wire_type: int) -> int:
-    """跳过未知字段，返回新位置"""
+    """跳过未知字段，返回新位置；长度超剩余字节说明流损坏，抛错由调用方按截断处理"""
     if wire_type == 0:      # varint
         _, pos = _read_varint(data, pos)
         return pos
     if wire_type == 1:      # 64-bit
-        return pos + 8
-    if wire_type == 2:      # length-delimited
+        end = pos + 8
+    elif wire_type == 2:    # length-delimited
         length, pos = _read_varint(data, pos)
-        return pos + length
-    if wire_type == 5:      # 32-bit
-        return pos + 4
-    raise ValueError(f"不支持的 wire type: {wire_type}")
+        end = pos + length
+    elif wire_type == 5:    # 32-bit
+        end = pos + 4
+    else:
+        raise ValueError(f"不支持的 wire type: {wire_type}")
+    if end > len(data):
+        raise ValueError(f"字段长度越界（wire type {wire_type}，位置 {pos}）")
+    return end
 
 
-def _parse_elem(data: bytes) -> dict:
-    """解析单个 DanmakuElem 嵌套消息，输出与 danmaku.parse_danmaku_xml 同构的 dict"""
+def _parse_elem(data: bytes, corrupt: list | None = None) -> dict:
+    """解析单个 DanmakuElem 嵌套消息，输出与 danmaku.parse_danmaku_xml 同构的 dict。
+    corrupt 提供时把长度越界截断的位置记入其中（供调用方计数告警）。"""
     fields = {}
     pos = 0
     while pos < len(data):
@@ -77,8 +97,10 @@ def _parse_elem(data: bytes) -> dict:
             fields[field_no] = value
         elif wire_type == 2:
             length, pos = _read_varint(data, pos)
-            fields[field_no] = data[pos:pos + length]
-            pos += length
+            chunk, pos, truncated = _take_bytes(data, pos, length)
+            if truncated and corrupt is not None:
+                corrupt.append(pos)
+            fields[field_no] = chunk
         else:
             pos = _skip_field(data, pos, wire_type)
 
@@ -108,9 +130,10 @@ def parse_danmaku_proto(data: bytes) -> list[dict]:
     解析 DmSegMobileReply protobuf 字节流（历史弹幕 seg.so 响应）
 
     顶层结构只有 field 1（elems，length-delimited 嵌套消息）重复出现。
-    单条 elem 解析失败跳过不中断。
+    单条 elem 解析失败跳过不中断；字段长度越界按损坏截断（保留已解析部分）并计数告警。
     """
     danmaku_list = []
+    corrupt = []   # 损坏位置计数（长度越界截断/顶层流损坏），结束统一告警
     pos = 0
     while pos < len(data):
         try:
@@ -118,10 +141,11 @@ def parse_danmaku_proto(data: bytes) -> list[dict]:
             field_no, wire_type = tag >> 3, tag & 0x07
             if field_no == 1 and wire_type == 2:
                 length, pos = _read_varint(data, pos)
-                elem_bytes = data[pos:pos + length]
-                pos += length
+                elem_bytes, pos, truncated = _take_bytes(data, pos, length)
+                if truncated:
+                    corrupt.append(pos)
                 try:
-                    danmaku_list.append(_parse_elem(elem_bytes))
+                    danmaku_list.append(_parse_elem(elem_bytes, corrupt))
                 except Exception:
                     # 单条弹幕损坏不中断整日解析
                     continue
@@ -129,7 +153,10 @@ def parse_danmaku_proto(data: bytes) -> list[dict]:
                 pos = _skip_field(data, pos, wire_type)
         except (ValueError, IndexError):
             # 顶层流损坏：已解析的部分仍然可用，直接返回
+            corrupt.append(pos)
             break
+    if corrupt:
+        print(f"[历史弹幕] 警告：响应体含 {len(corrupt)} 处损坏字段，已按截断处理")
     return danmaku_list
 
 
@@ -147,19 +174,39 @@ def _month_range(start_ym: tuple[int, int], end_ym: tuple[int, int]) -> list[str
     return months
 
 
-def _fetch_month_dates(cid: int, month: str, client: BiliAPIClient) -> list[str]:
-    """查询某月有弹幕的日期列表；失败返回空列表（降级不中断）"""
+def _load_date_set(bvid: str, key: str) -> set[str]:
+    """读取 phase_state 中的逗号分隔日期串（failed_dates/fetched_dates）为集合"""
+    from storage import get_phase_state
+    raw = get_phase_state(bvid, "danmaku", key) or ""
+    return {d for d in raw.split(",") if d}
+
+
+def _save_date_set(bvid: str, key: str, dates: set[str]):
+    """回写逗号分隔日期串（空集合写空串，读取侧按空集处理）"""
+    from storage import set_phase_state
+    set_phase_state(bvid, "danmaku", key, ",".join(sorted(dates)))
+
+
+def _fetch_month_dates(cid: int, month: str, client: BiliAPIClient) -> list[str] | None:
+    """查询某月有弹幕的日期列表；失败返回 None（该月按失败处理，与"本月无弹幕"的空列表区分）"""
     data = client.get(DANMAKU_HISTORY_INDEX_URL, params={"type": 1, "oid": cid, "month": month})
     if data.get("code") != 0:
         print(f"[历史弹幕] 警告：{month} 月份索引获取失败（{data.get('message')}），跳过该月")
-        return []
+        return None
     return data.get("data") or []
 
 
 def _fetch_day_danmaku(cid: int, date: str, client: BiliAPIClient) -> list[dict]:
-    """拉取并解析某日期的弹幕池快照（截至该日的最新1000条，非"该日发送的弹幕"）"""
+    """拉取并解析某日期的弹幕池快照（截至该日的最新1000条，非"该日发送的弹幕"）
+
+    合法 DmSegMobileReply 首字段为 elems（field 1, length-delimited），首字节必为 0x0A；
+    不符合特征（HTTP200 的 HTML 错误页/空响应等）抛 ValueError，由调用方按当日失败处理，
+    避免错误页被静默解析为 0 条照常计天推进。"""
     resp = client.get_raw(DANMAKU_HISTORY_SEG_URL, params={"type": 1, "oid": cid, "date": date})
-    return parse_danmaku_proto(resp.content)
+    body = resp.content
+    if not body or body[0] != 0x0A:
+        raise ValueError(f"响应体不符合 DmSegMobileReply 特征（长度 {len(body)}），疑似错误页")
+    return parse_danmaku_proto(body)
 
 
 def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int] = None,
@@ -167,12 +214,22 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     """
     采集视频历史弹幕（弹幕池快照逐日遍历）
 
-    从 pubdate 月份起到当前月逐月查询日期索引，再逐日拉取 seg.so。
-    返回的是原始快照合并结果（相邻日快照可能重叠），调用方需按 dmid 去重。
-    受 HISTORY_MAX_MONTHS / HISTORY_MAX_DAYS 限制；单月/单日失败打印警告跳过，不中断。
+    从 pubdate 月份起到当前月逐月查询日期索引，再逐日拉取 seg.so。月份与月内日期
+    均按降序遍历：天数上限（HISTORY_MAX_DAYS）耗尽时保留最新日期（近期弹幕对画像
+    价值更高）。返回的是原始快照合并结果（相邻日快照可能重叠），调用方需按 dmid 去重。
+    单月/单日失败打印警告跳过并计入失败清单（failed_dates 记账），不中断。
 
     bvid 提供时启用断点续采：逐日增量落库（append_danmaku 按 dmid 去重）+
-    phase_state 记录 last_date 检查点，中断后重跑从下一个日期继续；
+    phase_state 检查点（last_date 高水位 / fetched_dates 已采日期集 / failed_dates
+    失败日清单）。续采判据以已采日期集为准（last_date 兼容旧检查点）：失败日不被
+    高水位跳过，每次采集（含续采）都会重试补采，成功即销账。
+
+    done 语义：仅当时间窗完整迭代且无任何失败才写 done=1（截断属设计性上限，
+    done 照写但另写 truncated=1 供查询区分"采完"与"采到上限"）；有失败或月份
+    索引不完整时不写 done，保留续采入口。done=1 的视频重复调用时回拨检查点，
+    滚动补采最近 HISTORY_RECENT_REFRESH_DAYS 天（弹幕池每日滚动补新弹幕，dmid 幂等去重），
+    failed_dates 非空也照常补采，完成后保持 done=1。
+
     seen_dmids 为实时池/库中已有 dmid 集合（None 时从库加载），跨调用复用。
 
     Returns:
@@ -183,19 +240,39 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
 
     last_date = None
     fetched_before = 0
+    done_before = False
+    fetched_dates: set[str] = set()
+    failed_dates: set[str] = set()
     if bvid:
         from storage import (append_danmaku, get_phase_state, load_danmaku,
                              set_phase_state)
         last_date = get_phase_state(bvid, "danmaku", "last_date") or None
         fetched_before = int(get_phase_state(bvid, "danmaku", "fetched_days") or 0)
+        done_before = get_phase_state(bvid, "danmaku", "done") == "1"
+        fetched_dates = _load_date_set(bvid, "fetched_dates")
+        failed_dates = _load_date_set(bvid, "failed_dates")
         if seen_dmids is None:
             seen_dmids = {r["dmid"] for r in load_danmaku(bvid) if r["dmid"]}
         if last_date:
             print(f"[历史弹幕] 断点续采：{last_date} 及以前的日期已完成，从下一日期继续")
     seen_dmids = seen_dmids if seen_dmids is not None else set()
 
-    now = time.localtime()
-    end_ym = (now.tm_year, now.tm_mon)
+    # B站弹幕快照按北京时间划日：显式 UTC+8，消除宿主机时区依赖
+    today = datetime.now(timezone(timedelta(hours=8))).date()
+
+    # done=1 的已完成视频重复调用：回拨检查点滚动补采最近 HISTORY_RECENT_REFRESH_DAYS 天
+    # （dmid 幂等去重，重复调用快速；last_date 仍是历史高水位，不落库回拨值）
+    if done_before and last_date and last_date >= today.isoformat():
+        cutoff = (today - timedelta(days=HISTORY_RECENT_REFRESH_DAYS)).isoformat()
+        fetched_dates = {d for d in fetched_dates if d <= cutoff}
+        last_date = cutoff
+        print(f"[历史弹幕] 已完成视频滚动补采：仅补最近 {HISTORY_RECENT_REFRESH_DAYS} 天（{cutoff} 起）")
+
+    # 续采高水位快照：进入循环前固定，循环内 last_date 只增用于落库持久化——
+    # 降序遍历中若用活值做跳过判据，会先推高水位再把同轮更早日全部误跳过
+    resume_before = last_date
+
+    end_ym = (today.year, today.month)
     if pubdate:
         start = time.localtime(pubdate)
         start_ym = (start.tm_year, start.tm_mon)
@@ -215,37 +292,70 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
 
     all_danmaku = []
     fetched_days = fetched_before   # 续采时从检查点累计（HISTORY_MAX_DAYS 上限跨运行生效）
-    for month in months:
+    truncated = False               # 天数上限耗尽：更早日期未采集（设计性截断）
+    window_complete = True          # 月份索引全部成功才算时间窗完整
+    # 月份降序 + 月内日期降序：上限耗尽保留最新日期
+    for month in reversed(months):
         if fetched_days >= HISTORY_MAX_DAYS:
-            print(f"[历史弹幕] 已达天数上限 {HISTORY_MAX_DAYS}，停止回溯更早月份")
+            truncated = True
             break
         dates = _fetch_month_dates(cid, month, client)
+        if dates is None:
+            # 月份索引失败：时间窗不完整（不写 done）；该月内挂账的失败日继续挂账待补
+            window_complete = False
+            continue
         if not dates:
             continue
         month_count = 0
-        for date in dates:
+        for date in sorted(dates, reverse=True):
             if fetched_days >= HISTORY_MAX_DAYS:
+                truncated = True
                 break
-            if last_date and date <= last_date:
-                continue            # 断点续采：该日已在此前运行中落库
+            if date not in failed_dates and (
+                    date in fetched_dates or (resume_before and date <= resume_before)):
+                continue            # 该日已落库（失败日除外：不被高水位跳过，重试补采）
             try:
                 dms = _fetch_day_danmaku(cid, date, client)
             except Exception as e:
-                # 降级而非中断：单日失败仅跳过该日
+                # 降级而非中断：单日失败仅跳过该日并记账，后续运行优先补采
                 print(f"[历史弹幕] 警告：{date} 弹幕采集失败，已跳过: {e}")
+                failed_dates.add(date)
                 continue
+            failed_dates.discard(date)
             fetched_days += 1
             month_count += len(dms)
             all_danmaku.extend(dms)
             if bvid:
-                # 逐日增量落库 + 检查点：中断后重跑从下一日期继续
+                # 逐日增量落库 + 检查点：中断后重跑按已采日期集续采
+                fetched_dates.add(date)
                 append_danmaku(bvid, dms, seen_dmids)
-                set_phase_state(bvid, "danmaku", "last_date", date)
+                if not last_date or date > last_date:
+                    last_date = date   # 高水位线（降序遍历中只会被更新鲜的日期推高）
+                set_phase_state(bvid, "danmaku", "last_date", last_date)
                 set_phase_state(bvid, "danmaku", "fetched_days", str(fetched_days))
+                _save_date_set(bvid, "fetched_dates", fetched_dates)
+                _save_date_set(bvid, "failed_dates", failed_dates)
             print(f"[历史弹幕] {date}: {len(dms)} 条（第 {fetched_days} 天，累计 {len(all_danmaku)} 条）")
         print(f"[历史弹幕] {month}: {len(dates)} 天有弹幕，累计 {len(all_danmaku)} 条")
+        if truncated:
+            break
+
+    if truncated:
+        print(f"[历史弹幕] 已达天数上限 {HISTORY_MAX_DAYS}，更早的日期未采集（上限耗尽保留最新日期）")
 
     if bvid:
-        set_phase_state(bvid, "danmaku", "done", "1")
+        _save_date_set(bvid, "failed_dates", failed_dates)
+        if truncated:
+            # 截断语义：已达 HISTORY_MAX_DAYS 上限，更早日期属设计性放弃而非失败——
+            # done 照写（重跑不会也不应去补更早日期），truncated=1 单独可查
+            set_phase_state(bvid, "danmaku", "truncated", "1")
+        if done_before:
+            pass   # 滚动补采路径：保持 done=1
+        elif window_complete and not failed_dates:
+            # 时间窗完整迭代且无任何失败（含截断场景）才标完成；否则保留续采入口
+            set_phase_state(bvid, "danmaku", "done", "1")
+        else:
+            print(f"[历史弹幕] 时间窗未完整采集（失败 {len(failed_dates)} 天"
+                  f"{'' if window_complete else '，含月份索引失败'}），不写 done，重跑可续采")
     print(f"[历史弹幕] 共采集 {fetched_days} 天，{len(all_danmaku)} 条历史弹幕")
     return all_danmaku

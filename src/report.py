@@ -160,9 +160,10 @@ def _category_chips(categories: list) -> str:
 
 
 def safe_url(url):
-    """URL 白名单校验：仅允许 http/https，其余返回空串"""
+    """URL 白名单校验：仅允许 http/https 且 hostname 非空（挡 "https:" 这类残串），其余返回空串"""
     url = str(url) if url else ""
-    if urlparse(url).scheme in ("http", "https"):
+    p = urlparse(url)
+    if p.scheme in ("http", "https") and p.hostname:
         return esc(url)
     return ""
 
@@ -393,7 +394,7 @@ def generate_user_card(profile: dict) -> str:
 
     # 头像 (可点击跳转B站主页；referrerpolicy="no-referrer" 防 hdslb 防盗链拦截导致头像空白)
     profile_url = safe_url(f"https://space.bilibili.com/{uid}")
-    avatar_html = f'<a href="{profile_url}" target="_blank"><img src="{safe_url(face)}" alt="{esc(name)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display=\'none\'"></a>' if face else f'<div class="avatar-text">{esc(name[0]) if name else "?"}</div>'
+    avatar_html = f'<a href="{profile_url}" target="_blank" rel="noopener"><img src="{safe_url(face)}" alt="{esc(name)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display=\'none\'"></a>' if face else f'<div class="avatar-text">{esc(name[0]) if name else "?"}</div>'
 
     return f'''
     <div class="user-card" id="uid-{esc(uid)}" data-level="{esc(level)}" data-vip="{'true' if profile.get('vip_status',0)==1 else 'false'}" data-spam="{esc(spam_level)}" data-official="{'true' if profile.get('official_type',-1)>=0 else 'false'}" data-is-up="{'true' if profile.get('archive_count',0)>0 else 'false'}" data-spam-score="{spam_score:.2f}" data-danmaku-count="{esc(dm_count)}" data-fans="{esc(follower)}">
@@ -401,7 +402,7 @@ def generate_user_card(profile: dict) -> str:
             <div class="avatar">{avatar_html}</div>
             <div class="header-info">
                 <div class="name-line">
-                    <a href="{profile_url}" target="_blank" class="username-link"><span class="username">{esc(name)}</span></a>
+                    <a href="{profile_url}" target="_blank" rel="noopener" class="username-link"><span class="username">{esc(name)}</span></a>
                     <span class="uid">UID:{esc(uid)}</span>
                     <span class="level-badge">Lv.{esc(level)}</span>
                     {f'<span class="school-badge" title="毕业院校（来自空间信息）">🎓 {esc(profile.get("school", ""))}</span>' if profile.get('school') else ''}

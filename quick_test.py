@@ -21,7 +21,7 @@ from uid_resolver import resolve_sender
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
-from storage import init_db, save_video_info, save_comments
+from storage import init_db, save_video_info, load_video_info
 from web_autostart import maybe_launch_web
 
 # 冒烟采样上限：不跑全量视频，只取少量数据验证流水线
@@ -31,12 +31,13 @@ QUICK_COMMENT_LIMIT = 50    # 评论截断条数
 
 
 class _Tee:
-    """stdout 双写：终端 + data/quick_test.log（冒烟日志可回溯，重定向时也有文件）"""
+    """stdout/stderr 双写：终端 + data/quick_test.log（冒烟日志可回溯，重定向时也有文件）"""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, stream):
         # buffering=1 行缓冲：日志实时可见（tail -f 可追），避免块缓冲长时间无输出
-        self._file = open(path, "w", encoding="utf-8", buffering=1)
-        self._out = sys.stdout
+        # "a" 追加：重跑不清空历史日志，便于回溯上一次冒烟失败时的输出
+        self._file = open(path, "a", encoding="utf-8", buffering=1)
+        self._out = stream
 
     def write(self, s):
         self._out.write(s)
@@ -45,6 +46,17 @@ class _Tee:
     def flush(self):
         self._out.flush()
         self._file.flush()
+
+    # 文件对象协议属性：转发到底层流，兼容下游库对 sys.stdout/stderr 的能力探测
+    @property
+    def encoding(self):
+        return self._out.encoding
+
+    def fileno(self):
+        return self._out.fileno()
+
+    def isatty(self):
+        return self._out.isatty()
 
 
 def main():
@@ -59,8 +71,10 @@ def main():
 
     # 全程日志双写到 data/quick_test.log（后台/重定向运行时也能回看进度）
     os.makedirs(DATA_DIR, exist_ok=True)
-    sys.stdout = _Tee(os.path.join(DATA_DIR, "quick_test.log"))
-    print(f"[日志] 同步写入 {os.path.join(DATA_DIR, 'quick_test.log')}")
+    log_path = os.path.join(DATA_DIR, "quick_test.log")
+    sys.stdout = _Tee(log_path, sys.stdout)
+    sys.stderr = _Tee(log_path, sys.stderr)
+    print(f"[日志] 同步写入 {log_path}")
 
     print(f"🎯 快速分析: {bvid}  (刷屏 Top {top_n})")
     print(f"   策略: 采样弹幕{QUICK_DANMAKU_LIMIT}条/评论{QUICK_COMMENT_LIMIT}条 → 刷屏检测 → 只解 Top{top_n} UID\n")
@@ -78,9 +92,15 @@ def main():
     danmaku_list = danmaku_list[:QUICK_DANMAKU_LIMIT]
     sender_groups = group_by_sender(danmaku_list)
 
-    # 采样数据不落库（save_danmaku 是先删后插，会清掉该视频已有的全量弹幕）
+    # 采样数据不落库：弹幕采样只调用了 collect_danmaku_data 的解析与 group_by_sender 聚合，
+    # 全程未调用任何弹幕落库函数；评论采样同样只做内存统计（无 phase_state 哨兵的采样落库
+    # 会被 run.py 断点续采误判为"旧版完整落库"而跳过全量评论采集）。视频信息落库对齐主流程口径：先在内存合并
+    # 库内旧行的 danmaku_coverage，避免裸 API 返回整行覆盖把弹幕覆盖率冲掉
     try:
         init_db()
+        prev_info = load_video_info(bvid) or {}
+        if prev_info.get("danmaku_coverage"):
+            video_info["danmaku_coverage"] = prev_info["danmaku_coverage"]
         save_video_info(bvid, video_info)
     except Exception as e:
         print(f"   警告: 视频信息落库失败（{e}）")
@@ -111,6 +131,8 @@ def main():
     print("[4/6] 收集评论（采样）...")
     comments = []
     try:
+        # 不传 bvid：fetch_comments 带 bvid 会逐页落库并写 phase_state 游标检查点，
+        # 冒烟采样必须保持纯内存（采样落库会污染 run.py 的评论断点续采判据）
         comments = fetch_comments(video_info.get("aid", 0), pool, max_pages=QUICK_COMMENT_PAGES)
         comments = comments[:QUICK_COMMENT_LIMIT]
         comment_uid_map = build_comment_uid_map(comments)
@@ -124,11 +146,6 @@ def main():
         uid_comments.setdefault(c["uid"], []).append(c)
     for lst in uid_comments.values():
         lst.sort(key=lambda x: x.get("like", 0), reverse=True)
-    # 评论落库（INSERT OR IGNORE 幂等追加，不破坏已有数据；失败只警告不中断）
-    try:
-        save_comments(bvid, comments)
-    except Exception as e:
-        print(f"   警告: 评论落库失败（{e}），跨视频足迹将缺评论")
 
     # 5. 逐个解析 + 采集 + 画像 + AI
     profiles = []

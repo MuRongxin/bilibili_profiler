@@ -8,8 +8,13 @@ import hashlib
 import json
 import time
 from openai import OpenAI
-from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_DEEP_TOP_K
+from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_DEEP_TOP_K,
+                    LLM_FALLBACK, LLM_DEEP_TIMEOUT)
 from storage import load_llm_cache, save_llm_cache
+
+# 深掘结果缓存口径版本号（prompt/证据包结构变更时递增，使旧缓存自动失效）
+_DEEP_CACHE_VERSION = "v2"
+# 深掘单次 LLM 调用超时已迁移至 config.LLM_DEEP_TIMEOUT
 
 
 class LLMAnalyzer:
@@ -20,6 +25,13 @@ class LLMAnalyzer:
         self.base_url = LLM_BASE_URL
         self.model = LLM_MODEL
         self.max_tokens = LLM_MAX_TOKENS
+        # OpenAI client 复用（一次创建全程复用，避免每用户重建 TCP/TLS 连接）；
+        # 备用厂商第二套（LLM_FALLBACK，key 为空则不建），主用失败重试时切换
+        self.clients = [OpenAI(api_key=self.api_key, base_url=self.base_url)]
+        self.models = [self.model]
+        if LLM_FALLBACK[0]:
+            self.clients.append(OpenAI(api_key=LLM_FALLBACK[0], base_url=LLM_FALLBACK[1]))
+            self.models.append(LLM_FALLBACK[2])
 
     def _build_evidence(self, p: dict, video_info: dict) -> dict:
         """深掘证据包（缓存 hash 与 prompt 构建共用同一份数据，保证 hash 能反映证据变化）"""
@@ -66,19 +78,16 @@ class LLMAnalyzer:
 **证据引用**: （列出2-4条最能支撑结论的弹幕或评论原文，并各配一句解读）
 **风险等级**: （高/中/低 + 一句理由：对社区氛围的潜在影响）"""
 
-    def _analyze_one_deep(self, p: dict, video_info: dict) -> str:
-        """单人深掘调用，返回分析文本"""
-        client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url,
-        )
-        response = client.chat.completions.create(
-            model=self.model,
+    def _analyze_one_deep(self, p: dict, video_info: dict, ci: int = 0) -> str:
+        """单人深掘调用，返回分析文本。ci 为厂商下标（0=主用，1=备用）"""
+        response = self.clients[ci].chat.completions.create(
+            model=self.models[ci],
             messages=[{"role": "user", "content": self._build_deep_prompt(p, video_info)}],
             max_tokens=self.max_tokens,
             temperature=1.0,
             top_p=0.95,
             stream=False,
+            timeout=LLM_DEEP_TIMEOUT,
         )
         return response.choices[0].message.content or ""
 
@@ -99,7 +108,7 @@ class LLMAnalyzer:
             digest = hashlib.sha256(
                 json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode("utf-8")
             ).hexdigest()[:16]
-            cache_key = f"deep:{uid}:v2:{LLM_MODEL}:{digest}"
+            cache_key = f"deep:{uid}:{_DEEP_CACHE_VERSION}:{LLM_MODEL}:{digest}"
             cached = load_llm_cache(cache_key)
             if cached:
                 results[uid] = cached
@@ -111,11 +120,13 @@ class LLMAnalyzer:
                 text = self._analyze_one_deep(p, video_info)
             except Exception as e:
                 # 超时等多为瞬态 API 波动（实测曾整批连续超时后自行恢复），
-                # 退避后重试一次；仍失败才降级跳过，不中断整体深掘
-                print(f"  警告: UID:{uid} 深掘失败（{e}），20 秒后重试一次...")
+                # 退避后重试一次（有备用厂商则换备用），仍失败才降级跳过，不中断整体深掘
+                ci = 1 if len(self.clients) > 1 else 0
+                retry_tag = "，换备用厂商" if ci else ""
+                print(f"  警告: UID:{uid} 深掘失败（{e}），20 秒后重试一次{retry_tag}...")
                 time.sleep(20)
                 try:
-                    text = self._analyze_one_deep(p, video_info)
+                    text = self._analyze_one_deep(p, video_info, ci)
                 except Exception as e2:
                     print(f"  警告: UID:{uid} 重试仍失败（{e2}），跳过")
                     continue

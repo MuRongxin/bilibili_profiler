@@ -92,13 +92,24 @@ def verify_uid_exists(uid: int, client: BiliAPIClient) -> Tuple[str, dict]:
         return VERIFY_UNKNOWN, {}
 
 
+def _verify_chunk_single(chunk: list, client: BiliAPIClient, found: dict, unknown: set):
+    """单个 chunk 降级为单点逐验（保留三态语义），结果就地并入 found/unknown"""
+    for u in chunk:
+        status, info = verify_uid_exists(u, client)
+        if status == VERIFY_EXISTS:
+            found[u] = info
+        elif status == VERIFY_UNKNOWN:
+            unknown.add(u)
+
+
 def _batch_verify_uids(uids: list[int], client: BiliAPIClient) -> Tuple[dict, set]:
     """
     批量名片接口预验证存在性（≤50 UID/请求）
 
     接口行为（已实测）：返回 data 仅包含存在的 UID，不存在的直接缺席，
-    与单点接口 code=0/-404 一一对应。整批请求失败的 chunk 降级为
-    单点 verify_uid_exists 逐验，仍失败的计入"未知"集合。
+    与单点接口 code=0/-404 一一对应。请求异常（组合池风控/代理错误等）或
+    整批失败的 chunk 降级为单点 verify_uid_exists 逐验，仍失败的计入"未知"
+    集合——本函数任何情况下只返回 (found, unknown)，绝不外抛异常中断分析。
 
     Returns:
         (存在UID→名片info, 状态未知UID集合)；两集合之外的 UID 即确定不存在
@@ -107,35 +118,55 @@ def _batch_verify_uids(uids: list[int], client: BiliAPIClient) -> Tuple[dict, se
     unknown: set[int] = set()
     chunks = [uids[i:i + 50] for i in range(0, len(uids), 50)]
     for ci, chunk in enumerate(chunks, 1):
-        data = client.get(USER_CARDS_BATCH_URL, params={
-            "uids": ",".join(str(u) for u in chunk)
-        })
+        try:
+            data = client.get(USER_CARDS_BATCH_URL, params={
+                "uids": ",".join(str(u) for u in chunk)
+            })
+        except Exception as e:
+            # 组合池抛 RiskControlError/ProxyConnError 等：降级单点逐验，不外抛
+            print(f"[Resolver] 警告: 第 {ci}/{len(chunks)} 批批量验证请求异常 ({e})，降级单点逐验")
+            _verify_chunk_single(chunk, client, found, unknown)
+            print(f"[Resolver] 预验证 {ci}/{len(chunks)} 批（存在 {len(found)} / 未知 {len(unknown)}）")
+            continue
         if data.get("code") == 0:
-            for uid_str, card in (data.get("data") or {}).items():
-                if not card:
+            # 返回对账：返回 UID 必须全部属于本 chunk 且条数不超过请求数，否则视为
+            # 接口静默截断/串包——此时"缺席即不存在"的语义不再可信，降级单点逐验
+            batch_data = data.get("data") or {}
+            chunk_set = set(chunk)
+            entries = []
+            truncated = len(batch_data) > len(chunk)
+            for uid_str, card in batch_data.items():
+                if truncated or not card:
                     continue
                 try:
                     uid = int(uid_str)
                 except (TypeError, ValueError):
                     continue
-                found[uid] = {
-                    "uid": uid,
-                    "name": card.get("name", ""),
-                    "face": card.get("face", ""),
-                    "vip_type": (card.get("vip") or {}).get("type", 0),
-                    "vip_status": (card.get("vip") or {}).get("status", 0),
-                    "official_type": (card.get("official") or {}).get("type", -1),
-                }
+                if uid not in chunk_set:
+                    truncated = True
+                    continue
+                entries.append((uid, card))
+            if truncated:
+                print(f"[Resolver] 警告: 第 {ci}/{len(chunks)} 批批量返回与请求对账不符"
+                      f"（疑静默截断），降级单点逐验")
+                _verify_chunk_single(chunk, client, found, unknown)
+            else:
+                for uid, card in entries:
+                    # 批量名片为精简字段集：接口本身不含 sign/level/sex/follower/following
+                    # （单点 verify_uid_exists 才有），属预期差异，不为补字段额外发请求
+                    found[uid] = {
+                        "uid": uid,
+                        "name": card.get("name", ""),
+                        "face": card.get("face", ""),
+                        "vip_type": (card.get("vip") or {}).get("type", 0),
+                        "vip_status": (card.get("vip") or {}).get("status", 0),
+                        "official_type": (card.get("official") or {}).get("type", -1),
+                    }
         else:
             # 整批失败（风控/网络等）：降级单点逐验，保留三态语义
             print(f"[Resolver] 警告: 第 {ci}/{len(chunks)} 批批量验证失败"
                   f" (code={data.get('code')} {data.get('message')!r})，降级单点逐验")
-            for u in chunk:
-                status, info = verify_uid_exists(u, client)
-                if status == VERIFY_EXISTS:
-                    found[u] = info
-                elif status == VERIFY_UNKNOWN:
-                    unknown.add(u)
+            _verify_chunk_single(chunk, client, found, unknown)
         print(f"[Resolver] 预验证 {ci}/{len(chunks)} 批（存在 {len(found)} / 未知 {len(unknown)}）")
     return found, unknown
 
@@ -167,8 +198,7 @@ def _plaintext_result(method_map: dict | None, source_crc: str, danmaku_count: i
 
 
 def _finalize(mid_hash: str, danmaku_count: int, plain_uid: Optional[int],
-              candidates: list, comment_uid_map: dict[str, int],
-              method_map: dict | None, status_of, info_of):
+              candidates: list, method_map: dict | None, status_of, info_of):
     """
     存在性已知后的纯本地消歧（批量预验证/单点逐验两路径共用，保证判定口径一致）
 
@@ -191,19 +221,12 @@ def _finalize(mid_hash: str, danmaku_count: int, plain_uid: Optional[int],
     if not candidates:
         return None, "无", METHOD_UNKNOWN, None, False, candidates
 
-    # 2a. 候选 ∩ 明文 UID 集合且确定存在 → 等同明文验证（最可靠的消歧）
-    plain_uids = set(comment_uid_map.values())
-    inter = [u for u in candidates if u in plain_uids]
-    for u in inter:
-        if status_of(u) == VERIFY_EXISTS:
-            # 反查该候选对应的明文源条目，method 标注真实来源（充电名单/互动弹幕等）
-            source_crc = next((h for h, v in comment_uid_map.items() if v == u), mid_hash)
-            method, confidence, risk = _plaintext_result(method_map, source_crc, danmaku_count)
-            return u, confidence, method, info_of(u), risk, candidates
-    # 交集候选中确定不存在的剔除出 2b；状态未知的保留给 2b 统计
-    candidates = [u for u in candidates if u not in inter or status_of(u) == VERIFY_UNKNOWN]
+    # 注：原"候选 ∩ 明文 UID 集合"消歧分支已删除——在 comment_uid_map 满足
+    # key == crc32(value) 的不变式下，交集中的候选 u 必然也有
+    # comment_uid_map[mid_hash] == u（候选均经 zlib 校验 crc32(u) == mid_hash），
+    # 即方法1 的明文命中，已被先行短路处理，该分支数学上不可达。
 
-    # 2b. 按存在性分桶判定
+    # 按存在性分桶判定
     existing = [u for u in candidates if status_of(u) == VERIFY_EXISTS]
     unknown_n = sum(1 for u in candidates if status_of(u) == VERIFY_UNKNOWN)
 
@@ -243,7 +266,7 @@ def resolve_sender(
 
     优先级：
     1. 明文交叉验证（评论/充电名单/互动弹幕/全局库合并映射，100%准确）
-    2. MITM 反查 + 消歧（候选∩明文UID集合唯一→按明文验证；否则存在性验证）
+    2. MITM 反查 + 存在性验证消歧（候选∩明文集合必已被方法1覆盖，见 _finalize 注）
     3. 标记为未知
 
     Args:
@@ -285,7 +308,7 @@ def resolve_sender(
     if len(candidates) > 1:
         print(f"[Resolver] 注意: hash {mid_hash} 有 {len(candidates)} 个碰撞候选，逐个验证存在性")
     return _finalize(mid_hash, len(danmaku_contents), None, candidates,
-                     comment_uid_map, method_map, status_of, info_of)
+                     method_map, status_of, info_of)
 
 
 def resolve_all_senders(
@@ -325,8 +348,12 @@ def resolve_all_senders(
     for mid_hash in sender_groups:
         plain_uid = cross_verify_with_comments(mid_hash, comment_uid_map)
         if plain_uid is not None:
+            # 明文已命中的 hash 在 _finalize 方法1 即短路，跳过 MITM 反查、
+            # 候选记空列表且不并入待验证 universe（省本地计算与无谓验证请求）
             plain_hits[mid_hash] = plain_uid
             universe.add(plain_uid)
+            cand_map[mid_hash] = []
+            continue
         cands = crack_crc32(mid_hash, max_search=max_search)
         cand_map[mid_hash] = cands
         universe.update(cands)
@@ -350,7 +377,7 @@ def resolve_all_senders(
     for idx, (mid_hash, group) in enumerate(sender_groups.items(), 1):
         uid, confidence, method, user_info, collision_risk, candidates = _finalize(
             mid_hash, group["count"], plain_hits.get(mid_hash), cand_map[mid_hash],
-            comment_uid_map, method_map, status_of, info_of)
+            method_map, status_of, info_of)
 
         results[mid_hash] = {
             "uid": uid,

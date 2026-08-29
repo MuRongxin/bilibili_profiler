@@ -8,7 +8,11 @@ import difflib
 from collections import Counter
 from typing import Tuple
 
-from config import SPAM_HIGH_THRESHOLD, SPAM_MEDIUM_THRESHOLD
+from config import (SPAM_HIGH_THRESHOLD, SPAM_MEDIUM_THRESHOLD,
+                    SPAM_BURST_WINDOW_SECONDS, SPAM_BURST_HIGH_COUNT,
+                    SPAM_BURST_MEDIUM_COUNT, SPAM_VARIANT_SIMILARITY,
+                    SPAM_VARIANT_MIN_COUNT, SPAM_BURST_MIN_COUNT,
+                    SPAM_BURST_MAX_INTERVAL)
 
 
 def content_similarity(a: str, b: str) -> float:
@@ -18,16 +22,17 @@ def content_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
-def analyze_content_repeat(contents: list[str]) -> Tuple[float, list[float]]:
+def analyze_content_repeat(contents: list[str]) -> Tuple[float, float, int]:
     """
     分析内容重复率
-    
+
     Returns:
-        (整体重复率, 两两相似度列表)
+        (整体重复率, 两两相似度加权和, 两两相似度对数)
+        不物化全量相似度列表（n(n-1)/2 个 float），调用方按 sum/count 取均值。
     """
     n = len(contents)
     if n <= 1:
-        return 0.0, []
+        return 0.0, 0.0, 0
 
     counts = Counter(contents)
     unique = list(counts)
@@ -35,17 +40,23 @@ def analyze_content_repeat(contents: list[str]) -> Tuple[float, list[float]]:
 
     # 先按内容去重，只对唯一内容两两比较，再用出现次数加权展开为全量两两相似度。
     # 与原 O(n²) 全量比较数学等价（相同内容相似度恒为 1，唯一对 (a,b) 贡献
-    # count[a]*count[b] 个相同 sim），复杂度降为 O(u²)，u = 唯一内容数。
-    similarities = []
+    # count[a]*count[b] 个相同 sim），复杂度降为 O(u²)，u = 唯一内容数；
+    # 且边算边累加 sum/count，不再物化 n(n-1)/2 个元素的列表。
+    sim_sum = 0.0
+    sim_count = 0
     for c in counts.values():
-        similarities.extend([1.0] * (c * (c - 1) // 2))
+        k = c * (c - 1) // 2
+        sim_sum += float(k)
+        sim_count += k
     for i in range(len(unique)):
         ci = counts[unique[i]]
         for j in range(i + 1, len(unique)):
             sim = content_similarity(unique[i], unique[j])
-            similarities.extend([sim] * (ci * counts[unique[j]]))
+            k = ci * counts[unique[j]]
+            sim_sum += sim * k
+            sim_count += k
 
-    return repeat_rate, similarities
+    return repeat_rate, sim_sum, sim_count
 
 
 def detect_bot_pattern(timestamps: list[int]) -> float:
@@ -81,16 +92,17 @@ def detect_bot_pattern(timestamps: list[int]) -> float:
     # 变异系数极小（<0.1）说明间隔非常规律，疑似机器人
     bot_score = max(0, 1 - cv * 10)  # cv越小，分数越高
 
-    # 短时间内爆发（10秒内发送5条以上）
+    # 短时间内爆发：滑动窗口双指针 O(n) 统计窗口内最大条数
     burst_count = 0
-    window = 10  # 10秒窗口
-    for i in range(len(sorted_ts)):
-        count_in_window = sum(1 for j in range(i, len(sorted_ts)) if sorted_ts[j] - sorted_ts[i] <= window)
-        burst_count = max(burst_count, count_in_window)
+    left = 0
+    for right in range(len(sorted_ts)):
+        while sorted_ts[right] - sorted_ts[left] > SPAM_BURST_WINDOW_SECONDS:
+            left += 1
+        burst_count = max(burst_count, right - left + 1)
 
-    if burst_count >= 5:
+    if burst_count >= SPAM_BURST_HIGH_COUNT:
         bot_score = max(bot_score, 0.7)
-    elif burst_count >= 3:
+    elif burst_count >= SPAM_BURST_MEDIUM_COUNT:
         bot_score = max(bot_score, 0.4)
 
     return min(1.0, bot_score)
@@ -118,8 +130,8 @@ def analyze_spam(danmaku_contents: list[str], timestamps: list[int]) -> dict:
     unique_count = len(unique_contents)
 
     # 内容重复率
-    repeat_rate, similarities = analyze_content_repeat(danmaku_contents)
-    avg_similarity = sum(similarities) / len(similarities) if similarities else 0.0
+    repeat_rate, sim_sum, sim_count = analyze_content_repeat(danmaku_contents)
+    avg_similarity = sim_sum / sim_count if sim_count else 0.0
 
     # 时间间隔
     if len(timestamps) >= 2:
@@ -153,7 +165,7 @@ def analyze_spam(danmaku_contents: list[str], timestamps: list[int]) -> dict:
         reasons.append(f"疑似机器人(评分{bot_score:.2f})")
 
     # 规则3：内容高度相似但不完全相同（变种刷屏）
-    if avg_similarity >= 0.8 and count >= 5:
+    if avg_similarity >= SPAM_VARIANT_SIMILARITY and count >= SPAM_VARIANT_MIN_COUNT:
         spam_score = max(spam_score, 0.7)
         reasons.append(f"变种刷屏(相似度{avg_similarity:.0%})")
 
@@ -161,7 +173,7 @@ def analyze_spam(danmaku_contents: list[str], timestamps: list[int]) -> dict:
     # 已知局限：avg_interval 是该用户全部弹幕时间跨度的平均值，对"长期低频发言+
     # 某一刻集中爆发"的用户，爆发段会被整体平均值稀释而漏检；若要识别局部爆发
     # 需改为滑动窗口统计，当前按整体平均判定以保持简单。
-    if count >= 10 and avg_interval < 2:
+    if count >= SPAM_BURST_MIN_COUNT and avg_interval < SPAM_BURST_MAX_INTERVAL:
         spam_score = max(spam_score, 0.75)
         reasons.append(f"高频爆发(间隔{avg_interval:.1f}s)")
 

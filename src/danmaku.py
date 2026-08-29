@@ -7,7 +7,7 @@ from typing import Optional
 
 from api_client import BiliAPIClient
 from config import VIDEO_INFO_URL, DANMAKU_XML_URL, DANMAKU_VIEW_URL, MAX_ANALYZE_USERS_HARD_CAP
-from danmaku_history import _read_varint, _skip_field  # 复用历史弹幕的 wire 手写解析
+from danmaku_history import _read_varint, _skip_field, _take_bytes  # 复用历史弹幕的 wire 手写解析
 from uid_resolver import calc_crc32
 
 
@@ -58,6 +58,10 @@ def parse_danmaku_xml(xml_bytes: bytes) -> list[dict]:
             # 注意：不能用isdigit()特判——约2.3%的CRC32 hash恰好全是十进制数字
             # （如"12345678"），误判为明文数字UID转码后会产生完全不同的值。
             mid_hash = attrs[6].lower()
+            if not mid_hash:
+                continue   # p 属性第7段为空串：无发送者标识，不计入发送者聚合
+            # 左补零对齐历史池/calc_crc32 的8位格式（实测实时池个别条目不足8位）
+            mid_hash = mid_hash.zfill(8)
 
             danmaku_list.append({
                 "content": content,
@@ -79,7 +83,6 @@ def parse_danmaku_xml(xml_bytes: bytes) -> list[dict]:
 def fetch_danmaku(cid: int, client: BiliAPIClient) -> list[dict]:
     """获取单cid的弹幕列表"""
     resp = client.get_raw(DANMAKU_XML_URL, params={"oid": cid})
-    resp.encoding = "utf-8"
     return parse_danmaku_xml(resp.content)
 
 
@@ -193,8 +196,9 @@ def collect_danmaku_data(bvid: str, client: BiliAPIClient) -> tuple[dict, list[d
 
 # ========== 互动弹幕（commandDms，含明文 mid） ==========
 
-def _parse_command_dm(data: bytes) -> dict:
-    """解析单个 CommandDm 嵌套消息：mid=3(varint), command=4, content=5"""
+def _parse_command_dm(data: bytes, corrupt: list | None = None) -> dict:
+    """解析单个 CommandDm 嵌套消息：mid=3(varint), command=4, content=5。
+    corrupt 提供时把长度越界截断的位置记入其中（供调用方计数告警）。"""
     fields = {}
     pos = 0
     while pos < len(data):
@@ -205,8 +209,10 @@ def _parse_command_dm(data: bytes) -> dict:
             fields[field_no] = value
         elif wire_type == 2:
             length, pos = _read_varint(data, pos)
-            fields[field_no] = data[pos:pos + length]
-            pos += length
+            chunk, pos, truncated = _take_bytes(data, pos, length)
+            if truncated and corrupt is not None:
+                corrupt.append(pos)
+            fields[field_no] = chunk
         else:
             pos = _skip_field(data, pos, wire_type)
 
@@ -239,16 +245,26 @@ def fetch_command_dms(video_info: dict, client: BiliAPIClient) -> list[dict]:
             return []
         raw = client.get_raw(DANMAKU_VIEW_URL, params={"type": 1, "oid": cid, "pid": aid}).content
         items = []
+        corrupt = []   # 损坏条目计数（长度越界截断/单条解析失败），结束统一告警
         pos = 0
         while pos < len(raw):
             tag, pos = _read_varint(raw, pos)
             field_no, wire_type = tag >> 3, tag & 0x07
             if field_no == 9 and wire_type == 2:  # commandDms
                 length, pos = _read_varint(raw, pos)
-                items.append(_parse_command_dm(raw[pos:pos + length]))
-                pos += length
+                elem_bytes, pos, truncated = _take_bytes(raw, pos, length)
+                if truncated:
+                    corrupt.append(pos)
+                try:
+                    items.append(_parse_command_dm(elem_bytes, corrupt))
+                except Exception:
+                    # 单条损坏跳过不丢整份（对齐 parse_danmaku_proto 的 per-item 策略）
+                    corrupt.append(pos)
+                    continue
             else:
                 pos = _skip_field(raw, pos, wire_type)
+        if corrupt:
+            print(f"[Danmaku] 警告：互动弹幕响应含 {len(corrupt)} 处损坏，已截断/跳过")
         if items:
             print(f"[Danmaku] 互动弹幕: {len(items)} 条（含明文mid）")
         return items

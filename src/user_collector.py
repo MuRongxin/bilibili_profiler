@@ -49,7 +49,7 @@ def get_user_card(uid: int, client: BiliAPIClient) -> dict:
         "vip_type": vip.get("type", 0),        # 1:月度大会员, 2:年度大会员
         "vip_status": vip.get("status", 0),    # 1:有效
         "vip_due_date": vip.get("due_date", 0),
-        "official_type": official.get("type", -1),
+        "official_type": _safe_int(official.get("type", -1), -1),
         "official_title": official.get("desc", ""),
         "follower": card.get("fans", 0),
         "following": card.get("attention", 0),
@@ -334,7 +334,7 @@ def get_followings(uid: int, client: BiliAPIClient, max_pages: int = MAX_FOLLOWI
                 "uid": f.get("mid", 0),
                 "name": f.get("uname", ""),
                 "sign": f.get("sign", ""),
-                "official_type": f.get("official", {}).get("type", -1),
+                "official_type": _safe_int(f.get("official", {}).get("type", -1), -1),
                 "vip_type": f.get("vip", {}).get("type", 0),
                 "face": f.get("face", ""),
             })
@@ -365,7 +365,7 @@ def get_followers(uid: int, client: BiliAPIClient, max_pages: int = MAX_FOLLOWER
                 "uid": f.get("mid", 0),
                 "name": f.get("uname", ""),
                 "sign": f.get("sign", ""),
-                "official_type": f.get("official", {}).get("type", -1),
+                "official_type": _safe_int(f.get("official", {}).get("type", -1), -1),
                 "vip_type": f.get("vip", {}).get("type", 0),
             })
 
@@ -487,7 +487,12 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
         folders = []
         user_data["favorite_folders"] = []
     if folders:
-        user_data["favorite_contents"] = get_favorite_contents(folders[0]["id"], client)
+        try:
+            user_data["favorite_contents"] = get_favorite_contents(folders[0]["id"], client)
+        except Exception as e:
+            # 收藏夹内容采集失败降级为空列表，不连累已采的主页/追番/收藏夹数据
+            print(f"  [Collect] 警告: UID:{uid} 收藏夹内容采集失败（{e}），降级为空列表")
+            user_data["favorite_contents"] = []
     else:
         user_data["favorite_contents"] = []
 

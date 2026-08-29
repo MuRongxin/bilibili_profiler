@@ -7,6 +7,22 @@
 import csv
 import json
 
+# CSV 公式注入防护：以 = + - @ 或制表符开头的文本单元格会被 Excel/WPS 当公式执行
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t")
+# 需剥离的控制字符（\x00 等；保留 \t \n \r，制表符由前置单引号兜底）
+_CSV_CTRL_CHARS = frozenset(
+    chr(c) for c in list(range(0x00, 0x09)) + [0x0B, 0x0C] + list(range(0x0E, 0x20)) + [0x7F])
+
+
+def _sanitize_csv_cell(value):
+    """清洗 CSV 文本单元格：剥离控制字符；公式触发前缀前置英文单引号（非字符串原样返回）"""
+    if not isinstance(value, str):
+        return value
+    s = "".join(ch for ch in value if ch not in _CSV_CTRL_CHARS)
+    if s.startswith(_CSV_FORMULA_PREFIXES):
+        s = "'" + s
+    return s
+
 
 def _flatten_profile(profile: dict) -> dict:
     """将 analyze_profile 的嵌套画像结构压平为一行 CSV 记录。
@@ -46,8 +62,11 @@ def _flatten_profile(profile: dict) -> dict:
 
 
 def export_csv(profiles: list[dict], path: str) -> None:
-    """发送者画像汇总导出 CSV（utf-8-sig 带 BOM，便于 Excel 直接打开不乱码）"""
-    rows = [_flatten_profile(p) for p in profiles]
+    """发送者画像汇总导出 CSV（utf-8-sig 带 BOM，便于 Excel 直接打开不乱码）
+
+    文本单元格经 _sanitize_csv_cell 清洗：防公式注入 + 剥离控制字符。"""
+    rows = [{k: _sanitize_csv_cell(v) for k, v in _flatten_profile(p).items()}
+            for p in profiles]
     # 空画像列表也照常产出带表头的 CSV，字段取自一条样本行
     fieldnames = list(_flatten_profile({}).keys())
 
