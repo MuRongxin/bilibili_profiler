@@ -829,20 +829,23 @@ def _attack_focus(bvid: str, fp_cmt: set[str]) -> dict:
     """争执焦点（P0-b）：问题回复按 parent_rpid 还原 A→B 攻击边，聚合挑事分/被攻击分。
 
     只统计问题回复（problem 非空且 parent_rpid>0、父级在库、非自回）；已标记误报的不参与。
-    每侧各留至多 3 条代表原文（挑事者=其问题回复原文及攻击对象；被围攻者=受害原评+攻击者
-    及其攻击原文成对，能直接看出谁攻击了ta、攻击了什么）。
+    挑事者侧留至多 3 条代表原文（攻击原文 + 被攻击者的原评上下文，成对展示才能看懂为何而喷，
+    同 (原文,对象) 去重）；被围攻者侧受害原评按条去重（同一条原评被 N 人围攻只展示一次，
+    攻击条目挂在该原评下；不同原评各展示一次，至多 3 条）。
     展示名额随攻击边数浮动（保底 ATTACK_FOCUS_TOP_N，每10条攻击边+1，封顶 ATTACK_FOCUS_MAX_N）。
     返回 {"attackers": [{uid,name,count,categories,examples}],
-           "victims": [{uid,name,count,examples}], "names": {uid: 昵称},
+           "victims": [{uid,name,count,comments}], "names": {uid: 昵称},
            "top_n": 动态名额, "edges": 攻击边数}，无攻击边时 attackers 为空列表。"""
     with closing(get_db()) as conn:
         rows = conn.execute('''
             SELECT c.rpid, c.uid AS attacker, c.uname AS aname, c.problem,
-                   c.content AS reply_content,
+                   c.content AS reply_content, c.parent_rpid,
                    p.uid AS victim, p.uname AS vname, p.content AS parent_content,
+                   gp.uid AS gp_uid, gp.uname AS gp_uname, gp.content AS gp_content,
                    ua.name AS a_dbname, uv.name AS v_dbname
             FROM comments c
             JOIN comments p ON p.bvid = c.bvid AND p.rpid = c.parent_rpid
+            LEFT JOIN comments gp ON gp.bvid = p.bvid AND gp.rpid = p.parent_rpid
             LEFT JOIN users ua ON ua.uid = c.uid
             LEFT JOIN users uv ON uv.uid = p.uid
             WHERE c.bvid = ? AND c.problem != '' AND c.parent_rpid > 0 AND p.uid != c.uid
@@ -869,17 +872,27 @@ def _attack_focus(bvid: str, fp_cmt: set[str]) -> dict:
         ea["victims"][v] += 1
         if r["problem"] not in ea["categories"]:
             ea["categories"].append(r["problem"])
-        if len(ea["examples"]) < 3:
+        # 代表原文：攻击话语 + 被攻击者的原评上下文（pair）；同 (原文,对象) 去重避免刷屏复读刷屏列表
+        if len(ea["examples"]) < 3 and not any(
+                x["content"] == r["reply_content"] and x["target"] == v_name
+                for x in ea["examples"]):
             ea["examples"].append({"content": r["reply_content"], "target": v_name,
-                                   "category": r["problem"]})
+                                   "parent": r["parent_content"], "category": r["problem"],
+                                   "gp_name": r["gp_uname"] or "", "gp_content": r["gp_content"],
+                                   "gp_is_self": bool(r["gp_uid"]) and r["gp_uid"] == a})
         ev = victims.setdefault(v, {"uid": v, "name": v_name,
-                                    "count": 0, "attackers": Counter(), "examples": []})
+                                    "count": 0, "attackers": Counter(), "comments": {}})
         ev["count"] += 1
         ev["attackers"][a] += 1
-        if len(ev["examples"]) < 3:
-            # 被围攻者证据要成对：自己的原评 + 攻击者的攻击原文（单放原评看不出"被谁攻击了什么"）
-            ev["examples"].append({"parent": r["parent_content"], "attack": r["reply_content"],
-                                   "attacker": a_name, "category": r["problem"]})
+        # 受害原评按条（parent_rpid）去重：同一条原评被 N 人围攻只展示一次，
+        # 各攻击者的攻击原文挂在其下；不同原评各展示一次，至多 3 条
+        vc = ev["comments"].get(r["parent_rpid"])
+        if vc is None and len(ev["comments"]) < 3:
+            vc = {"parent": r["parent_content"], "attacks": []}
+            ev["comments"][r["parent_rpid"]] = vc
+        if vc is not None and len(vc["attacks"]) < 3:
+            vc["attacks"].append({"attack": r["reply_content"], "attacker": a_name,
+                                  "category": r["problem"]})
     names = {u: e["name"] for u, e in attackers.items()}
     names.update({u: e["name"] for u, e in victims.items()})
     # 头像（关系图节点用）：face_cache + users.data_json 双源汇总，缺的异步补采
@@ -898,14 +911,16 @@ def _attack_focus(bvid: str, fp_cmt: set[str]) -> dict:
 
 
 def _truncate(text: str, limit: int = 80) -> str:
-    """原文摘录截断（争执焦点/楼中楼引用展示用）"""
+    """原文摘录截断（争执焦点/楼中楼引用展示用）；剥离 B站楼中楼自带的
+    「回复 @xxx :」前缀——展示层已有「对 X 的原评」标签，前缀留着只会混淆视听"""
     text = (text or "").strip().replace("\n", " ")
+    text = re.sub(r"^回复\s*@.+?\s*[:：]\s*", "", text)
     return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _attack_focus_html(data: dict) -> str:
-    """争执焦点区块：左列挑事者（发起问题回复最多，附问题回复原文），
-    右列被围攻者（被问题回复命中最多，附被攻击的原评原文）"""
+    """争执焦点区块：左列挑事者（发起问题回复最多，攻击原文附被攻击者原评上下文），
+    右列被围攻者（被问题回复命中最多，受害原评按条去重、攻击条目挂在其下）"""
     if not data or not data["attackers"]:
         return ""
     names = data["names"]
@@ -913,30 +928,44 @@ def _attack_focus_html(data: dict) -> str:
     def _opp_text(counter: Counter) -> str:
         return "、".join(f'{esc(names.get(u, f"UID:{u}"))}×{n}' for u, n in counter.most_common(3))
 
-    def _quotes(examples: list[dict], arrow: str) -> str:
-        return "".join(
-            f'<div class="af-quote">{arrow} {esc(e["target"])}：「{esc(_truncate(e["content"]))}」'
-            f'{_problem_chip(e["category"])}</div>'
-            for e in examples)
-
-    def _victim_quotes(examples: list[dict]) -> str:
-        """被围攻者证据成对展示：受害原评 + 攻击者及其攻击原文（看出谁攻击了ta、攻击了什么）"""
+    def _quotes(examples: list[dict]) -> str:
+        """挑事者证据：被攻击者的原评（上下文）+ 攻击原文成对展示；
+        原评本身也是回复时再多带一层上游原文——单看一层父评看不出这是
+        「一来一回」的第几回合（常见误读：被攻击者先动的口）"""
         out = []
         for e in examples:
+            if e.get("gp_content"):
+                # 上游正是挑事者自己早前发的评论时明确标注（最常见的回骂场景）
+                up_label = "更早一层（正是ta自己早前发的）" if e.get("gp_is_self") else "更早一层"
+                out.append(f'<div class="af-quote">↪ {up_label}：{esc(e["gp_name"] or "未知")} 说：'
+                           f'「{esc(_truncate(e["gp_content"], 50))}」</div>')
             out.append(
-                f'<div class="af-quote">原评：「{esc(_truncate(e["parent"]))}」</div>'
-                f'<div class="af-quote af-quote-atk">⚔ {esc(e["attacker"])} 攻击：'
-                f'「{esc(_truncate(e["attack"]))}」{_problem_chip(e["category"])}</div>')
+                f'<div class="af-quote">对 {esc(e["target"])} 的原评：'
+                f'「{esc(_truncate(e["parent"], 50))}」</div>'
+                f'<div class="af-quote af-quote-atk">⚔ 攻击：「{esc(_truncate(e["content"]))}」'
+                f'{_problem_chip(e["category"])}</div>')
         return "".join(out)
 
-    def _item(e: dict, badge: str, opp_label: str, opp: str, arrow: str) -> str:
+    def _victim_quotes(comments: list[dict]) -> str:
+        """被围攻者证据：受害原评按条去重只展示一次（被 N 人围攻不重复 N 次），
+        各攻击者的攻击原文挂在该原评下（看出谁攻击了ta、攻击了什么）"""
+        out = []
+        for c in comments:
+            out.append(f'<div class="af-quote">原评：「{esc(_truncate(c["parent"]))}」</div>')
+            for at in c["attacks"]:
+                out.append(
+                    f'<div class="af-quote af-quote-atk">⚔ {esc(at["attacker"])} 攻击：'
+                    f'「{esc(_truncate(at["attack"]))}」{_problem_chip(at["category"])}</div>')
+        return "".join(out)
+
+    def _item(e: dict, badge: str, opp_label: str, opp: str) -> str:
         return f'''<div class="af-item" data-side="a" data-uid="{e["uid"]}">
             <div class="af-line">
                 <a href="/user/{e["uid"]}" title="查看用户互动时间线">{esc(e["name"])}</a>
                 <span class="hot-badge">{badge.format(e["count"])}</span>
                 {_category_chips(e.get("categories", []))}
                 <span class="af-targets">{opp_label} {opp}</span>
-            </div>{_quotes(e["examples"], arrow)}</div>'''
+            </div>{_quotes(e["examples"])}</div>'''
 
     def _victim_item(e: dict) -> str:
         return f'''<div class="af-item" data-side="v" data-uid="{e["uid"]}">
@@ -944,7 +973,7 @@ def _attack_focus_html(data: dict) -> str:
                 <a href="/user/{e["uid"]}" title="查看用户互动时间线">{esc(e["name"])}</a>
                 <span class="hot-badge">被攻击 {e["count"]} 次</span>
                 <span class="af-targets">主要来源： {_opp_text(e["attackers"])}</span>
-            </div>{_victim_quotes(e["examples"])}</div>'''
+            </div>{_victim_quotes(list(e["comments"].values()))}</div>'''
 
     top_n = data.get("top_n", ATTACK_FOCUS_TOP_N)
     shown_attackers = data["attackers"][:top_n]
@@ -975,7 +1004,7 @@ def _attack_focus_html(data: dict) -> str:
         graph_html = (f'<div class="af-graph" data-af-graph="{esc(json.dumps(graph, ensure_ascii=False))}">'
                       f'<div class="af-graph-hint">🖱 拖空白平移 · 滚轮缩放 · 拖头像调位置</div>'
                       f'</div>')
-    a_html = "".join(_item(e, "攻击 {} 次", "主要对象：", _opp_text(e["victims"]), "攻击")
+    a_html = "".join(_item(e, "攻击 {} 次", "主要对象：", _opp_text(e["victims"]))
                      for e in shown_attackers)
     v_html = "".join(_victim_item(e) for e in shown_victims)
     return f'''
