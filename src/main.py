@@ -30,7 +30,7 @@ from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map
 from comment import build_comment_uid_map, build_comment_location_map
 from uid_resolver import resolve_all_senders, calc_crc32, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
-from spam_detector import batch_detect_spam
+from spam_detector import batch_detect_spam, distribution_stats, detect_repeat_events
 from cringe_detector import detect_cringe_danmaku, detect_problem_comments
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
@@ -491,14 +491,28 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
     return resolved
 
 
-def phase_spam(bvid: str, sender_groups: dict) -> dict:
+def phase_spam(bvid: str, sender_groups: dict, danmaku_list: list | None = None) -> dict:
     """阶段2.5: 刷屏检测（提前到解析前，以 spam_score 驱动兴趣分选人；
-    检测完成后回写库中已存在行的真实结果；本轮新解析行由阶段4 save_sender 直接写入真实值）"""
+    检测完成后回写库中已存在行的真实结果；本轮新解析行由阶段4 save_sender 直接写入真实值）。
+
+    danmaku_list 传入时附带做两件事（纯本地统计，不影响选人）：
+    群体复读事件计数（全视频维度接龙/+1 队列检测，明细在报告概览页）与
+    全池分布自检打印（P50/P90/P95，供阈值校准参考）。"""
     print("\n[Phase 2.5] 刷屏行为检测...")
     spam_results = batch_detect_spam(sender_groups)
     high_spam = sum(1 for v in spam_results.values() if v["spam_level"] == "高")
     med_spam = sum(1 for v in spam_results.values() if v["spam_level"] == "中")
     print(f"[Phase 2.5] 检测完成: 高风险 {high_spam} | 中风险 {med_spam}")
+
+    dist = distribution_stats(spam_results)
+    if dist.get("senders"):
+        print(f"[Phase 2.5] 全池分布: 弹幕数 P50={dist['count_p50']:.0f}/P95={dist['count_p95']:.0f} | "
+              f"重复率 P50={dist['repeat_p50']:.0%}/P95={dist['repeat_p95']:.0%} | "
+              f"刷屏分 P50={dist['score_p50']:.2f}/P95={dist['score_p95']:.2f}")
+    if danmaku_list:
+        events = detect_repeat_events(danmaku_list)
+        print(f"[Phase 2.5] 群体复读事件: {len(events)} 起"
+              + (f"（最多一起 {events[0]['sender_count']} 人同刷）" if events else ""))
 
     # 回写库中已存在行的真实检测结果（缓存行；本轮新解析行由阶段4 save_sender 直接写入真实值，此处 UPDATE 对其命中 0 行无影响）
     for mid_hash, result in spam_results.items():
@@ -783,7 +797,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         return
 
     # 阶段2.5: 刷屏检测（本地，提前到解析前驱动选人）
-    spam_results = phase_spam(bvid, sender_groups)
+    spam_results = phase_spam(bvid, sender_groups, danmaku_list)
 
     # 阶段2.6: 问题弹幕检测（LLM，可降级；批次级缓存，中断后重跑已完成批次直接命中）
     cringe_results = phase_cringe(danmaku_list, sender_groups, video_info)

@@ -51,7 +51,7 @@ from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
 from combo_pool import build_pool
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
-from spam_detector import batch_detect_spam
+from spam_detector import batch_detect_spam, detect_repeat_events, pool_distribution_from_rows
 from llm_analyzer import LLMAnalyzer
 from up_analyzer import _tokenize
 from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats,
@@ -373,11 +373,12 @@ def _load_profiles(bvid: str) -> list[dict]:
 
     附带注入渲染期键（不落库）：resolve_method/resolve_confidence 来自 senders 表
     （卡片解析徽标 tooltip），collected_at 来自 users 表（基础信息采集时间），
+    _mid_hash 来自 senders 表（刷屏判定误报按钮的 target），
     school 在旧缓存画像缺省时从 data_json 回退提取（毕业院校徽标）。
-    GROUP BY u.uid 下 method/confidence 取该 uid 任一行（同 uid 多 mid_hash 极少见，可接受）。"""
+    GROUP BY u.uid 下 method/confidence/mid_hash 取该 uid 任一行（同 uid 多 mid_hash 极少见，可接受）。"""
     with closing(get_db()) as conn:
         rows = conn.execute('''
-            SELECT u.profile_json, u.data_json, s.method, s.confidence, u.collected_at
+            SELECT u.profile_json, u.data_json, s.method, s.confidence, u.collected_at, s.mid_hash
             FROM senders s JOIN users u ON u.uid = s.uid
             WHERE s.bvid = ? AND s.uid IS NOT NULL
             GROUP BY u.uid
@@ -391,6 +392,7 @@ def _load_profiles(bvid: str) -> list[dict]:
         p["resolve_method"] = r["method"] or ""
         p["resolve_confidence"] = r["confidence"] or ""
         p["collected_at"] = r["collected_at"] or ""
+        p["_mid_hash"] = r["mid_hash"] or ""
         # 毕业院校回退：本特性之前的缓存画像无 school 键，从采集原始数据 data_json 补
         if not p.get("school"):
             try:
@@ -497,10 +499,13 @@ def _sender_meta(bvid: str) -> dict:
     """发送者联查（spec 5）：mid_hash → {uid, name, spam_level, categories}。
     uid/name/spam_level 来自 senders LEFT JOIN users；categories 从 users.profile_json
     的 cringe 字段 Python 侧解析（非 SQL），并按内容扣除已标记误报的弹幕
-    （与 video_page 的 _apply_danmaku_fp 同口径——UI 文案承诺「标记后不计入聚合」）。
+    （与 video_page 的 _apply_danmaku_fp 同口径——UI 文案承诺「标记后不计入聚合」）；
+    spam_level 命中刷屏误报（kind=spam，发送者粒度）时降级为 "低"（弹幕浏览器面板同口径）。
     senders 无行的 mid_hash 不在此表 → 未分析。
     连接用 closing 保证异常路径也关闭（参照 storage.py 模式）。"""
-    fp_dm = {t for k, t in load_false_positives(bvid) if k == "dm"}
+    fp = load_false_positives(bvid)
+    fp_dm = {t for k, t in fp if k == "dm"}
+    fp_spam = {t for k, t in fp if k == "spam"}
     with closing(get_db()) as conn:
         rows = conn.execute('''
         SELECT s.mid_hash, s.uid, s.spam_level, u.name, u.profile_json
@@ -525,8 +530,11 @@ def _sender_meta(bvid: str) -> dict:
                                 categories.append(it["category"])
             except Exception:
                 categories = []
+        spam_level = r["spam_level"]
+        if fp_spam and r["mid_hash"] in fp_spam:
+            spam_level = "低"   # 刷屏判定人工误报：展示层降级（与用户卡片/统计图同口径）
         meta[r["mid_hash"]] = {"uid": r["uid"], "name": r["name"],
-                               "spam_level": r["spam_level"], "categories": categories}
+                               "spam_level": spam_level, "categories": categories}
     return meta
 
 
@@ -646,6 +654,46 @@ def _resolve_quality(bvid: str) -> dict | None:
         "resolved": len(rows),
         "total_senders": total_senders,
     }
+
+
+def _repeat_events_block(bvid: str) -> str:
+    """概览页「群体复读事件」区块：全视频维度的接龙/+1 队列刷屏检测
+    （spam_detector.detect_repeat_events：同一内容在 60s 窗口内被 ≥5 个不同发送者
+    发送且 ≥8 条——单人检测抓不到这种「一人一句」的群体刷屏）。
+
+    底部附全池分布自检行（pool_distribution_from_rows：发送者数、弹幕数与重复率的
+    P50/P95），供刷屏阈值校准参考。无弹幕数据返回 ""（不渲染区块）。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT content, mid_hash, timestamp FROM danmaku WHERE bvid = ?", (bvid,)).fetchall()
+    if not rows:
+        return ""
+    # sqlite3.Row 无 .get，转 dict 再喂给检测函数
+    dict_rows = [dict(r) for r in rows]
+    events = detect_repeat_events(dict_rows)
+    dist = pool_distribution_from_rows(dict_rows)
+    if events:
+        trs = "".join(
+            f'<tr><td title="{esc(e["content"])}">{esc(_truncate(e["content"], 30))}</td>'
+            f'<td>{e["sender_count"]}</td><td>{e["total"]}</td>'
+            f'<td>{time.strftime("%m-%d %H:%M", time.localtime(e["start"]))}'
+            f' ~ {time.strftime("%m-%d %H:%M", time.localtime(e["end"]))}</td></tr>'
+            for e in events)
+        body = (f'<table><thead><tr><th>内容</th><th>发送者数</th><th>窗口条数</th>'
+                f'<th>时间段</th></tr></thead><tbody>{trs}</tbody></table>')
+    else:
+        body = '<p class="empty-note">未检出群体复读事件</p>'
+    # 全池分布自检：重复率 = 同一发送者所发内容中的重复占比
+    dist_line = (f'全池 {dist.get("senders", 0):,} 个发送者 · '
+                 f'弹幕数 P50={dist.get("count_p50", 0):g}/P95={dist.get("count_p95", 0):g} · '
+                 f'重复率 P50={dist.get("repeat_p50", 0) * 100:.0f}%'
+                 f'/P95={dist.get("repeat_p95", 0) * 100:.0f}%（阈值校准参考）')
+    return f'''
+    <div class="cringe-board">
+        <h3>🔁 群体复读事件<span class="chart-hint">（同一内容在 60 秒内被 ≥5 个不同发送者发送且 ≥8 条——接龙/+1 队列式刷屏）</span></h3>
+        {body}
+        <div class="cringe-reason">{dist_line}</div>
+    </div>'''
 
 
 # ========== 误报标记（P2-a）/ 争执焦点（P0-b）/ 问题评论榜（P1-b） ==========
@@ -1437,6 +1485,7 @@ def index():
     data-time/data-dm/data-profiles 供排序；超 20 条分页。
     数据库锁定（分析任务写入期）由 _db_guard 降级为 503 友好页。"""
     with closing(get_db()) as conn:
+        # 刷屏高/中统计以库内原始值为准：kind=spam 的发送者级人工误报只在报告页展示层降级
         rows = conn.execute('''
             SELECT v.bvid, v.title, v.created_at, v.duration, v.view_count,
                    (SELECT COUNT(*) FROM danmaku d WHERE d.bvid = v.bvid) AS dm_count,
@@ -1564,6 +1613,16 @@ def video_page(bvid: str):
     fp_dm = {t for k, t in fp if k == "dm"}
     fp_cmt = {t for k, t in fp if k == "cmt"}
     fp_dm_used = _apply_danmaku_fp(profiles, fp_dm)
+    # 刷屏判定人工误报（kind=spam，粒度=该视频该发送者）：展示层降级为低风险，
+    # 统计图/筛选/排序随之不计入（与 dm/cmt 误报同口径），库内原始值不动
+    fp_spam = {t for k, t in fp if k == "spam"}
+    if fp_spam:
+        for p in profiles:
+            mh = (p.get("danmaku") or {}).get("mid_hash") or p.get("_mid_hash") or ""
+            if mh and mh in fp_spam:
+                dm = p.setdefault("danmaku", {})
+                dm["spam_level"] = "低"
+                dm["spam_fp"] = True
     profiles = sort_profiles_by_risk(profiles)
     stats = generate_summary_stats(profiles)
     chart = generate_chart_data(profiles)
@@ -1577,6 +1636,7 @@ def video_page(bvid: str):
     panel = _danmaku_panel_stats(bvid)
     density = _danmaku_density(bvid, row["duration"])   # 概览页弹幕密度时间轴
     rq = _resolve_quality(bvid)                          # 概览页解析质量区块
+    repeat_block = _repeat_events_block(bvid)            # 概览页群体复读事件区块（含全池分布自检）
     dm_attrs = _danmaku_attr_stats(bvid)                 # 弹幕属性分布（mode/color）
 
     # CSV/JSON 导出下载链接：默认只显示最新一组，历史导出收进 <details> 折叠块（spec 6）
@@ -1786,6 +1846,7 @@ def video_page(bvid: str):
             <div class="chart-card"><h3>用户标签 Top10</h3><canvas id="tagChart"></canvas></div>
             {region_canvas}
         </div>
+        {repeat_block}
         {rq_block}
     </div>
 
@@ -2038,7 +2099,10 @@ def api_regenerate(bvid: str):
 def _fp_affected(bvid: str, kind: str, target: str) -> int:
     """误报影响面：该 (bvid, kind, target) 命中的弹幕/评论条数。
     kind=dm 按内容全文匹配（误报粒度=内容，一次标记隐藏全部同名弹幕）；
-    kind=cmt 按 rpid 精确命中（comments.rpid 为 INTEGER，需 CAST 后按文本比较）。"""
+    kind=cmt 按 rpid 精确命中（comments.rpid 为 INTEGER，需 CAST 后按文本比较）；
+    kind=spam 为发送者粒度（target=mid_hash，仅该发送者的刷屏判定），恒为 1，无需 SQL。"""
+    if kind == "spam":
+        return 1
     with closing(get_db()) as conn:
         if kind == "dm":
             return conn.execute(
@@ -2051,7 +2115,7 @@ def _fp_affected(bvid: str, kind: str, target: str) -> int:
 
 @app.route("/api/video/<bvid>/false_positive", methods=["POST"])
 def api_false_positive(bvid: str):
-    """误报标记切换（P2-a）：body {kind: dm|cmt, target: 弹幕内容或评论rpid字符串}。
+    """误报标记切换（P2-a）：body {kind: dm|cmt|spam, target: 弹幕内容、评论rpid字符串或mid_hash}。
 
     幂等切换（已标记则撤销），返回 {"ok": true, "marked": bool, "affected": int}；
     affected 为该标记命中的弹幕/评论条数（kind=dm 一次标记隐藏全部同名弹幕，
@@ -2062,8 +2126,8 @@ def api_false_positive(bvid: str):
     data = request.get_json(silent=True) or {}
     kind = data.get("kind")
     target = str(data.get("target") or "")
-    if kind not in ("dm", "cmt") or not target:
-        return jsonify({"error": "参数错误：kind 须为 dm/cmt，target 不能为空"}), 400
+    if kind not in ("dm", "cmt", "spam") or not target:
+        return jsonify({"error": "参数错误：kind 须为 dm/cmt/spam，target 不能为空"}), 400
     affected = _fp_affected(bvid, kind, target)
     if data.get("count_only"):
         return jsonify({"ok": True, "affected": affected})
@@ -2153,8 +2217,18 @@ def api_danmaku(bvid: str):
         params.extend(hashes)
 
     if spam in ("高", "中", "低"):
-        where.append("s.spam_level = ?")
-        params.append(spam)
+        # 刷屏判定人工误报（kind=spam）：_sender_meta 已把命中者降级为"低"，
+        # 筛选条件在 SQL 层同步——筛「低」时纳入、筛「高/中」时排除，与卡片/面板同口径
+        fp_spam = {t for k, t in load_false_positives(bvid) if k == "spam"}
+        if spam == "低" and fp_spam:
+            where.append("(s.spam_level = ? OR s.mid_hash IN (%s))" % ",".join("?" * len(fp_spam)))
+            params.extend(["低", *sorted(fp_spam)])
+        else:
+            where.append("s.spam_level = ?")
+            params.append(spam)
+            if fp_spam:
+                where.append("(s.mid_hash IS NULL OR s.mid_hash NOT IN (%s))" % ",".join("?" * len(fp_spam)))
+                params.extend(sorted(fp_spam))
     elif spam == "未分析":
         # senders 无行（未进解析名单）或旧缓存 spam_level 为 NULL 均属未分析
         where.append("s.spam_level IS NULL")
@@ -2217,7 +2291,8 @@ def api_danmaku(bvid: str):
             "first_video_time": r["first_video_time"],
             "first_send_time": r["first_send_time"],
             "categories": m.get("categories", []),
-            "spam_level": r["spam_level"] or "未分析",
+            # meta 的 spam_level 已扣刷屏误报（降级"低"），优先于 SQL 原值
+            "spam_level": m.get("spam_level") or r["spam_level"] or "未分析",
             "sender_count": r["sender_count"],
             "mode": r["mode"] or 1,
             "color": r["color"] or "",

@@ -96,8 +96,9 @@ function hotToggle(btn) {
     btn.textContent = collapsed ? '展开全部回复 ▾' : '收起回复 ▴';
 }
 
-// 误报标记（P2-a）：问题弹幕（kind=dm，target=内容）/问题评论（kind=cmt，target=rpid）
-// 切换人工误报标记；标记后该条不再计入聚合与用户疑似分，可撤销。
+// 误报标记（P2-a）：问题弹幕（kind=dm，target=内容）/问题评论（kind=cmt，target=rpid）/
+// 刷屏判定（kind=spam，target=mid_hash）。切换人工误报标记；标记后该条不再计入聚合与
+// 用户疑似分（刷屏判定降级为低风险展示），可撤销。
 // kind=dm 按内容全文标记：一次标记隐藏全部同名弹幕，confirm 前先做只读查询提示影响面
 function fpToggle(btn) {
     const kind = btn.dataset.kind, target = btn.dataset.target;
@@ -107,8 +108,10 @@ function fpToggle(btn) {
         // 影响面提示：kind=dm 时一次操作作用于全部同名弹幕
         const impact = (kind === 'dm' && affected > 1)
             ? '\n注意：将' + (willMark ? '隐藏' : '恢复') + '本视频全部 ' + affected + ' 条同名弹幕。' : '';
+        const what = (kind === 'dm' ? '该条弹幕内容'
+            : (kind === 'spam' ? '该发送者的刷屏判定' : '该条评论'));
         const msg = willMark
-            ? '将该条' + (kind === 'dm' ? '弹幕内容' : '评论') + '标记为误报？标记后不再计入聚合。' + impact + '\n\n' + shown
+            ? '将' + what + '标记为误报？标记后不再计入聚合。' + impact + '\n\n' + shown
             : '撤销该条的误报标记？撤销后重新计入聚合。' + impact + '\n\n' + shown;
         if (!confirm(msg)) return;
         btn.disabled = true;
@@ -130,7 +133,7 @@ function fpToggle(btn) {
         }).then(r => r.json()).then(j => doToggle(j.affected || 0))
           .catch(() => doToggle(0));   // 查询失败降级为不带条数的确认框
     } else {
-        doToggle(1);   // kind=cmt 只影响该条评论本身
+        doToggle(1);   // kind=cmt/spam 只影响该条评论/该发送者本身
     }
 }
 

@@ -211,6 +211,21 @@ def generate_user_card(profile: dict) -> str:
     # 精确刷屏分值 + UID 解析方式/置信度徽标（tooltip 呈现，spec 7）；
     # resolve_method/resolve_confidence 由 web.py _load_profiles 渲染期注入，缺失时不渲染徽标
     spam_score = dm.get("spam_score") or 0.0   # senders.spam_score 可空，None 防御
+    # 刷屏判定人工误报（kind=spam，web.py 展示层已把 spam_level 降为"低"）：
+    # 已标记时徽标文本改「低·已标误报」并渲染「撤销误报」按钮；未标记的高/中风险渲染「误报」按钮。
+    # mid_hash 取 web.py _load_profiles 注入的渲染期键 _mid_hash，缺失时不渲染按钮
+    spam_fp = bool(dm.get("spam_fp"))
+    mid_hash = profile.get("_mid_hash", "")
+    spam_badge_text = "低·已标误报" if spam_fp else f"{spam_level}风险 {spam_score:.2f}分"
+    spam_fp_btn = ""
+    if mid_hash and spam_fp:
+        spam_fp_btn = (f'<button class="fp-btn fp-btn-marked" data-kind="spam" '
+                       f'data-target="{esc(mid_hash)}" onclick="fpToggle(this)" '
+                       f'title="已人工标记为误报（按低风险展示）；点击撤销恢复原判定">撤销误报</button>')
+    elif mid_hash and spam_level in ("高", "中"):
+        spam_fp_btn = (f'<button class="fp-btn" data-kind="spam" '
+                       f'data-target="{esc(mid_hash)}" onclick="fpToggle(this)" '
+                       f'title="人工标记该发送者的刷屏判定为误报；标记后按低风险展示，可撤销">误报</button>')
     resolve_method = profile.get("resolve_method", "")
     resolve_confidence = profile.get("resolve_confidence", "")
     method_badge = (f'<span class="method-badge" title="UID 解析方式：{esc(resolve_method)}">解析:{esc(resolve_method)}</span>'
@@ -424,7 +439,7 @@ def generate_user_card(profile: dict) -> str:
 
         <div class="card-body">
             <div class="section">
-                <h4>🎤 弹幕行为 <span class="spam-badge {spam_class}">{esc(spam_level)}风险 {spam_score:.2f}分</span>{method_badge}{conf_badge}</h4>
+                <h4>🎤 弹幕行为 <span class="spam-badge {spam_class}">{esc(spam_badge_text)}</span>{method_badge}{conf_badge}{spam_fp_btn}</h4>
                 <div class="detail">共发送 {esc(dm_count)} 条弹幕{cringe_note}{cp_note}</div>
                 <ol class="dm-list">{dm_list}</ol>
                 {f'<div class="reason">判定: {esc(spam_reason)}</div>' if spam_reason else ''}
