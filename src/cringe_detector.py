@@ -24,7 +24,7 @@ from openai import OpenAI
 from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_CONCURRENCY,
                     LLM_FALLBACK, CRINGE_BATCH_SIZE, COMMENT_CRINGE_BATCH_SIZE,
                     COMMENT_CRINGE_MAX_ITEMS, LLM_RETRY_BUDGET_SECONDS,
-                    LLM_TRANSIENT_RETRIES)
+                    LLM_TRANSIENT_RETRIES, LLM_BATCH_THINKING)
 from storage import load_llm_cache, save_llm_cache
 
 # 问题弹幕类别（prompt 与聚合均引用，勿散落硬编码字符串）
@@ -39,6 +39,40 @@ _CMT_CACHE_VERSION = "v4"   # 问题评论（v4：整段缓存值由 {rpid:verdi
 # 致命错误（鉴权失败/权限不足/请求参数错误/资源不存在等 4xx 类）：重试与换厂商均无意义，直接上抛由调用方降级
 _FATAL_LLM_ERRORS = (openai.AuthenticationError, openai.PermissionDeniedError,
                      openai.BadRequestError, openai.NotFoundError)
+
+
+class _UnparseableResponse(ValueError):
+    """LLM 响应为空或无法解析为 JSON 数组：恒思考模型（glm-5.3）间歇性空正文，
+    属可重试的抖动，先同厂商短退避再换厂商"""
+
+
+class _ContentFiltered(Exception):
+    """厂商内容审核拦截（如 GLM 1301 contentFilter）：是该批内容触发的批次级失败，
+    同厂商重试无意义、更不该按致命错误中止整轮判定——直接换厂商，全部厂商都被拦
+    则该批按最终失败跳过（不进整轮重试，同一内容必然重复触发）"""
+
+
+def _batch_thinking_extra(base_url: str, model: str) -> dict:
+    """判定批次思考参数（强度由 config.LLM_BATCH_THINKING 控制：off/low/default）。
+    分类任务推理增益微弱，推理 token 计费且占 max_tokens 预算，故默认 off：
+    - off：deepseek 与 GLM-4.x 用 thinking:disabled，GLM-5.x 恒思考只能压 low；
+    - low：deepseek 无档位概念保持原生，GLM 用 enabled+low；
+    - default：不下发任何思考参数（厂商原生行为，GLM-5.x 即全量思考）。
+    深掘（llm_analyzer）不走此函数，始终保默认档。"""
+    mode = LLM_BATCH_THINKING
+    if mode == "default":
+        return {}
+    if "bigmodel.cn" in base_url:
+        if mode == "low":
+            return {"extra_body": {"thinking": {"type": "enabled", "level": "low"}}}
+        # off：GLM-4.x 可彻底关闭；5.x 恒思考（disabled 会 400）压 low 兜底
+        if model.startswith("glm-4"):
+            return {"extra_body": {"thinking": {"type": "disabled"}}}
+        return {"extra_body": {"thinking": {"type": "enabled", "level": "low"}}}
+    if "deepseek" in base_url:
+        # deepseek 思考只有开/关：off 显式关闭；low/default 保持原生（开）
+        return {"extra_body": {"thinking": {"type": "disabled"}}} if mode == "off" else {}
+    return {}
 
 
 def _dedup_contents(danmaku_list: list[dict]) -> list[dict]:
@@ -159,20 +193,25 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
         last_err = None
         for pi, (_, _, model, tag) in enumerate(providers):
             if pi > 0:
-                print(f"[{label}] 批次 {bi + 1} 主厂商失败，换备用厂商（{tag}）重试...")
+                # 透出主用厂商的失败原因（类型+摘要），否则换厂商兜底成功后根因无从排查
+                print(f"[{label}] 批次 {bi + 1} 主厂商失败（{type(last_err).__name__}: "
+                      f"{str(last_err)[:120]}），换备用厂商（{tag}）重试...")
             transient_retries = 0
             for retry in range(3):      # 限速退避：429 时等一会再试，最多 2 次重试
                 try:
+                    extra = _batch_thinking_extra(providers[pi][1], model)
                     resp = client_of(pi).chat.completions.create(
                         model=model,
                         messages=[{"role": "user", "content": prompt}],
                         max_tokens=LLM_MAX_TOKENS,
                         temperature=0.3,  # 判定类任务低温，减少格式漂移
+                        **extra,
                     )
                     raw = resp.choices[0].message.content or ""
                     if _parse_verdicts(raw) is None:
-                        # 空串/坏响应：不落缓存、不算成功，抛错进重试链（换厂商/整轮重试）
-                        raise ValueError(f"响应无法解析为 JSON 数组（前100字符: {raw[:100]!r}）")
+                        # 空串/坏响应：不落缓存、不算成功，进同厂商短退避重试链
+                        raise _UnparseableResponse(
+                            f"响应无法解析为 JSON 数组（前100字符: {raw[:100]!r}）")
                     if bkey:
                         save_llm_cache(bkey, raw)
                     return raw
@@ -183,13 +222,17 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                     wait = 10 * (retry + 1) + random.uniform(0, 3)
                     print(f"[{label}] 批次 {bi + 1} 触发限速，{wait:.0f}s 后重试...")
                     time.sleep(wait)
-                except (openai.APITimeoutError, openai.APIConnectionError) as e:
+                except openai.BadRequestError as e:
+                    if "1301" in str(e) or "contentFilter" in str(e):
+                        raise _ContentFiltered(str(e)[:200]) from e   # 内容审核：批次级失败换厂商
+                    raise               # 其他参数类 400 属致命错误，直接上抛
+                except (openai.APITimeoutError, openai.APIConnectionError, _UnparseableResponse) as e:
                     last_err = e
                     transient_retries += 1
                     if transient_retries > LLM_TRANSIENT_RETRIES:
-                        break           # 瞬态错误同厂商重试耗尽，换下一厂商
+                        break           # 瞬态错误/空坏响应同厂商重试耗尽，换下一厂商
                     wait = 3 * transient_retries + random.uniform(0, 1)
-                    print(f"[{label}] 批次 {bi + 1} 网络瞬态错误（{type(e).__name__}），{wait:.0f}s 后同厂商重试...")
+                    print(f"[{label}] 批次 {bi + 1} 瞬态错误（{type(e).__name__}），{wait:.0f}s 后同厂商重试...")
                     time.sleep(wait)
                 except _FATAL_LLM_ERRORS:
                     raise               # 致命错误（鉴权/参数类）重试与换厂商均无意义，直接上抛
@@ -216,6 +259,11 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                     for f in futures:
                         f.cancel()      # 取消未开始的批次（进行中的让其自然结束）
                     continue
+                except _ContentFiltered:
+                    # 厂商内容审核拦截：该批内容必然重复触发，按最终失败跳过、不进整轮重试
+                    print(f"[{label}] 警告: 批次 {bi + 1} 被厂商内容审核拦截，该批判空跳过（不重试）")
+                    final_failed.append(bi)
+                    continue
                 except Exception as e:
                     print(f"[{label}] 警告: 批次 {bi + 1} 请求失败（{e}），稍后重试")
                     still_failed.append(bi)
@@ -235,6 +283,7 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
     # 失败批次整轮重试：等待递增（60s×轮次，封顶 300s），但总耗时超 LLM_RETRY_BUDGET_SECONDS 熔断放弃
     print(f"[{label}] 判定 {total} 批（并发 {workers} 路，LLM请求中）...")
     start_ts = time.monotonic()
+    final_failed: list[int] = []   # 内容审核拦截等必然重复的批次：跳过不重试
     pending = run_pass(list(range(total)))
     round_no = 1
     while pending:
@@ -247,7 +296,7 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
         time.sleep(wait)
         pending = run_pass(pending)
         round_no += 1
-    return verdicts, len(pending), total
+    return verdicts, len(pending) + len(final_failed), total
 
 
 def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dict],

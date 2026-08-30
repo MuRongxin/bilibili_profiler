@@ -509,9 +509,12 @@ def generate_summary_stats(profiles: list[dict]) -> dict:
 
 
 def sort_profiles_by_risk(profiles: list[dict]) -> list[dict]:
-    """用户卡片排序：风险等级 高→中→低；同级按兴趣分（刷屏分/问题弹幕严重度/弹幕数）降序"""
+    """用户卡片排序：AI 深掘画像优先（有 ai_deep/ai_analysis 的排最前）；
+    再按风险等级 高→中→低；同级按兴趣分（刷屏分/问题弹幕严重度/弹幕数）降序"""
     risk_rank = {"高": 0, "中": 1, "低": 2}
     return sorted(profiles, key=lambda p: (
+        # AI 深掘画像置顶：深掘内容是报告价值最高的部分，应最先看到
+        0 if (p.get("ai_deep") or p.get("ai_analysis")) else 1,
         risk_rank.get(p.get("danmaku", {}).get("spam_level", "低"), 2),
         -p.get("danmaku", {}).get("spam_score", 0.0),
         -p.get("cringe", {}).get("max_severity", 0),
