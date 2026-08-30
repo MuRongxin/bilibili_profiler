@@ -25,6 +25,7 @@ _GLOBAL_UID_SOURCE_PRIORITY = {
     "充电名单": 2,
     "互动弹幕": 2,
     "视频信息": 2,
+    "评论收割": 2,     # harvest_comment_uids 翻评论区收集的明文 UID，证据等级同评论
     "CRC32破解": 1,
 }
 

@@ -28,7 +28,7 @@ from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_
 from danmaku import get_video_info
 from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map, refresh_comments
-from comment import build_comment_uid_map, build_comment_location_map
+from comment import build_comment_uid_map, build_comment_location_map, harvest_comment_uids
 from uid_resolver import resolve_all_senders, calc_crc32, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
 from spam_detector import batch_detect_spam, distribution_stats, detect_repeat_events
 from cringe_detector import detect_cringe_danmaku, detect_problem_comments
@@ -311,7 +311,15 @@ def phase_comment(video_info: dict, client, resume: bool = True):
                         print(f"[Phase 3] 警告: 评论增量刷新失败（{e}），沿用库内已有数据")
                 print(f"[Phase 3] 断点续采：从库读回 {len(existing)} 条评论，跳过评论重采")
                 charge_uid_map = fetch_charge_uid_map(bvid, aid, up_mid, client) if up_mid else {}
-                return (existing, build_comment_uid_map(existing),
+                comment_uid_map = build_comment_uid_map(existing)
+                # 纯 UID 收割并入评论明文映射（收割源同为评论明文，证据等级一致）
+                if aid:
+                    try:
+                        for h, u in harvest_comment_uids(aid, client, bvid).items():
+                            comment_uid_map.setdefault(h, u)
+                    except Exception as e:
+                        print(f"[Phase 3] 警告: 评论UID收割失败（{e}），不影响已有映射")
+                return (existing, comment_uid_map,
                         build_comment_location_map(existing), charge_uid_map)
             # 半成品：游标续页（collect_comment_data 返回库内全量）
             print(f"[Phase 3] 断点续采：评论从检查点续采（库内已有 {len(existing)} 条）")
@@ -324,6 +332,13 @@ def phase_comment(video_info: dict, client, resume: bool = True):
         comments, comment_uid_map, comment_location_map = collect_comment_data(aid, client, bvid=bvid or None)
     except Exception as e:
         print(f"[Phase 3] 评论采集失败 (将仅用其他来源): {e}")
+    # 纯 UID 收割并入评论明文映射（收割源同为评论明文，证据等级一致），失败不影响主流程
+    if bvid:
+        try:
+            for h, u in harvest_comment_uids(aid, client, bvid).items():
+                comment_uid_map.setdefault(h, u)
+        except Exception as e:
+            print(f"[Phase 3] 警告: 评论UID收割失败（{e}），不影响已有映射")
     # 充电名单（独立降级：评论失败也照常尝试）
     charge_uid_map = {}
     if up_mid:

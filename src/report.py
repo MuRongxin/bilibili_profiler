@@ -270,7 +270,8 @@ def generate_user_card(profile: dict) -> str:
     raw_map = {r["name"]: r for r in all_raw}
     fol_section = ""
     if all_names:
-        # 构建 name → up_details 映射（有深度分析的才显示详情）
+        # 构建 name → up_details 映射（旧版缓存画像才有深度分析；新口径采集阶段只存名单，
+        # 词云改为悬停时经 /api/up/<uid>/wordcloud 懒加载）
         up_detail_map = {}
         for i, up in enumerate(fol_summary.get("up_details", [])):
             up_detail_map[up["name"]] = (i, up)
@@ -291,16 +292,21 @@ def generate_user_card(profile: dict) -> str:
             else:
                 raw = raw_map.get(up_name, {})
                 raw_sign = raw.get("sign", "")
-                tip = f"签名: {raw_sign}" if raw_sign else "未深度分析"
-                up_names += f'<span class="up-chip" title="{esc(tip)}">{esc(up_name)}</span>'
+                tip = f"签名: {raw_sign}；" if raw_sign else ""
+                tip += "悬停加载该 UP 主近期投稿词云"
+                # data-up-uid：懒加载词云的目标 UP 主 uid（旧版缓存画像缺 uid 时退化为纯展示）
+                up_uid = raw.get("uid", 0)
+                lazy_attr = f' data-up-uid="{esc(up_uid)}"' if up_uid else ""
+                up_names += f'<span class="up-chip"{lazy_attr} title="{esc(tip)}">{esc(up_name)}</span>'
 
         total = fol_summary.get("total", len(all_names))
+        cats_span = f"<span>偏好: {cats_str}</span>" if cats_str else ""
         fol_section = f'''
             <div class="section fol-section">
                 <h4>🕸️ 关注偏好</h4>
                 <div class="fol-stats">
                     <span>关注 {esc(total)} 人 (全部展示)</span>
-                    <span>偏好: {cats_str}</span>
+                    {cats_span}
                 </div>
                 <div class="up-chips">{up_names}</div>
             </div>'''

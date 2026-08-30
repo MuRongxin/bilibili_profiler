@@ -15,7 +15,7 @@ from config import (
     USER_DYNAMICS_URL, USER_FOLLOWINGS_URL, USER_FOLLOWERS_URL,
     USER_FAV_FOLDERS_URL, USER_FAV_CONTENTS_URL, USER_BANGUMI_URL,
     MAX_VIDEO_PAGES, MAX_DYNAMIC_PAGES, MAX_FOLLOWING_PAGES,
-    MAX_FOLLOWER_PAGES, MAX_FAV_CONTENTS, MAX_UP_SAMPLE
+    MAX_FOLLOWER_PAGES, MAX_FAV_CONTENTS
 )
 
 
@@ -522,14 +522,10 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
 
     print(f"  [Collect] UID:{uid} 维度3(社交关系)完成，分析关注偏好/行为模式...")
 
-    # UP主关注偏好分析
-    try:
-        from up_analyzer import summarize_followings
-        user_data["following_summary"] = summarize_followings(
-            user_data["followings"], client, sample_size=MAX_UP_SAMPLE
-        )
-    except Exception:
-        user_data["following_summary"] = {}
+    # UP主关注偏好：只存关注名单本身（全部关注，uid+name+sign），不再逐个分析
+    # 被关注 UP 主的投稿/词频——那部分挪到报告页悬停时按需懒加载（/api/up/<uid>/wordcloud），
+    # 初采不再为每个用户扇出 2×MAX_UP_SAMPLE 个请求，阶段5 显著提速
+    user_data["following_summary"] = {"total": len(user_data["followings"])}
 
     # 维度4：行为模式（综合动态 + 视频投稿时间）
     dynamic_timestamps = [d["timestamp"] for d in user_data["dynamics"] if d.get("timestamp")]

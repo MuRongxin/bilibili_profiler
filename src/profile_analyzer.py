@@ -281,7 +281,9 @@ def analyze_profile(user_data: dict, danmaku_stats: dict, spam_stats: dict) -> d
         "following_analysis": following_analysis,
         "following_summary": user_data.get("following_summary", {}),
         "all_following_names": [f.get("name", "") for f in followings],
-        "all_followings_raw": [{"name": f.get("name", ""), "sign": f.get("sign", "")} for f in followings],
+        # 带 uid：报告页关注 chip 悬停时按需懒加载该 UP 主的投稿词云（/api/up/<uid>/wordcloud）
+        "all_followings_raw": [{"uid": f.get("uid", 0), "name": f.get("name", ""),
+                                "sign": f.get("sign", "")} for f in followings],
         "video": video_analysis,
         "dynamic": dynamic_analysis,
         "live": live,

@@ -45,12 +45,14 @@ from storage import get_db, init_db
 from storage import (load_senders, load_global_uid_map, save_global_uid,
                      save_sender, save_user_data, has_user_data, load_video_info,
                      delete_video_data, toggle_false_positive, load_false_positives,
-                     load_faces, load_face_cached_uids, save_face)
+                     load_faces, load_face_cached_uids, save_face,
+                     load_llm_cache, save_llm_cache)
 from main import run_analysis
 from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
 from combo_pool import build_pool
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
+from up_analyzer import analyze_up
 from spam_detector import batch_detect_spam, detect_repeat_events, pool_distribution_from_rows
 from llm_analyzer import LLMAnalyzer
 from up_analyzer import _tokenize
@@ -404,6 +406,18 @@ def _load_profiles(bvid: str) -> list[dict]:
         if not p.get("school"):
             try:
                 p["school"] = json.loads(r["data_json"]).get("school", "")
+            except Exception:
+                pass
+        # 关注名单 uid 回退：懒加载词云特性之前的缓存画像 all_followings_raw 无 uid，
+        # 从 data_json.followings 按名字补（补不上则该 chip 退化为纯展示）
+        raw_fol = p.get("all_followings_raw") or []
+        if raw_fol and not raw_fol[0].get("uid"):
+            try:
+                fol = json.loads(r["data_json"]).get("followings", [])
+                uid_by_name = {f.get("name"): f.get("uid") for f in fol if f.get("name")}
+                for item in raw_fol:
+                    if not item.get("uid") and uid_by_name.get(item.get("name")):
+                        item["uid"] = uid_by_name[item["name"]]
             except Exception:
                 pass
         profiles.append(p)
@@ -1956,7 +1970,7 @@ def video_page(bvid: str):
             <button class="filter-btn" onclick="reportRegen()">🔄 重新生成报告</button>
             <button class="filter-btn btn-danger" onclick="reportDelete()">🗑 删除报告</button>
             <button class="filter-btn" onclick="toggleMask()"
-                    title="开启后全站昵称只显示最后一个字、UID 只显示前三位（Cookie 持久化，所有页面共享）">🙈 隐藏信息：{'开' if mask else '关'}</button>
+                    title="开启后全站昵称只显示最后一个字、UID 只显示前三位（Cookie 持久化，所有页面共享）">{'已隐藏信息' if mask else '未隐藏信息'}</button>
             <span class="ov-dl">{links}</span>
             <span id="reportJobStatus"></span>
         </div>
@@ -2272,6 +2286,63 @@ def api_false_positive(bvid: str):
     marked = toggle_false_positive(bvid, kind, target)
     _invalidate_page_cache(bvid)
     return jsonify({"ok": True, "marked": marked, "affected": affected})
+
+
+# ========== UP 主投稿词云懒加载（报告页关注 chip 悬停时按需采集） ==========
+
+_UP_WC_LOCK = threading.Lock()
+_UP_WC_EVENTS: dict[int, threading.Event] = {}   # uid → 在采事件（并发悬停只采一次，其余等待）
+
+
+@app.route("/api/up/<int:uid>/wordcloud")
+def api_up_wordcloud(uid: int):
+    """关注 UP 主的近期投稿词云（懒加载）：采集阶段只存关注名单、不逐个分析被关注 UP 主，
+    报告页悬停 chip 时才经此接口按需采集（analyze_up：名片+最近一页投稿标题分词）。
+
+    结果按 llm_cache 键 up:{uid} 缓存（跨视频复用，--force 清除范围不含 up: 前缀）。
+    同一 uid 并发请求只采一次：后到者等在 Event 上（最多 25s）再读缓存。"""
+    key = f"up:{uid}"
+    cached = load_llm_cache(key)
+    if cached:
+        try:
+            return jsonify(json.loads(cached))
+        except Exception:
+            pass                                        # 缓存损坏按未命中重采
+    with _UP_WC_LOCK:
+        ev = _UP_WC_EVENTS.get(uid)
+        if ev is None:
+            ev = threading.Event()
+            _UP_WC_EVENTS[uid] = ev
+            owner = True
+        else:
+            owner = False
+    if not owner:
+        ev.wait(25)
+        cached = load_llm_cache(key)
+        if cached:
+            try:
+                return jsonify(json.loads(cached))
+            except Exception:
+                pass
+        return jsonify({"error": "正在采集中，请稍候再悬停"}), 202
+    try:
+        client = _get_client()
+        info = analyze_up(uid, client)
+        words = sorted((info.get("word_freq") or {}).items(), key=lambda x: x[1], reverse=True)[:80]
+        data = {"words": [[w, c] for w, c in words], "name": info.get("name", ""),
+                "follower": info.get("follower", 0), "video_count": info.get("video_count", 0),
+                "top_category": info.get("top_category", "")}
+        save_llm_cache(key, json.dumps(data, ensure_ascii=False))
+        return jsonify(data)
+    except CookieInvalidError as e:
+        return jsonify({"error": str(e)}), 503
+    except Exception as e:
+        print(f"[Web] UP词云采集失败 uid={uid}: {e}")
+        return jsonify({"error": "采集失败，请稍后重试"}), 502
+    finally:
+        with _UP_WC_LOCK:
+            _UP_WC_EVENTS.pop(uid, None)
+        ev.set()
 
 
 @app.route("/api/video/<bvid>/danmaku")

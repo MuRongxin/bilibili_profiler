@@ -137,25 +137,61 @@ function fpToggle(btn) {
     }
 }
 
-// UP主悬停词云弹窗
-const upWcData = PAGE_DATA.upWordcloud;
+// UP主悬停词云弹窗：旧版缓存画像的词频随页面注入（upWcData）；新口径采集阶段只存关注名单，
+// 词云在悬停时经 /api/up/<uid>/wordcloud 懒加载（服务端 llm_cache 键 up:{uid} 缓存复用）
+const upWcData = PAGE_DATA.upWordcloud || {};
+const upWcCache = {};   // 懒加载结果前端缓存：upUid → words
 const popup = document.getElementById('wc-popup');
 const popupCanvas = document.getElementById('wc-popup-canvas');
+
+function showUpWc(chip, data) {
+    if (!data || data.length === 0) return;
+    const rect = chip.getBoundingClientRect();
+    popup.style.display = 'block';
+    popup.style.left = Math.min(rect.left, window.innerWidth - 320) + 'px';
+    popup.style.top = (rect.bottom + 8) + 'px';
+    const maxW = Math.max(...data.map(d => d[1]));
+    const minW = Math.min(...data.map(d => d[1]));
+    const scaled = data.map(d => [d[0], 10 + (d[1] - minW) / Math.max(maxW - minW, 1) * 50]);
+    WordCloud(popupCanvas, {list: scaled, gridSize: 10, weightFactor: 1, fontFamily: 'sans-serif',
+        color: () => ['#00a1d6','#fb7299','#ff9f43','#6c5ce7','#2e7d32'][Math.floor(Math.random()*5)],
+        rotateRatio: 0, backgroundColor: '#ffffff', shape: 'circle', clearCanvas: true});
+}
+
+function showUpWcText(chip, text) {   // 加载中/失败等纯文本提示（画在词云画布上）
+    const rect = chip.getBoundingClientRect();
+    popup.style.display = 'block';
+    popup.style.left = Math.min(rect.left, window.innerWidth - 320) + 'px';
+    popup.style.top = (rect.bottom + 8) + 'px';
+    const ctx = popupCanvas.getContext('2d');
+    ctx.clearRect(0, 0, popupCanvas.width, popupCanvas.height);
+    ctx.font = '14px sans-serif';
+    ctx.fillStyle = '#888';
+    ctx.fillText(text, 10, 30);
+}
+
 document.querySelectorAll('.up-chip').forEach(chip => {
     chip.addEventListener('mouseenter', function() {
         const upId = this.dataset.upid;
-        const data = upWcData[upId];
-        if (!data || data.length === 0) return;
-        const rect = this.getBoundingClientRect();
-        popup.style.display = 'block';
-        popup.style.left = Math.min(rect.left, window.innerWidth - 320) + 'px';
-        popup.style.top = (rect.bottom + 8) + 'px';
-        const maxW = Math.max(...data.map(d => d[1]));
-        const minW = Math.min(...data.map(d => d[1]));
-        const scaled = data.map(d => [d[0], 10 + (d[1] - minW) / Math.max(maxW - minW, 1) * 50]);
-        WordCloud(popupCanvas, {list: scaled, gridSize: 10, weightFactor: 1, fontFamily: 'sans-serif',
-            color: () => ['#00a1d6','#fb7299','#ff9f43','#6c5ce7','#2e7d32'][Math.floor(Math.random()*5)],
-            rotateRatio: 0, backgroundColor: '#ffffff', shape: 'circle', clearCanvas: true});
+        if (upId && upWcData[upId] && upWcData[upId].length) {
+            showUpWc(this, upWcData[upId]);
+            return;
+        }
+        const upUid = this.dataset.upUid;
+        if (!upUid) return;                         // 旧缓存画像无 uid：纯展示
+        if (upWcCache[upUid]) { showUpWc(this, upWcCache[upUid]); return; }
+        showUpWcText(this, '加载中…');
+        fetch('/api/up/' + encodeURIComponent(upUid) + '/wordcloud')
+            .then(r => r.json().then(j => ({ok: r.ok, j})))
+            .then(({ok, j}) => {
+                if (ok && j.words && j.words.length) {
+                    upWcCache[upUid] = j.words;
+                    showUpWc(this, j.words);        // 悬停未移开则直接展示
+                } else {
+                    showUpWcText(this, j.error || '该 UP 主暂无投稿数据');
+                }
+            })
+            .catch(() => showUpWcText(this, '网络错误'));
     });
     chip.addEventListener('mouseleave', function() { popup.style.display = 'none'; });
 });

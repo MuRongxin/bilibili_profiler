@@ -171,19 +171,23 @@ LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "16384"))
 # LLM 判定并发上限（问题弹幕/问题评论；实际路数=min(批次数, 此值)；触发 429 限速自动退避重试）
 LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "16"))
 
-# 第二套 LLM：小米 MiMo（备选）。LLM_PROVIDER=mimo 切换启用；
-# 两套缓存按模型名隔离（cache key 含模型名），可同视频 A/B 对比判定质量
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "deepseek")   # deepseek | mimo
+# 第二/三套 LLM：小米 MiMo、智谱 GLM（GLM 为默认主用，Flash 档成本最低；deepseek 按量计费偏贵）。
+# LLM_PROVIDER 选择主用厂商，备用厂商按 glm→mimo→deepseek 省钱序自动取下一个 key 非空的；
+# 各厂商缓存按模型名隔离（cache key 含模型名），可同视频 A/B 对比判定质量
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "glm")   # glm | deepseek | mimo（默认 glm）
 MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
 MIMO_BASE_URL = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
 MIMO_MODEL = os.environ.get("MIMO_MODEL", "mimo-v2.5")
-if LLM_PROVIDER == "mimo":
-    # 主用切到 MiMo 前，先记下 DeepSeek 原始配置作失败兜底
-    LLM_FALLBACK = (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, "deepseek")
-    LLM_API_KEY, LLM_BASE_URL, LLM_MODEL = MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL
-else:
-    # 主用 DeepSeek，MiMo 兜底（key 为空则不启用兜底）
-    LLM_FALLBACK = (MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, "mimo")
+GLM_API_KEY = os.environ.get("GLM_API_KEY", "")        # 智谱开放平台 bigmodel.cn 的 API Key
+GLM_BASE_URL = os.environ.get("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/")
+GLM_MODEL = os.environ.get("GLM_MODEL", "glm-5.3-flash")
+_PROVIDERS = {"deepseek": (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL),
+              "mimo": (MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL),
+              "glm": (GLM_API_KEY, GLM_BASE_URL, GLM_MODEL)}
+_primary = LLM_PROVIDER if LLM_PROVIDER in _PROVIDERS else "glm"
+_fb = next((n for n in ("glm", "mimo", "deepseek") if n != _primary and _PROVIDERS[n][0]), "")
+LLM_FALLBACK = (*_PROVIDERS[_fb], _fb) if _fb else ("", "", "", "")
+LLM_API_KEY, LLM_BASE_URL, LLM_MODEL = _PROVIDERS[_primary]
 
 # === 审查修复新增（2026-08-29） ===
 # 以下常量原分散在各模块内的私有定义，统一迁移至配置文件便于调优
@@ -213,5 +217,6 @@ REPEAT_EVENT_WINDOW_SECONDS = 60   # 群体复读事件：时间窗口（秒，�
 REPEAT_EVENT_MIN_SENDERS = 5       # 群体复读事件：窗口内不同发送者下限
 REPEAT_EVENT_MIN_TOTAL = 8         # 群体复读事件：窗口内总条数下限
 REPEAT_EVENT_TOP_N = 20            # 群体复读事件：展示上限
+UID_HARVEST_MAX_PAGES = 500        # 评论 UID 收割（纯翻页取 uid 建 CRC32 映射）的累计页数上限
 PROXY_NODE_DEAD_TTL = 660          # 节点死名单 TTL（秒，略大于订阅健康检查间隔 600s，到期允许复活重试）
 COMMENT_REFRESH_MAX_PAGES = 10     # 评论增量刷新（done=1 重跑）按时间序回翻的页数上限

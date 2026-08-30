@@ -12,8 +12,9 @@ from contextlib import closing
 from api_client import BiliAPIClient
 from config import COMMENT_MAIN_WBI_URL, COMMENT_MAIN_URL, COMMENT_REPLY_URL
 from config import MAX_COMMENT_PAGES, COMMENT_REPLY_MAX_PAGES, CHARGE_LIST_URL
-from config import COMMENT_REFRESH_MAX_PAGES
-from storage import get_db, get_phase_state, load_comments, save_comments, set_phase_state
+from config import COMMENT_REFRESH_MAX_PAGES, UID_HARVEST_MAX_PAGES
+from storage import (get_db, get_phase_state, load_comments, save_comments,
+                     set_phase_state, save_global_uid, load_global_uid_map)
 from uid_resolver import calc_crc32
 
 
@@ -347,6 +348,99 @@ def refresh_comments(oid: int, client: BiliAPIClient, bvid: str,
 
     print(f"[Comment] 增量刷新完成：新增主评论 {new_total} 条")
     return new_total
+
+
+def harvest_comment_uids(oid: int, client: BiliAPIClient, bvid: str,
+                         max_pages: int = UID_HARVEST_MAX_PAGES) -> dict[str, int]:
+    """纯 UID 收割（阶段3尾部调用）：翻评论区只提取发送者 uid → 正向 CRC32 映射，
+    不落评论内容、不补采子评论——目的是提高弹幕发送者解析率（评论者即明文 UID 源），
+    收割结果沉淀 global_uid_map（来源「评论收割」，明文优先级），跨视频复用。
+
+    断点：phase_state(bvid, "uid_harvest", page/offset/done)，中断/达累计上限
+    （UID_HARVEST_MAX_PAGES，跨运行累计）下轮续翻。done=1 后重跑转为刷新模式：
+    时间序（mode=2）从最新往回翻，整页无新 uid（对照本视频已入库评论 + 全局映射库
+    + 本轮已收）即停。单页失败只告警中断本轮（不写 done）。
+    返回本轮新收割的 {crc32_hex: uid}。"""
+    done = get_phase_state(bvid, "uid_harvest", "done") == "1"
+    # 已知集合：本视频已入库评论 uid + 全局映射库 uid（碰撞守卫：crc 已被占且 uid 不同则跳过）
+    known_uids: set[int] = {c["uid"] for c in load_comments(bvid)}
+    global_map = load_global_uid_map()
+    known_uids.update(v["uid"] for v in global_map.values())
+
+    offset, page_start = "", 0
+    if not done:
+        page_start = int(get_phase_state(bvid, "uid_harvest", "page") or 0)
+        offset = get_phase_state(bvid, "uid_harvest", "offset") or ""
+        if page_start:
+            print(f"[Comment] UID收割续翻：从第 {page_start + 1} 页继续")
+    else:
+        print("[Comment] UID收割：刷新模式（翻至整页无新 uid 即停）")
+
+    harvested: dict[str, int] = {}
+    page = page_start
+    while page < max_pages:
+        page += 1
+        try:
+            data = client.get(COMMENT_MAIN_WBI_URL, params={
+                "oid": oid,
+                "type": 1,
+                "mode": 2,       # 时间序：与正文采集的热度序错开，且刷新模式边界可判定
+                "pagination_str": json.dumps({"offset": offset}),
+            })
+        except Exception as e:
+            print(f"[Comment] UID收割第{page}页请求异常（{e}），本轮中止（已收 {len(harvested)} 个）")
+            break
+        if data.get("code") != 0:
+            print(f"[Comment] UID收割第{page}页失败: {data.get('message')}，本轮中止（已收 {len(harvested)} 个）")
+            break
+        page_data = data.get("data") or {}
+        replies = page_data.get("replies") or []
+        if not replies:
+            if not done:
+                set_phase_state(bvid, "uid_harvest", "done", "1")
+            break
+
+        page_new = 0
+        for r in replies:
+            mids = [(r.get("member") or {}).get("mid")]
+            mids += [(s.get("member") or {}).get("mid") for s in (r.get("replies") or [])]
+            for mid in mids:
+                try:
+                    uid = int(mid or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not uid or uid in known_uids:
+                    continue
+                crc = calc_crc32(uid)
+                if crc in global_map and global_map[crc]["uid"] != uid:
+                    continue        # crc 碰撞：全局库已有他人，保留先见者
+                known_uids.add(uid)
+                if crc not in harvested:
+                    harvested[crc] = uid
+                    save_global_uid(crc, uid, "评论收割")
+                    page_new += 1
+
+        if page % 20 == 0 or page_new:
+            print(f"[Comment] UID收割第 {page}/{max_pages} 页: +{page_new}（本轮累计 {len(harvested)} 个）")
+
+        if done and page_new == 0:
+            break                   # 刷新模式：整页无新 uid，到达边界
+        cursor = page_data.get("cursor") or {}
+        next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
+        if cursor.get("is_end", False) or not next_offset:
+            if not done:
+                set_phase_state(bvid, "uid_harvest", "done", "1")
+            break
+        offset = next_offset
+        if not done:
+            set_phase_state(bvid, "uid_harvest", "page", str(page))
+            set_phase_state(bvid, "uid_harvest", "offset", offset)
+    else:
+        print(f"[Comment] UID收割达累计上限 {max_pages} 页，剩余评论区下轮续翻"
+              f"（可调大 UID_HARVEST_MAX_PAGES）")
+
+    print(f"[Comment] UID收割完成：本轮新收 {len(harvested)} 个 uid 映射")
+    return harvested
 
 
 def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT_PAGES,
