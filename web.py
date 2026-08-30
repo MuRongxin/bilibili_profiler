@@ -117,17 +117,19 @@ def _db_guard(view):
             return _db_error_page(), 503
     return wrapper
 
-# 报告页整页 HTML 内存缓存：bvid → (数据指纹, HTML)。避免每次刷新重跑
+# 报告页整页 HTML 内存缓存：(bvid, 遮蔽开关) → (数据指纹, HTML)。避免每次刷新重跑
 # _load_profiles/_attach_other_videos 逐用户查询串；job 完成/删除/误报标记时主动失效，
 # 指纹比对兜底外部进程（CLI run.py）写入的数据变化
-_PAGE_CACHE: dict[str, tuple[tuple, str]] = {}
+_PAGE_CACHE: dict[tuple[str, bool], tuple[tuple, str]] = {}
 _PAGE_CACHE_LOCK = threading.Lock()
 
 
 def _invalidate_page_cache(bvid: str):
-    """使指定视频的报告页缓存失效（job 完成/删除时调用）"""
+    """使指定视频的报告页缓存失效（job 完成/删除时调用）；
+    key 为 (bvid, 遮蔽开关) 元组，开/关两个形态一并清除"""
     with _PAGE_CACHE_LOCK:
-        _PAGE_CACHE.pop(bvid, None)
+        _PAGE_CACHE.pop((bvid, True), None)
+        _PAGE_CACHE.pop((bvid, False), None)
 
 
 def _page_fingerprint(bvid: str) -> tuple:
@@ -393,6 +395,11 @@ def _load_profiles(bvid: str) -> list[dict]:
         p["resolve_confidence"] = r["confidence"] or ""
         p["collected_at"] = r["collected_at"] or ""
         p["_mid_hash"] = r["mid_hash"] or ""
+        # 隐藏信息（mask Cookie）：昵称只留末字、另注入遮蔽 UID 显示串
+        # （uid 原值保留：链接/锚点/逻辑比较都靠它，遮蔽只影响可见文本）
+        if _mask_on():
+            p["name"] = _mask_name(p.get("name"))
+            p["_uid_disp"] = _mask_uid(p.get("uid"))
         # 毕业院校回退：本特性之前的缓存画像无 school 键，从采集原始数据 data_json 补
         if not p.get("school"):
             try:
@@ -533,7 +540,9 @@ def _sender_meta(bvid: str) -> dict:
         spam_level = r["spam_level"]
         if fp_spam and r["mid_hash"] in fp_spam:
             spam_level = "低"   # 刷屏判定人工误报：展示层降级（与用户卡片/统计图同口径）
-        meta[r["mid_hash"]] = {"uid": r["uid"], "name": r["name"],
+        # 隐藏信息（mask Cookie）：昵称只留末字（影响弹幕浏览器 Top10 与 API 行内昵称）
+        name = _mask_name(r["name"]) if _mask_on() else r["name"]
+        meta[r["mid_hash"]] = {"uid": r["uid"], "name": name,
                                "spam_level": spam_level, "categories": categories}
     return meta
 
@@ -852,8 +861,11 @@ def _attack_focus(bvid: str, fp_cmt: set[str]) -> dict:
             ORDER BY c.like DESC
         ''', (bvid,)).fetchall()
 
+    mask = _mask_on()
+
     def _nm(uname, dbname, uid) -> str:
-        return uname or dbname or f"UID:{uid}"
+        s = uname or dbname or f"UID:{uid}"
+        return _mask_name(s) if mask else s   # 隐藏信息：昵称只留末字
 
     attackers: dict[int, dict] = {}
     victims: dict[int, dict] = {}
@@ -878,7 +890,9 @@ def _attack_focus(bvid: str, fp_cmt: set[str]) -> dict:
                 for x in ea["examples"]):
             ea["examples"].append({"content": r["reply_content"], "target": v_name,
                                    "parent": r["parent_content"], "category": r["problem"],
-                                   "gp_name": r["gp_uname"] or "", "gp_content": r["gp_content"],
+                                   # 上游层昵称同样过遮蔽（mask 时只留末字）
+                                   "gp_name": _mask_name(r["gp_uname"]) if mask else (r["gp_uname"] or ""),
+                                   "gp_content": r["gp_content"],
                                    "gp_is_self": bool(r["gp_uid"]) and r["gp_uid"] == a})
         ev = victims.setdefault(v, {"uid": v, "name": v_name,
                                     "count": 0, "attackers": Counter(), "comments": {}})
@@ -918,12 +932,42 @@ def _truncate(text: str, limit: int = 80) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+# ========== 隐藏信息开关（Cookie mask=1，全站展示层遮蔽昵称/UID） ==========
+
+def _mask_on() -> bool:
+    """隐藏信息开关是否开启（Cookie mask=1）；无请求上下文（后台线程/直调）时不遮蔽"""
+    try:
+        return request.cookies.get("mask") == "1"
+    except RuntimeError:
+        return False
+
+
+def _mask_name(name) -> str:
+    """昵称遮蔽：只显示最后一个字，其余字符用固定颜文字代替
+    （「洋葱调色盘」→「（￣▽￣）盘」；单字名/空名不变）"""
+    s = str(name or "")
+    if len(s) <= 1:
+        return s
+    return "（￣▽￣）" + s[-1]
+
+
+def _mask_uid(uid) -> str:
+    """UID 遮蔽：除前三位外全部替换为 *（3691006683777071 → 369*************；长度≤3 不变）"""
+    s = str(uid or "")
+    if len(s) <= 3:
+        return s
+    return s[:3] + "*" * (len(s) - 3)
+
+
 def _attack_focus_html(data: dict) -> str:
     """争执焦点区块：左列挑事者（发起问题回复最多，攻击原文附被攻击者原评上下文），
     右列被围攻者（被问题回复命中最多，受害原评按条去重、攻击条目挂在其下）"""
     if not data or not data["attackers"]:
         return ""
     names = data["names"]
+    # 隐藏信息：图节点 id 与明细条目 data-uid 同步用遮蔽值（前端点击节点靠它俩配对定位；
+    # 遮蔽值碰撞时两个用户会合并为一个节点，属已知取舍）；/user/<uid> 链接保持原值
+    _disp_uid = _mask_uid if _mask_on() else (lambda u: u)
 
     def _opp_text(counter: Counter) -> str:
         return "、".join(f'{esc(names.get(u, f"UID:{u}"))}×{n}' for u, n in counter.most_common(3))
@@ -959,7 +1003,7 @@ def _attack_focus_html(data: dict) -> str:
         return "".join(out)
 
     def _item(e: dict, badge: str, opp_label: str, opp: str) -> str:
-        return f'''<div class="af-item" data-side="a" data-uid="{e["uid"]}">
+        return f'''<div class="af-item" data-side="a" data-uid="{_disp_uid(e["uid"])}">
             <div class="af-line">
                 <a href="/user/{e["uid"]}" title="查看用户互动时间线">{esc(e["name"])}</a>
                 <span class="hot-badge">{badge.format(e["count"])}</span>
@@ -968,7 +1012,7 @@ def _attack_focus_html(data: dict) -> str:
             </div>{_quotes(e["examples"])}</div>'''
 
     def _victim_item(e: dict) -> str:
-        return f'''<div class="af-item" data-side="v" data-uid="{e["uid"]}">
+        return f'''<div class="af-item" data-side="v" data-uid="{_disp_uid(e["uid"])}">
             <div class="af-line">
                 <a href="/user/{e["uid"]}" title="查看用户互动时间线">{esc(e["name"])}</a>
                 <span class="hot-badge">被攻击 {e["count"]} 次</span>
@@ -981,19 +1025,21 @@ def _attack_focus_html(data: dict) -> str:
     # 关系图画布数据：图节点按 uid 合并——同一人既是挑事者也是被围攻者时只画一个节点
     # （na=攻击次数 / nv=被攻击次数，攻击链 A→X→B 通过指向ta的边+ta发出的边体现）；
     # links 的端点放宽到任一身份上榜（链条边：目标仅以挑事者身份上榜也保留）
-    merged: dict[int, dict] = {}
+    merged: dict = {}
     faces = data.get("faces", {})
     for e in shown_attackers:
-        ent = merged.setdefault(e["uid"], {"id": e["uid"], "name": e["name"],
-                                           "na": 0, "nv": 0, "face": faces.get(e["uid"], "")})
+        ent = merged.setdefault(_disp_uid(e["uid"]),
+                                {"id": _disp_uid(e["uid"]), "name": e["name"],
+                                 "na": 0, "nv": 0, "face": faces.get(e["uid"], "")})
         ent["na"] = e["count"]
     for e in shown_victims:
-        ent = merged.setdefault(e["uid"], {"id": e["uid"], "name": e["name"],
-                                           "na": 0, "nv": 0, "face": faces.get(e["uid"], "")})
+        ent = merged.setdefault(_disp_uid(e["uid"]),
+                                {"id": _disp_uid(e["uid"]), "name": e["name"],
+                                 "na": 0, "nv": 0, "face": faces.get(e["uid"], "")})
         ent["nv"] = e["count"]
     graph_nodes = list(merged.values())
-    shown_uids = set(merged)
-    graph_links = [{"s": e["uid"], "t": v, "w": n}
+    shown_uids = {e["uid"] for e in shown_attackers} | {e["uid"] for e in shown_victims}
+    graph_links = [{"s": _disp_uid(e["uid"]), "t": _disp_uid(v), "w": n}
                    for e in shown_attackers
                    for v, n in e["victims"].most_common() if v in shown_uids]
     graph = {"nodes": graph_nodes, "links": graph_links}
@@ -1037,18 +1083,19 @@ def _problem_comment_board(bvid: str, fp_cmt: set[str]) -> tuple[list[dict], lis
             WHERE c.bvid = ? AND c.problem != ''
         ''', (bvid,)).fetchall()
     items, marked = [], []
+    mn = _mask_name if _mask_on() else (lambda s: s)   # 隐藏信息：评论者/父评作者昵称只留末字
     for r in rows:
         it = {
             "rpid": r["rpid"], "uid": r["uid"],
-            "name": r["uname"] or r["db_name"] or f"UID:{r['uid']}",
+            "name": mn(r["uname"] or r["db_name"] or f"UID:{r['uid']}"),
             "content": r["content"], "ctime": r["ctime"], "like": r["like"] or 0,
             "reply_count": r["reply_count"] or 0, "is_sub": r["is_sub"],
             "problem": r["problem"],
             "heat": (r["like"] or 0) + (r["reply_count"] or 0) * COMMENT_HEAT_REPLY_WEIGHT,
             # 楼中楼语境：被回复的父评论（父级未采集到时为空，前端不展示）
             "parent_content": r["parent_content"] or "",
-            "parent_name": (r["parent_uname"] or r["parent_db_name"]
-                            or (f"UID:{r['parent_uid']}" if r["parent_uid"] else "")),
+            "parent_name": mn(r["parent_uname"] or r["parent_db_name"]
+                              or (f"UID:{r['parent_uid']}" if r["parent_uid"] else "")),
         }
         (marked if str(r["rpid"]) in fp_cmt else items).append(it)
     items.sort(key=lambda x: -x["heat"])
@@ -1158,7 +1205,8 @@ def _cross_video_overlaps() -> list[dict]:
             })
     return [{
         "uid": r["uid"],
-        "name": r["name"] or f"UID:{r['uid']}",
+        # 隐藏信息（mask Cookie）：昵称只留末字
+        "name": _mask_name(r["name"] or f"UID:{r['uid']}") if _mask_on() else (r["name"] or f"UID:{r['uid']}"),
         "video_count": r["vcnt"],
         "total_dm": r["total_dm"] or 0,
         # 弹幕多的视频排前，展开列表一眼看到主战场
@@ -1224,7 +1272,8 @@ def _hot_comments(bvid: str, aid: int | None) -> dict:
         ''', (bvid, HOT_COMMENT_MIN_REPLIES, HOT_COMMENT_MAX_SHOW)).fetchall()
 
         def _name(uname, db_name, uid) -> str:
-            return uname or db_name or f"UID:{uid}"
+            s = uname or db_name or f"UID:{uid}"
+            return _mask_name(s) if _mask_on() else s   # 隐藏信息：昵称只留末字
 
         items = []
         for r in rows:
@@ -1610,18 +1659,66 @@ def index():
 </html>'''
 
 
+def _low_conf_tab_html(bvid: str) -> tuple[str, int]:
+    """「低置信度」标签页：解析出 UID 但置信度为「低」的发送者（多为 CRC32 碰撞疑似误识别）。
+
+    自动流水线对低置信度用户不做深度采集/画像（main.py 阶段5 只收高/中置信度），
+    这里集中列出其 UID 与具体弹幕内容供人工复核；确认无误的可到「弹幕浏览器」
+    勾选对应 mid_hash 手动强制分析（无视置信度）。返回 (HTML, 人数)。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT mid_hash, uid, method, danmaku_count, contents_json, spam_level "
+            "FROM senders WHERE bvid = ? AND uid IS NOT NULL AND confidence = '低' "
+            "ORDER BY danmaku_count DESC", (bvid,)).fetchall()
+    if not rows:
+        return ('<p class="empty-note">无低置信度解析用户（解析出 UID 的发送者均为高/中置信度）</p>', 0)
+    mask = _mask_on()
+    items = []
+    for r in rows:
+        uid = r["uid"]
+        uid_disp = _mask_uid(uid) if mask else str(uid)   # 遮蔽只影响可见文本，href 保持真实 uid
+        try:
+            contents = json.loads(r["contents_json"] or "[]")
+        except Exception:
+            contents = []
+        cnt = Counter(c for c in contents if c)
+        dm_html = "".join(
+            f'<li>{esc(c)}' + (f' <span class="tl-time">×{n}</span>' if n > 1 else "") + "</li>"
+            for c, n in cnt.most_common(15))
+        if len(cnt) > 15:
+            dm_html += f'<li class="ov-none">……另有 {len(cnt) - 15} 条不同内容</li>'
+        spam = r["spam_level"] or ""
+        spam_badge = f'<span class="spam-badge spam-{esc(spam)}">刷屏:{esc(spam)}</span>' if spam and spam != "低" else ""
+        items.append(f'''<div class="af-item">
+            <div class="af-line">
+                <a href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener" title="查看B站空间（新标签页）">UID:{esc(uid_disp)}</a>
+                <span class="hot-badge">{r["danmaku_count"]} 条弹幕</span>
+                <span class="method-badge" title="UID 解析方式">{esc(r["method"] or "")}</span>
+                <span class="risk-badge" title="低置信度解析存在 CRC32 撞库误识别风险">可能误识别</span>
+                {spam_badge}
+                <span class="uid">mid_hash:{esc(r["mid_hash"])}</span>
+            </div>
+            <ul class="ov-list">{dm_html or '<li class="ov-none">弹幕内容未留存</li>'}</ul>
+        </div>''')
+    head = (f'<div class="chart-hint" style="margin:4px 0 10px">以下 {len(rows)} 名发送者的 UID 为低置信度解析'
+            f'（疑似碰撞误识别），未做深度采集/画像；人工复核确认无误后，可在「弹幕浏览器」'
+            f'搜索其 mid_hash 并勾选「分析选中发送者」强制画像。</div>')
+    return head + "".join(items), len(rows)
+
+
 @app.route("/video/<bvid>")
 @_db_guard
 def video_page(bvid: str):
-    """报告页：概览/用户画像/弹幕浏览器/问题弹幕榜/争执焦点/问题评论榜/高回复评论 七个标签页。
+    """报告页：概览/用户画像/弹幕浏览器/问题弹幕榜/争执焦点/问题评论榜/高回复评论/低置信度 八个标签页。
 
     整页 HTML 按 bvid 内存缓存（_PAGE_CACHE）：避免每次刷新重跑 _load_profiles/
     _attach_other_videos 逐用户查询；job（手动分析/重新生成）完成或删除时主动失效，
     且每次请求比对数据指纹，外部进程（run.py）落库导致的变化也能检出。
     数据库锁定（分析任务写入期）由 _db_guard 降级为 503 友好页。"""
     page_fp = _page_fingerprint(bvid)
+    mask = _mask_on()   # 隐藏信息开关：开/关两版页面分开缓存，防串味
     with _PAGE_CACHE_LOCK:
-        cached = _PAGE_CACHE.get(bvid)
+        cached = _PAGE_CACHE.get((bvid, mask))
     if cached is not None and cached[0] == page_fp:
         return cached[1]
 
@@ -1667,6 +1764,7 @@ def video_page(bvid: str):
     rq = _resolve_quality(bvid)                          # 概览页解析质量区块
     repeat_block = _repeat_events_block(bvid)            # 概览页群体复读事件区块（含全池分布自检）
     dm_attrs = _danmaku_attr_stats(bvid)                 # 弹幕属性分布（mode/color）
+    lowconf_tab, lowconf_count = _low_conf_tab_html(bvid)  # 低置信度页（疑似误识别用户复核）
 
     # CSV/JSON 导出下载链接：默认只显示最新一组，历史导出收进 <details> 折叠块（spec 6）
     latest, history = _export_links(bvid)
@@ -1837,7 +1935,7 @@ def video_page(bvid: str):
             评论: {video_info.get('stat', {}).get('reply', 0):,} ·
             分析用户数: {stats['total']} · 大会员: {stats['vip_count']} ·
             刷屏用户: {stats['spam_levels'].get('高', 0) + stats['spam_levels'].get('中', 0)} ·
-            AI画像: {ai_count}{coverage_line}
+            AI画像: {ai_count} · 低置信度: {lowconf_count}{coverage_line}
         </div>
     </div>
 
@@ -1849,6 +1947,7 @@ def video_page(bvid: str):
         <button class="tab-btn" data-tab="attack" onclick="switchTab('attack')">争执焦点</button>
         <button class="tab-btn" data-tab="cmtwar" onclick="switchTab('cmtwar')">问题评论榜</button>
         <button class="tab-btn" data-tab="hot" onclick="switchTab('hot')">高回复评论</button>
+        <button class="tab-btn" data-tab="lowconf" onclick="switchTab('lowconf')">低置信度</button>
     </div>
 
     <div id="tab-overview" class="tab-pane active">
@@ -1856,6 +1955,8 @@ def video_page(bvid: str):
             <a class="filter-btn" href="/">← 返回首页</a>
             <button class="filter-btn" onclick="reportRegen()">🔄 重新生成报告</button>
             <button class="filter-btn btn-danger" onclick="reportDelete()">🗑 删除报告</button>
+            <button class="filter-btn" onclick="toggleMask()"
+                    title="开启后全站昵称只显示最后一个字、UID 只显示前三位（Cookie 持久化，所有页面共享）">🙈 隐藏信息：{'开' if mask else '关'}</button>
             <span class="ov-dl">{links}</span>
             <span id="reportJobStatus"></span>
         </div>
@@ -1911,6 +2012,8 @@ def video_page(bvid: str):
 
     <div id="tab-hot" class="tab-pane">{hot_tab}</div>
 
+    <div id="tab-lowconf" class="tab-pane">{lowconf_tab}</div>
+
     <div id="wc-popup" class="wc-popup"><canvas id="wc-popup-canvas" width="276" height="216"></canvas></div>
 </div>
 <script>window.__DATA__ = {js_json(page_data)};</script>
@@ -1918,7 +2021,7 @@ def video_page(bvid: str):
 </body>
 </html>'''
     with _PAGE_CACHE_LOCK:
-        _PAGE_CACHE[bvid] = (page_fp, html)
+        _PAGE_CACHE[(bvid, mask)] = (page_fp, html)
     return html
 
 
@@ -1931,6 +2034,12 @@ def user_page(uid: int):
     弹幕本身匿名，无法从 UID 出发反查站内全部弹幕。"""
     data = _user_timeline(uid)
     name, level = data["name"], data["level"]
+    # 隐藏信息（mask Cookie）：昵称只留末字、UID 可见文本只留前三位；链接 href 保持原值
+    if _mask_on():
+        name = _mask_name(name)
+        uid_disp = _mask_uid(uid)
+    else:
+        uid_disp = uid
 
     def _fmt_ts(ts: int) -> str:
         return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "时间未留存"
@@ -1985,7 +2094,7 @@ def user_page(uid: int):
         <h1><a href="/" style="color:white;text-decoration:none">🎬 B站弹幕用户画像分析</a></h1>
         <div class="meta">
             <strong>🕐 {esc(name)} 的互动时间线</strong><br>
-            UID: {uid} | Lv.{esc(level)} |
+            UID: {esc(uid_disp)} | Lv.{esc(level)} |
             <a style="color:#ffd" href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">B站空间 ↗</a><br>
             <span style="opacity:0.8">仅覆盖本系统已分析视频；按最近互动时间倒序。</span>
         </div>
@@ -2309,14 +2418,15 @@ def api_danmaku(bvid: str):
         return jsonify({"error": "数据库查询失败，请稍后重试"}), 500
 
     rows = []
+    mask = _mask_on()   # 隐藏信息：行内昵称只留末字、UID 只留前三位（JSON 里 uid 变字符串无副作用，前端只展示）
     for r in raw_rows:
         m = meta.get(r["mid_hash"], {})
         rows.append({
             "content": r["content"],
             "dup_count": r["dup_count"],
             "mid_hash": r["mid_hash"],
-            "uid": r["uid"],
-            "name": r["name"],
+            "uid": _mask_uid(r["uid"]) if (mask and r["uid"] is not None) else r["uid"],
+            "name": _mask_name(r["name"]) if mask else r["name"],
             "first_video_time": r["first_video_time"],
             "first_send_time": r["first_send_time"],
             "categories": m.get("categories", []),

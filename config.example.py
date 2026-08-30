@@ -213,3 +213,5 @@ REPEAT_EVENT_WINDOW_SECONDS = 60   # 群体复读事件：时间窗口（秒，�
 REPEAT_EVENT_MIN_SENDERS = 5       # 群体复读事件：窗口内不同发送者下限
 REPEAT_EVENT_MIN_TOTAL = 8         # 群体复读事件：窗口内总条数下限
 REPEAT_EVENT_TOP_N = 20            # 群体复读事件：展示上限
+PROXY_NODE_DEAD_TTL = 660          # 节点死名单 TTL（秒，略大于订阅健康检查间隔 600s，到期允许复活重试）
+COMMENT_REFRESH_MAX_PAGES = 10     # 评论增量刷新（done=1 重跑）按时间序回翻的页数上限

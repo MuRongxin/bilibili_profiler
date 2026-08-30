@@ -176,6 +176,9 @@ def js_json(obj):
 def generate_user_card(profile: dict) -> str:
     """生成单个用户的画像卡片HTML"""
     uid = profile.get("uid", 0)
+    # 隐藏信息（web.py mask Cookie 开启时注入 _uid_disp）：可见 UID 文本用遮蔽值；
+    # href/id 锚点/data-* 保持原值（链接仍指向真实 /user/<uid>，属已知取舍）
+    uid_disp = profile.get("_uid_disp") or uid
     name = profile.get("name", "未知")
     face = profile.get("face", "")
     sign = profile.get("sign", "")
@@ -418,7 +421,7 @@ def generate_user_card(profile: dict) -> str:
             <div class="header-info">
                 <div class="name-line">
                     <a href="{profile_url}" target="_blank" rel="noopener" class="username-link"><span class="username">{esc(name)}</span></a>
-                    <span class="uid">UID:{esc(uid)}</span>
+                    <span class="uid">UID:{esc(uid_disp)}</span>
                     <span class="level-badge">Lv.{esc(level)}</span>
                     {f'<span class="school-badge" title="毕业院校（来自空间信息）">🎓 {esc(profile.get("school", ""))}</span>' if profile.get('school') else ''}
                     { '<span class="vip-badge">大会员</span>' if profile.get('vip_status')==1 else '' }

@@ -27,7 +27,7 @@ from api_client import RiskControlError
 from danmaku import collect_danmaku_data, get_top_senders, group_by_sender, get_cid_for_page, fetch_command_dms, build_command_uid_map
 from danmaku import get_video_info
 from danmaku_history import fetch_history_danmaku
-from comment import collect_comment_data, fetch_charge_uid_map
+from comment import collect_comment_data, fetch_charge_uid_map, refresh_comments
 from comment import build_comment_uid_map, build_comment_location_map
 from uid_resolver import resolve_all_senders, calc_crc32, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
 from spam_detector import batch_detect_spam, distribution_stats, detect_repeat_events
@@ -301,7 +301,14 @@ def phase_comment(video_info: dict, client, resume: bool = True):
             # 哨兵 format 存在而无 done 必为半成品；三者皆无才是旧版完整落库。
             # 否则中断点早于首个游标检查点时会被误判为完整而永久跳过剩余翻页
             if done == "1" or (done is None and mode is None and fmt is None):
-                # 完整数据（含旧版完整落库）：直接读库
+                # 完整数据（含旧版完整落库）：先按时间序增量刷新（新评论撞整页已见即停，
+                # 旧评论顺带刷新热度；失败降级沿用库内数据），再读库
+                if aid:
+                    try:
+                        refresh_comments(aid, client, bvid)
+                        existing = load_comments(bvid)
+                    except Exception as e:
+                        print(f"[Phase 3] 警告: 评论增量刷新失败（{e}），沿用库内已有数据")
                 print(f"[Phase 3] 断点续采：从库读回 {len(existing)} 条评论，跳过评论重采")
                 charge_uid_map = fetch_charge_uid_map(bvid, aid, up_mid, client) if up_mid else {}
                 return (existing, build_comment_uid_map(existing),

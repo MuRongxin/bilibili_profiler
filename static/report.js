@@ -1047,6 +1047,15 @@ function restoreViewState() {
 })();
 
 // ===== 报告页：重新生成 / 删除（spec 9） =====
+// 隐藏信息开关（Cookie mask=1，全站共享）：开/关切换后整页刷新，服务端按遮蔽态重渲染
+function toggleMask() {
+    if (document.cookie.split('; ').includes('mask=1'))
+        document.cookie = 'mask=; Max-Age=0; path=/';
+    else
+        document.cookie = 'mask=1; path=/';
+    location.reload();
+}
+
 function reportRegen() {
     if (!confirm('重新生成 ' + BVID + ' 的报告？将清空该视频缓存并后台重跑完整分析流水线。')) return;
     const status = document.getElementById('reportJobStatus');

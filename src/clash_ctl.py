@@ -6,9 +6,12 @@
 """
 import re
 import threading
+import time
 from urllib.parse import urlparse
 
 import requests
+
+from config import PROXY_NODE_DEAD_TTL
 
 # 组内伪节点/内置策略名，不进入轮换
 _PSEUDO = {"DIRECT", "REJECT", "PASS", "GLOBAL", "COMPATIBLE"}
@@ -45,7 +48,42 @@ class ClashCtl:
         self.group = group          # 为空时首次读组自动挑选第一个非 GLOBAL 的 Selector 组
         self._nodes: list[str] = []
         self._region_cursor: dict[str, int] = {}   # 各地区内部轮换位置
+        self._dead: dict[str, tuple[float, bool]] = {}   # 死名单：节点名 → (截止时刻, 是否手动标记)
         self._lock = threading.Lock()   # 节点轮换串行化：多号并行分片共享同一控制器
+
+    def mark_dead(self, name: str, ttl: float = PROXY_NODE_DEAD_TTL):
+        """手动标记节点为死（代理故障时由组合池即时上报，不等下一轮健康检查）。
+        手动标记优先级高于健康检查历史：历史最多滞后 600s，刚发生的故障更新鲜，
+        健康检查通道不得提前复活手动标记的节点（只能等 TTL 到期）"""
+        if name:
+            with self._lock:
+                self._dead[name] = (time.time() + ttl, True)
+
+    def _update_dead_from_history(self, proxies: dict):
+        """读取各节点的健康检查历史（proxy_core 为每个订阅 provider 开启了
+        health-check，interval 600s）：最近一次探测 delay<=0 判死（进 TTL 名单），
+        探测恢复成功则移出死名单——但只复活健康检查自己标记的，不动手动标记"""
+        now = time.time()
+        for name, p in proxies.items():
+            if not isinstance(p, dict):
+                continue
+            history = p.get("history") or []
+            if not history:
+                continue                        # 未探测过：不判死，给首次机会
+            last = history[-1].get("delay", 0) if isinstance(history[-1], dict) else 0
+            if last <= 0:
+                self._dead.setdefault(name, (now + PROXY_NODE_DEAD_TTL, False))
+            elif not (self._dead.get(name) or (0, False))[1]:
+                self._dead.pop(name, None)      # 仅复活非手动标记的条目
+
+    def _is_alive(self, name: str) -> bool:
+        ent = self._dead.get(name)
+        if ent is None:
+            return True
+        if time.time() >= ent[0]:
+            del self._dead[name]                # TTL 到期，允许复活重试
+            return True
+        return False
 
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self.secret}"} if self.secret else {}
@@ -69,6 +107,9 @@ class ClashCtl:
         proxies = body.get("proxies") if isinstance(body, dict) else None
         if not isinstance(proxies, dict):
             return {"name": "", "all": [], "now": ""}
+        # 顺带消费健康检查结果更新死名单（本方法可能被锁内/锁外调用，
+        # _dead 只做 setdefault/pop 的 GIL 原子操作，不重复取锁防死锁）
+        self._update_dead_from_history(proxies)
         if self.group:
             g = proxies.get(self.group)
             if not isinstance(g, dict):
@@ -83,12 +124,20 @@ class ClashCtl:
         return {"name": "", "all": [], "now": ""}
 
     def list_nodes(self) -> list[str]:
-        """组内可轮换节点（过滤伪节点）；失败返回 []"""
+        """组内可轮换节点（过滤伪节点 + 死节点名单）；失败返回 []。
+
+        死节点全灭时回退返回未过滤列表（健康检查/手动标记都可能误判，
+        宁可轮换到死节点浪费一次请求，也不提前放弃整个 IP 池）"""
         try:
             g = self._fetch_group()
         except requests.RequestException:
             return []
-        return [n for n in g["all"] if n and n.upper() not in _PSEUDO]
+        alive = [n for n in g["all"] if n and n.upper() not in _PSEUDO]
+        filtered = [n for n in alive if self._is_alive(n)]
+        if 0 < len(filtered) < len(alive):
+            print(f"[Clash] 节点池 {len(alive)} 个，剔除当前不通 {len(alive) - len(filtered)} 个"
+                  f"（健康检查/故障上报，TTL {PROXY_NODE_DEAD_TTL}s 后允许复活）")
+        return filtered or alive
 
     def refresh_nodes(self) -> list[str]:
         """刷新并缓存节点列表"""

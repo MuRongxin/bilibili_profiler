@@ -41,3 +41,5 @@ data/cookies/
 vendor/mihomo*
 data/mihomo*
 data/*.log
+data/profiler.db-wal
+data/profiler.db-shm

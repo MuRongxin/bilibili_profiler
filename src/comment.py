@@ -12,6 +12,7 @@ from contextlib import closing
 from api_client import BiliAPIClient
 from config import COMMENT_MAIN_WBI_URL, COMMENT_MAIN_URL, COMMENT_REPLY_URL
 from config import MAX_COMMENT_PAGES, COMMENT_REPLY_MAX_PAGES, CHARGE_LIST_URL
+from config import COMMENT_REFRESH_MAX_PAGES
 from storage import get_db, get_phase_state, load_comments, save_comments, set_phase_state
 from uid_resolver import calc_crc32
 
@@ -285,6 +286,67 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int,
     if bvid and natural_end:
         set_phase_state(bvid, "comment", "done", "1")
     return all_comments
+
+
+def refresh_comments(oid: int, client: BiliAPIClient, bvid: str,
+                     max_pages: int = COMMENT_REFRESH_MAX_PAGES) -> int:
+    """评论增量刷新（评论已采完整即 done=1 的视频重跑时由阶段3调用）。
+
+    主采集按热度序（mode=3），新评论在热度序里位置不定，无法判定增量边界；
+    故刷新改用时间倒序（mode=2）从最新往回翻，整页都是已入库 rpid 即停。
+    新主评论照常补采子评论；已见主评论轻量回写（ON CONFLICT 更新
+    like/reply_count/uname/location，顺带刷新旧评论热度，不重复补采子评论）。
+    任何失败只告警、保留已刷新部分；不写任何检查点（done 保持 1）。
+    返回本轮新增主评论数。"""
+    with closing(get_db()) as conn:
+        seen_rpids = {row["rpid"] for row in conn.execute(
+            "SELECT rpid FROM comments WHERE bvid = ?", (bvid,))}
+    offset = ""
+    new_total = 0
+    for page in range(1, max_pages + 1):
+        try:
+            data = client.get(COMMENT_MAIN_WBI_URL, params={
+                "oid": oid,
+                "type": 1,
+                "mode": 2,       # 时间倒序：最新评论在前，增量边界可判定
+                "pagination_str": json.dumps({"offset": offset}),
+            })
+        except Exception as e:
+            print(f"[Comment] 增量刷新第{page}页请求异常（{e}），保留已刷新部分")
+            break
+        if data.get("code") != 0:
+            print(f"[Comment] 增量刷新第{page}页失败: {data.get('message')}，保留已刷新部分")
+            break
+        page_data = data.get("data") or {}
+        replies = page_data.get("replies") or []
+        if not replies:
+            break
+
+        stale_src = [r for r in replies if r.get("rpid") in seen_rpids]
+        new_replies = [r for r in replies if r.get("rpid") not in seen_rpids]
+        if new_replies:
+            page_comments = _collect_page(new_replies, oid, client)
+            save_comments(bvid, page_comments)
+            seen_rpids.update(r.get("rpid") for r in new_replies)
+            new_total += len(new_replies)
+        # 已见主评论轻量回写：刷新 like/reply_count 等（高回复榜热度不再停在首采快照）
+        stale = [c for c in (_parse_comment(r, is_sub=False) for r in stale_src) if c]
+        if stale:
+            save_comments(bvid, stale)
+        print(f"[Comment] 增量刷新第 {page}/{max_pages} 页: +{len(new_replies)} 条新主评论")
+
+        if not new_replies:
+            break   # 整页都是已见评论：到达增量边界
+        cursor = page_data.get("cursor") or {}
+        next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
+        if cursor.get("is_end", False) or not next_offset:
+            break
+        offset = next_offset
+    else:
+        print(f"[Comment] 增量刷新达上限 {max_pages} 页，可能还有更多新评论（可调大 COMMENT_REFRESH_MAX_PAGES）")
+
+    print(f"[Comment] 增量刷新完成：新增主评论 {new_total} 条")
+    return new_total
 
 
 def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT_PAGES,

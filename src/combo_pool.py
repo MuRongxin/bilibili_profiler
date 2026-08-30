@@ -195,6 +195,10 @@ class ComboPool:
             self._strip_proxy()
             return
         if self._clash:
+            # 故障即把当前节点记入死名单（即时反应，不等 600s 一轮的健康检查），再切下一个
+            cur = self._clash.current_node()
+            if cur:
+                self._clash.mark_dead(cur)
             nxt = self._clash.pick_next_node()
             if nxt and self._clash.switch_node(nxt):
                 print(f"[Pool] 代理连接失败，已切换节点 → {nxt}（第 {self._proxy_fail_streak} 次）")
@@ -282,6 +286,9 @@ def _proxy_selfcheck(pool: ComboPool, max_tries: int = 5) -> bool:
         except Exception:
             pass
         if pool._clash and attempt < max_tries - 1:
+            cur = pool._clash.current_node()
+            if cur:
+                pool._clash.mark_dead(cur)      # 自检不通的节点直接进死名单，轮换不再选中
             nxt = pool._clash.pick_next_node()
             if nxt and pool._clash.switch_node(nxt):
                 print(f"[Pool] 自检节点不通，切换到 [{nxt}] 重试")
