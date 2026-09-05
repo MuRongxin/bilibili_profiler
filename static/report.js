@@ -142,9 +142,47 @@ function fpToggle(btn) {
 // UP主悬停词云弹窗：旧版缓存画像的词频随页面注入（upWcData）；新口径采集阶段只存关注名单，
 // 词云在悬停时经 /api/up/<uid>/wordcloud 懒加载（服务端 llm_cache 键 up:{uid} 缓存复用）
 const upWcData = PAGE_DATA.upWordcloud || {};
-const upWcCache = {};   // 懒加载结果前端缓存：upUid → words
+const upWcCache = {};   // 词云结果前端缓存：upUid → words
+const upWcInflight = {};   // upUid → Promise（在途去重：预热与悬停共享同一请求）
 const popup = document.getElementById('wc-popup');
 const popupCanvas = document.getElementById('wc-popup-canvas');
+
+function fetchUpWc(upUid) {
+    /* 取词云（带在途去重与缓存）：预热队列和悬停 handler 共用 */
+    if (upWcCache[upUid]) return Promise.resolve(upWcCache[upUid]);
+    if (upWcInflight[upUid]) return upWcInflight[upUid];
+    upWcInflight[upUid] = fetch('/api/up/' + encodeURIComponent(upUid) + '/wordcloud')
+        .then(r => r.json())
+        .then(j => {
+            if (j && j.words && j.words.length) { upWcCache[upUid] = j.words; return j.words; }
+            return null;
+        })
+        .catch(() => null)
+        .finally(() => { delete upWcInflight[upUid]; });
+    return upWcInflight[upUid];
+}
+
+// 视口预热：进入视口附近（200px 余量）的 chip 进入慢速队列逐个预取（间隔 700ms，
+// 与批量采集的限速节奏相当），用户悬停时多半已命中前端/服务端缓存而瞬开
+const wcWarmQueue = [];
+const wcWarmQueued = new Set();
+let wcWarmTimer = null;
+function wcWarmNext() {
+    const uid = wcWarmQueue.shift();
+    if (!uid) { wcWarmTimer = null; return; }
+    fetchUpWc(uid).finally(() => { wcWarmTimer = setTimeout(wcWarmNext, 700); });
+}
+const wcObserver = new IntersectionObserver(entries => {
+    for (const en of entries) {
+        const uid = en.target.dataset && en.target.dataset.upUid;
+        if (en.isIntersecting && uid && !upWcCache[uid] && !wcWarmQueued.has(uid)) {
+            wcWarmQueued.add(uid);
+            wcWarmQueue.push(uid);
+        }
+    }
+    if (wcWarmQueue.length && !wcWarmTimer) wcWarmNext();
+}, {rootMargin: '200px'});
+document.querySelectorAll('.up-chip[data-up-uid]').forEach(c => wcObserver.observe(c));
 
 function showUpWc(chip, data) {
     if (!data || data.length === 0) return;
@@ -190,17 +228,12 @@ document.querySelectorAll('.up-chip').forEach(chip => {
         if (!upUid) return;                         // 旧缓存画像无 uid：纯展示
         if (upWcCache[upUid]) { showUpWc(this, upWcCache[upUid]); return; }
         showUpWcText(this, '加载中…');
-        fetch('/api/up/' + encodeURIComponent(upUid) + '/wordcloud')
-            .then(r => r.json().then(j => ({ok: r.ok, j})))
-            .then(({ok, j}) => {
-                if (ok && j.words && j.words.length) {
-                    upWcCache[upUid] = j.words;
-                    showUpWc(this, j.words);        // 悬停未移开则直接展示
-                } else {
-                    showUpWcText(this, j.error || '该 UP 主暂无投稿数据');
-                }
-            })
-            .catch(() => showUpWcText(this, '网络错误'));
+        const chip = this;
+        fetchUpWc(upUid).then(words => {
+            // 悬停已移开则不展示（用户只是路过）
+            if (words) { if (chip.matches(':hover')) showUpWc(chip, words); }
+            else if (chip.matches(':hover')) showUpWcText(chip, '该 UP 主暂无投稿数据或加载失败');
+        });
     });
     chip.addEventListener('mouseleave', function() { popup.style.display = 'none'; });
 });

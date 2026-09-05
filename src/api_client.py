@@ -199,7 +199,7 @@ class BiliAPIClient:
         if self._throttle < old:
             print(f"[API] 单元采集成功，降速倍率回落: {old:.2f} → {self._throttle:.2f}")
 
-    def _sleep_if_needed(self, url: str):
+    def _sleep_if_needed(self, url: str, immediate: bool = False):
         # -412 全局冷却：本方法在 _request_locked 的锁内执行，
         # 冷却等待会阻塞其他线程拿锁，即所有请求一起暂停（全局冷却的预期语义）
         remaining = self._risk_cooldown_until - time.time()
@@ -207,6 +207,10 @@ class BiliAPIClient:
             if remaining > 1:
                 print(f"[API] 风控冷却中，等待 {remaining:.0f} 秒...")
             time.sleep(remaining)
+        # immediate=True：交互式单次请求（如报告页悬停词云）跳过随机限速间隔——
+        # 限速是批量采集的风控约束，人点一下不属于批量行为；风控冷却仍然生效。
+        if immediate:
+            return
         # 区间内随机取间隔（消除固定节奏特征），再乘自适应倍率
         lo, hi = REQUEST_DELAY_LONG if self._is_risk_api(url) else REQUEST_DELAY
         delay = random.uniform(lo, hi) * self._throttle
@@ -215,15 +219,15 @@ class BiliAPIClient:
             time.sleep(delay - elapsed)
         self._last_request_time = time.time()
 
-    def _request_locked(self, method: str, url: str, **kwargs) -> requests.Response:
+    def _request_locked(self, method: str, url: str, immediate: bool = False, **kwargs) -> requests.Response:
         """限速与请求发出原子化（线程安全）；全局冷却等待在锁内的 _sleep_if_needed 中执行"""
         with self._lock:
-            self._sleep_if_needed(url)
+            self._sleep_if_needed(url, immediate=immediate)
             # setdefault：调用方显式传 timeout（如 _get_wbi_key 的 timeout=10）时保留，避免关键字冲突
             kwargs.setdefault("timeout", 15)
             return self.session.request(method, url, **kwargs)
 
-    def get(self, url: str, params: dict = None, headers: dict = None, **kwargs) -> dict:
+    def get(self, url: str, params: dict = None, headers: dict = None, immediate: bool = False, **kwargs) -> dict:
         merged_headers = {**(headers or {})}
         params = dict(params or {})
 
@@ -237,7 +241,8 @@ class BiliAPIClient:
 
         for attempt in range(MAX_RETRY):
             try:
-                resp = self._request_locked("GET", url, params=params, headers=merged_headers, **kwargs)
+                resp = self._request_locked("GET", url, params=params, headers=merged_headers,
+                                            immediate=immediate, **kwargs)
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("code") == -412:

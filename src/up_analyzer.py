@@ -9,6 +9,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import USER_VIDEOS_LEGACY_URL, USER_CARD_URL, COLLECT_WORKERS
+from api_client import BiliAPIClient
 
 
 def _tokenize(text: str) -> list[str]:
@@ -136,6 +137,32 @@ def analyze_up(uid: int, client) -> dict:
     except Exception as e:
         print(f"  [UP] 警告: 投稿列表接口异常（UID:{uid}）: {e}")
 
+    return result
+
+
+def fetch_up_wordcloud(uid: int, client: BiliAPIClient) -> dict:
+    """轻量词云采集（报告页悬停懒加载专用）：只发 1 个投稿列表请求，且走
+    immediate 交互式免限速通道（悬停是单次交互，不属批量采集）——
+    对比 analyze_up 的名片+投稿双请求，出词延迟从「2 次限速+2 次网络」降到 1 次网络。
+    UP 主昵称从投稿列表响应顺带取（vlist[0].author），名片接口不再调。
+    返回 {"name": str, "word_freq": {词: 次}}；失败返回空词频。"""
+    result = {"name": "", "word_freq": {}}
+    try:
+        data = client.get(USER_VIDEOS_LEGACY_URL, params={
+            "mid": uid, "ps": 50, "pn": 1,
+            "order": "pubdate", "order_avoided": "true",
+        }, immediate=True)
+        if data.get("code") == 0:
+            vlist = data["data"]["list"]["vlist"]
+            if vlist:
+                result["name"] = vlist[0].get("author", "")
+            wf: dict[str, int] = {}
+            for v in vlist:
+                for w in _tokenize(v.get("title", "")):
+                    wf[w] = wf.get(w, 0) + 1
+            result["word_freq"] = wf
+    except Exception as e:
+        print(f"  [UP] 警告: 词云轻量采集异常（UID:{uid}）: {e}")
     return result
 
 

@@ -367,6 +367,15 @@ def save_user_data(uid: int, name: str, level: int, user_data: dict, profile: di
         conn.commit()
 
 
+def update_user_profile(uid: int, profile: dict):
+    """只更新 users.profile_json（阶段7 LLM 深掘结果注入后回写用；
+    不重写 data_json/collected_at——深掘在阶段6落库之后运行）"""
+    with closing(get_db()) as conn:
+        conn.execute("UPDATE users SET profile_json = ? WHERE uid = ?",
+                     (json.dumps(profile, ensure_ascii=False), uid))
+        conn.commit()
+
+
 def load_user_data(uid: int) -> tuple[dict, dict] | None:
     """加载用户数据和画像"""
     with closing(get_db()) as conn:

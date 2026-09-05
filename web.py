@@ -37,7 +37,7 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      USER_TIMELINE_MAX_VIDEOS, USER_TIMELINE_SAMPLES,
                      CROSS_VIDEO_MIN_VIDEOS, CROSS_VIDEO_MAX_USERS, DENSITY_BUCKETS,
                      COMMENT_HEAT_REPLY_WEIGHT, PROBLEM_COMMENT_TOP_N,
-                     ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_MAX_N, USER_CARD_URL,
+                     ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_MAX_N, USER_CARD_URL, NAV_URL,
                      REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, ANALYZE_MAX_TARGETS)
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
@@ -52,7 +52,7 @@ from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
 from combo_pool import build_pool
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
-from up_analyzer import analyze_up
+from up_analyzer import analyze_up, fetch_up_wordcloud
 from spam_detector import batch_detect_spam, detect_repeat_events, pool_distribution_from_rows
 from llm_analyzer import LLMAnalyzer
 from up_analyzer import _tokenize
@@ -2338,11 +2338,10 @@ def api_up_wordcloud(uid: int):
         return jsonify({"error": "正在采集中，请稍候再悬停"}), 202
     try:
         client = _get_client()
-        info = analyze_up(uid, client)
+        # 轻量采集：只发 1 个投稿列表请求（交互式免限速通道），悬停出词≈单次网络延迟
+        info = fetch_up_wordcloud(uid, client)
         words = sorted((info.get("word_freq") or {}).items(), key=lambda x: x[1], reverse=True)[:80]
-        data = {"words": [[w, c] for w, c in words], "name": info.get("name", ""),
-                "follower": info.get("follower", 0), "video_count": info.get("video_count", 0),
-                "top_category": info.get("top_category", "")}
+        data = {"words": [[w, c] for w, c in words], "name": info.get("name", "")}
         save_llm_cache(key, json.dumps(data, ensure_ascii=False))
         return jsonify(data)
     except CookieInvalidError as e:
@@ -2633,6 +2632,15 @@ if __name__ == "__main__":
 
     _write_pid(port)
     atexit.register(lambda: _clear_pid(port))
+
+    # 鉴权威胁热身（后台线程，不阻塞启动）：BiliAPIClient 首次请求的 buvid3/
+    # bili_ticket/WBI 密钥获取约 2-3s，提前完成让首次悬停词云也是 ~0.2s
+    def _warm_client():
+        try:
+            _get_client().get(NAV_URL, immediate=True)
+        except Exception:
+            pass
+    threading.Thread(target=_warm_client, daemon=True).start()
 
     def _on_term(signum, frame):
         # SIGTERM（来自 web.py --stop）：清 pidfile 后退出，端口随即释放

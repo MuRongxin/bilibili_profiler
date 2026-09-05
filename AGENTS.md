@@ -45,7 +45,7 @@ src/
 ├── main.py              # 主控流程：登录→弹幕(实时+历史)→刷屏检测→问题弹幕检测→评论→兴趣分UID解析（+问题评论作者直引 select_problem_comment_authors）→用户采集→画像分析→LLM深掘→报告
 ├── web_autostart.py     # 分析完毕自动启动 web.py 并打开报告页（maybe_launch_web，WEB_AUTOSTART 开关）
 ├── config.py            # 全部配置常量：API 端点、限速/重试、采集翻页上限、LLM 配置（含 API Key，已被 .gitignore 排除）
-├── api_client.py        # BiliAPIClient：HTTP 封装（线程安全限速（区间内随机：基础0.8–1.6s/高风险2–4s）、自适应降速（触发风控×1.5、成功缓慢回落）、重试退避、-412及重签无效的-352/-403风控全局冷却（仅 WBI 端点走重签）、Cookie、WBI签名（密钥获取失败 60s 负缓存）、bili_ticket/buvid3（失败 300s 后可重试）；post() 与 get() 同风控语义）
+├── api_client.py        # BiliAPIClient：HTTP 封装（线程安全限速（区间内随机：基础0.8–1.6s/高风险2–4s）、自适应降速（触发风控×1.5、成功缓慢回落）、重试退避、-412及重签无效的-352/-403风控全局冷却（仅 WBI 端点走重签）、Cookie、WBI签名（密钥获取失败 60s 负缓存）、bili_ticket/buvid3（失败 300s 后可重试）；post() 与 get() 同风控语义；get(immediate=True) 为交互式单次请求免限速通道——仅报告页悬停词云用，风控冷却仍生效）
 ├── clash_ctl.py         # Clash/mihomo 控制器封装（列节点/切节点换出口 IP，跨地区跳跃轮换，失败静默降级；死节点名单：健康检查历史判死 + 代理故障即时上报 mark_dead，TTL 复活，全灭回退不过滤）
 ├── proxy_core.py        # 内置 mihomo 核心生命周期（SUB_URLS 多订阅→127.0.0.1 随机端口代理+控制器，零安装；自动下载锁定版本且经官方 SHA256 校验不匹配拒绝执行、github.com 直连优先；PDEATHSIG 防孤儿驻留，stop 时清理含凭证 config.yaml）
 ├── combo_pool.py        # 账号×IP 组合池（鸭子类型模拟 BiliAPIClient；风控换"新号+新IP"重试，冷却按截止时刻锁外等待（单账号池冷却缩至 SINGLE_ACCOUNT_RISK_COOLDOWN=120s），IP 池故障摘代理降级直连、每 PROXY_RETRY_AFTER=600s 重探恢复；注意内置核心为单 mixed-port 单 select 组，IP 维度全局单点：所有账号共享同一出口 IP）
@@ -59,8 +59,8 @@ src/
 ├── cringe_detector.py   # LLM 问题弹幕检测（八类判定+发送者聚合+llm_cache缓存，key 带口径版本号 v4，批次响应先解析校验成功才落缓存）+ 问题评论检测（同口径，按内容缓存判定、回映 rpid 回写 comments.problem，未配置 LLM_API_KEY 自动跳过；致命 4xx 直接上抛由 phase 层降级，瞬态错误同厂商短退避，整轮重试 LLM_RETRY_BUDGET_SECONDS=1800s 熔断）
 ├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；采集全程走账号×IP 组合池（combo_pool，鸭子类型透明接管：多号并行分片（每账号一子池、限速按号独立、线程↔分片绑定、吞吐≈账号数倍）、风控换号+切节点重试，冷却锁外等待，IP 池故障自动降级直连并定时重探恢复）；单用户日志行缓冲、完成时原子输出，多线程不交错）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
-├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存，OpenAI client 初始化时复用、单次调用超时 LLM_DEEP_TIMEOUT=120s；全员粗筛已砍，未配置 Key 自动跳过）
-├── up_analyzer.py       # UP 主相关分析（analyze_up：名片+最近一页投稿两请求并行、标题分词词频；采集阶段只存全部关注名单，被关注 UP 主的投稿词云在悬停 chip 时经 /api/up/<uid>/wordcloud 懒加载，`up:{uid}` 缓存）
+├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存，OpenAI client 初始化时复用、单次调用超时 LLM_DEEP_TIMEOUT=120s；结果注入 profile 并由阶段7回写 users.profile_json（web 报告读库展示，不落库则报告页不可见）；全员粗筛已砍，未配置 Key 自动跳过）
+├── up_analyzer.py       # UP 主相关分析（analyze_up：名片+最近一页投稿两请求并行、标题分词词频；采集阶段只存全部关注名单，被关注 UP 主的投稿词云在悬停 chip 时经 /api/up/<uid>/wordcloud 懒加载——走 fetch_up_wordcloud 轻量路径（单请求+immediate 免限速），`up:{uid}` 缓存；web 启动时后台热身鉴权威胁，前端视口内 chip 慢速队列预热+在途去重）
 ├── report.py            # 报告渲染函数库（用户卡片/问题弹幕榜/图表统计/基础CSS，被 web.py 复用）
 ├── exporter.py          # CSV/JSON 数据导出（report_{BV号}_{时间} 前缀，Web 报告页提供下载链接）
 └── storage.py           # SQLite 持久化（data/profiler.db，get_db 统一 WAL + busy_timeout=10000 + synchronous=NORMAL），支撑断点续采与 LLM 结果缓存（llm_cache 表、danmaku 全量弹幕表（含 mode/color/pool/dmid/page 属性列）、comments 评论表（含 uname 昵称、parent_rpid 回复树、problem 问题标注、location IP属地）、false_positive 误报标记表（kind: dm=弹幕内容/cmt=评论rpid/spam=发送者mid_hash，展示层扣除聚合）、phase_state 阶段检查点表（弹幕历史 last_date/fetched_dates/failed_dates/truncated、评论游标，中断续采））

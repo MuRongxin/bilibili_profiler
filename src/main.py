@@ -17,7 +17,7 @@ from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USE
                     COMMENT_AUTHOR_MIN_SEVERITY, COMMENT_AUTHOR_MIN_HITS)
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_video_info
-from storage import load_user_data, has_user_data, load_senders
+from storage import load_user_data, has_user_data, load_senders, update_user_profile
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
 from storage import save_comments, update_comment_problems
 from storage import load_danmaku, load_comments, append_danmaku
@@ -784,6 +784,12 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]):
             uid = p.get("uid")
             if uid in deep:
                 p["ai_deep"] = deep[uid]
+                # 深掘结果必须落库：web 报告读的是 users.profile_json，
+                # 阶段6已在深掘前落库，这里注入后不回写的话报告页永远看不到
+                try:
+                    update_user_profile(uid, p)
+                except Exception as e:
+                    print(f"[Phase 7] 警告: UID:{uid} 深掘结果落库失败（{e}），重跑可补")
         print(f"[Phase 7] 完成: {len(deep)} 人生成深度画像")
     except Exception as e:
         print(f"[Phase 7] LLM 分析失败: {e}")
