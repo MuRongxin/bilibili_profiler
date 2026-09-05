@@ -9,6 +9,7 @@ B站弹幕发送者用户画像分析系统 — 主控流程
 import sys
 import os
 import argparse
+import threading
 from datetime import datetime
 
 from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USERS_RATIO,
@@ -607,12 +608,16 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
 
     user_data_map = {}
     processed = set()
+    print_lock = threading.Lock()   # 单用户日志原子输出锁：多线程分片并行时不交错
 
     def collect_one(mid_hash, uid, sub_pool, idx):
         """采集单个用户：缓存命中跳过；成功立即落库（断点续采），降速倍率回落一档。
         组合池接管风控轮换与兜底冷却；兜底耗尽抛 RiskControlError，按失败跳过本 uid。
         缓存读写（sqlite）异常同样纳入逐人容错：打印警告降级处理，
-        不得从 fut.result() 炸穿整个阶段5。返回 (uid, data|None)。"""
+        不得从 fut.result() 炸穿整个阶段5。返回 (uid, data|None)。
+
+        该用户的采集过程日志进行级缓冲（log=buf.append），完成时持锁一次性
+        整块输出——多号并行分片下不再出现 A/B 两个用户的日志逐行交错。"""
         print(f"  [{idx}/{total}] 采集 UID:{uid}...")
         # 检查是否已缓存（--force 时跳过缓存强制重采，结果覆盖写 users 表）
         if not force:
@@ -624,25 +629,35 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
             if cached:
                 print(f"  [缓存] UID:{uid} 使用已采集数据")
                 return uid, cached[0]
+        buf: list[str] = []
         try:
-            data = collect_user_data(uid, sub_pool)
+            data = collect_user_data(uid, sub_pool, log=buf.append)
         except Exception as e:
             data = {"error": str(e)}
         if "error" in data:
             # 失败不落库，重跑时会重新采集
-            print(f"  [失败] UID:{uid} {data['error']}")
+            with print_lock:
+                for line in buf:
+                    print(line)
+                print(f"  [{idx}/{total}] [失败] UID:{uid} {data['error']}")
             return uid, None
         # 立即落库：Ctrl+C 中断后已采集数据不丢失，重跑时命中上方缓存跳过。
         # profile 暂存空 dict，阶段6分析后以 INSERT OR REPLACE 覆盖
+        save_err = None
         try:
             save_user_data(uid, data.get("name", ""), data.get("level", 0), data, {})
         except Exception as e:
             # 落库失败不丢内存数据：本轮画像分析仍可用，仅重跑时会重新采集
-            print(f"  [警告] UID:{uid} 落库失败（{e}），本轮继续使用内存数据，重跑将重新采集")
+            save_err = e
         # 单元级成功：降速倍率回落一档（sub_pool 可能是裸 client，做鸭子兼容）
         used = sub_pool.current[1] if hasattr(sub_pool, "current") else sub_pool
         if hasattr(used, "reward_throttle_batch"):
             used.reward_throttle_batch()
+        with print_lock:
+            for line in buf:
+                print(line)
+            if save_err:
+                print(f"  [警告] UID:{uid} 落库失败（{save_err}），本轮继续使用内存数据，重跑将重新采集")
         return uid, data
 
     # 多号并行分片：限速是 per-client 实例的，N 个账号并行 ≈ N 倍吞吐；

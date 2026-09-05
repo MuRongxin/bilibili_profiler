@@ -76,9 +76,17 @@ def analyze_up(uid: int, client) -> dict:
         "word_freq": {},  # 标题词频
     }
 
+    # 名片与投稿列表两个请求互不依赖，并行发出（懒加载场景下词云出图时间直接减半）
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        card_fut = ex.submit(lambda: client.get(USER_CARD_URL, params={"mid": uid}))
+        videos_fut = ex.submit(lambda: client.get(USER_VIDEOS_LEGACY_URL, params={
+            "mid": uid, "ps": 50, "pn": 1,
+            "order": "pubdate", "order_avoided": "true",
+        }))
+
     # 获取 UP主 基础信息
     try:
-        card = client.get(USER_CARD_URL, params={"mid": uid})
+        card = card_fut.result()
         if card.get("code") == 0:
             cdata = card["data"].get("card", {})
             result["name"] = cdata.get("name", "")
@@ -92,10 +100,7 @@ def analyze_up(uid: int, client) -> dict:
 
     try:
         # 分区分析依赖 typeid，新接口 recArchivesByKeywords 不返回分区，固定用旧 arc/search
-        data = client.get(USER_VIDEOS_LEGACY_URL, params={
-            "mid": uid, "ps": 50, "pn": 1,
-            "order": "pubdate", "order_avoided": "true",
-        })
+        data = videos_fut.result()
         if data.get("code") == 0:
             vlist = data["data"]["list"]["vlist"]
             result["video_count"] = data["data"]["page"]["count"]

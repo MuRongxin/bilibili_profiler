@@ -8,6 +8,7 @@
 """
 import json
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from api_client import BiliAPIClient
 from config import COMMENT_MAIN_WBI_URL, COMMENT_MAIN_URL, COMMENT_REPLY_URL
@@ -109,23 +110,47 @@ def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
 
 
 def _collect_page(replies: list, oid: int, client: BiliAPIClient) -> list[dict]:
-    """解析一页主评论及其子评论（含补采）"""
-    comments = []
+    """解析一页主评论及其子评论（含补采）。
+
+    子评论补采并行化：各主楼的楼中楼补采互相独立（wbi 主评论游标翻页是链式依赖
+    无法分片，这里才是时间大头——实测子评论约占评论总量 3/4），client 为组合池
+    且有多个分片时按账号分片并发补采（限速按号独立，吞吐≈账号数倍）；
+    单池/裸 client 时保持串行。组装顺序不变：主评论紧跟其子评论。"""
+    # 1) 主评+内嵌预览先按页序落位，需补采的主楼记录待办
+    page_items: list[tuple[dict, list]] = []   # (主评论, 预览子评论)
+    pending: list[tuple] = []                  # (rpid, rcount, preview)
     for r in replies:
         main = _parse_comment(r, is_sub=False)
         if not main:
             continue
-        comments.append(main)
-
-        # 内嵌预览子评论
         preview = []
         for sub in r.get("replies") or []:
             c = _parse_comment(sub, is_sub=True)
             if c:
                 preview.append(c)
+        page_items.append((main, preview))
+        if main["reply_count"] > len(preview):
+            pending.append((main["rpid"], main["reply_count"], preview))
 
-        # 子评论记录所属主评论 root_rpid（「高回复评论」页据此关联争议主楼与回复）
-        subs = _fetch_sub_replies(oid, r.get("rpid"), main["reply_count"], preview, client)
+    # 2) 补采（并发或串行）
+    subs_map: dict = {}
+    if pending:
+        shards = client.shard_pools() if hasattr(client, "shard_pools") else []
+        if len(shards) > 1:
+            with ThreadPoolExecutor(max_workers=len(shards)) as ex:
+                futs = {ex.submit(_fetch_sub_replies, oid, rpid, rc, pv, shards[i % len(shards)]): rpid
+                        for i, (rpid, rc, pv) in enumerate(pending)}
+                for fut in as_completed(futs):
+                    subs_map[futs[fut]] = fut.result()
+        else:
+            for rpid, rc, pv in pending:
+                subs_map[rpid] = _fetch_sub_replies(oid, rpid, rc, pv, client)
+
+    # 3) 组装：子评论记录所属主评论 root_rpid（「高回复评论」页据此关联争议主楼与回复）
+    comments = []
+    for main, preview in page_items:
+        comments.append(main)
+        subs = subs_map.get(main["rpid"], preview)
         for c in subs:
             c["root_rpid"] = main["rpid"]
         comments.extend(subs)
@@ -356,21 +381,44 @@ def harvest_comment_uids(oid: int, client: BiliAPIClient, bvid: str,
     不落评论内容、不补采子评论——目的是提高弹幕发送者解析率（评论者即明文 UID 源），
     收割结果沉淀 global_uid_map（来源「评论收割」，明文优先级），跨视频复用。
 
-    断点：phase_state(bvid, "uid_harvest", page/offset/done)，中断/达累计上限
-    （UID_HARVEST_MAX_PAGES，跨运行累计）下轮续翻。done=1 后重跑转为刷新模式：
-    时间序（mode=2）从最新往回翻，整页无新 uid（对照本视频已入库评论 + 全局映射库
-    + 本轮已收）即停。单页失败只告警中断本轮（不写 done）。
+    断点：phase_state(bvid, "uid_harvest", page/offset/mode/done)，中断/达累计上限
+    （UID_HARVEST_MAX_PAGES，跨运行累计）下轮续翻。首轮启动判据：正文未被截断且
+    评论表非空时收割无增量价值（全部评论者 uid 已在库），直接标 done 跳过
+    （评论采集整体失败、表为空时例外——收割是唯一 UID 来源，不能跳）；
+    正文被截断且有 wbi 游标时接续其热度序游标翻页——热度序与时间序的页码互不
+    对应，但截断点之后恰是正文未覆盖的部分，不必从第 1 页重扫。done=1 后重跑转为
+    刷新模式：时间序（mode=2）从最新往回翻，整页无新 uid（对照本视频已入库
+    评论 + 全局映射库 + 本轮已收）即停。单页失败只告警中断本轮（不写 done）。
     返回本轮新收割的 {crc32_hex: uid}。"""
     done = get_phase_state(bvid, "uid_harvest", "done") == "1"
     # 已知集合：本视频已入库评论 uid + 全局映射库 uid（碰撞守卫：crc 已被占且 uid 不同则跳过）
-    known_uids: set[int] = {c["uid"] for c in load_comments(bvid)}
+    local_uids: set[int] = {c["uid"] for c in load_comments(bvid)}
+    known_uids: set[int] = set(local_uids)
     global_map = load_global_uid_map()
     known_uids.update(v["uid"] for v in global_map.values())
 
-    offset, page_start = "", 0
+    offset, page_start, mode = "", 0, 2
     if not done:
         page_start = int(get_phase_state(bvid, "uid_harvest", "page") or 0)
         offset = get_phase_state(bvid, "uid_harvest", "offset") or ""
+        if page_start or offset:
+            mode = int(get_phase_state(bvid, "uid_harvest", "mode") or 2)   # 续翻沿用原模式
+        else:
+            # 首轮启动判据：
+            # 1) 正文未被截断且评论表非空 → 全部评论者 uid 已在库，专门收割无增量价值，
+            #    标 done 跳过（后续重跑走刷新模式捕捉新评论者）；
+            #    例外：评论采集整体失败（表空）时收割是唯一 UID 来源，不能跳；
+            # 2) 正文被截断且有 wbi 游标 → 接续热度序游标翻页，不重扫已采页
+            c_truncated = get_phase_state(bvid, "comment", "truncated") == "1"
+            if not c_truncated and local_uids:
+                print("[Comment] UID收割：评论已完整采集（无截断），评论者 UID 已在库，跳过收割")
+                set_phase_state(bvid, "uid_harvest", "done", "1")
+                return {}
+            if (c_truncated and get_phase_state(bvid, "comment", "mode") == "wbi"
+                    and (get_phase_state(bvid, "comment", "offset") or "")):
+                offset = get_phase_state(bvid, "comment", "offset")
+                mode = 3
+                print("[Comment] UID收割：正文采集被截断，从热度序截断游标接续翻页（不重扫已采页）")
         if page_start:
             print(f"[Comment] UID收割续翻：从第 {page_start + 1} 页继续")
     else:
@@ -384,7 +432,7 @@ def harvest_comment_uids(oid: int, client: BiliAPIClient, bvid: str,
             data = client.get(COMMENT_MAIN_WBI_URL, params={
                 "oid": oid,
                 "type": 1,
-                "mode": 2,       # 时间序：与正文采集的热度序错开，且刷新模式边界可判定
+                "mode": mode,    # 首轮沿用正文热度序游标（截断场景）或时间序；刷新固定时间序
                 "pagination_str": json.dumps({"offset": offset}),
             })
         except Exception as e:
@@ -435,6 +483,7 @@ def harvest_comment_uids(oid: int, client: BiliAPIClient, bvid: str,
         if not done:
             set_phase_state(bvid, "uid_harvest", "page", str(page))
             set_phase_state(bvid, "uid_harvest", "offset", offset)
+            set_phase_state(bvid, "uid_harvest", "mode", str(mode))
     else:
         print(f"[Comment] UID收割达累计上限 {max_pages} 页，剩余评论区下轮续翻"
               f"（可调大 UID_HARVEST_MAX_PAGES）")

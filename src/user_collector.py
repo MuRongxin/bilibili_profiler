@@ -452,14 +452,19 @@ def analyze_activity_pattern(timestamps: list[int]) -> dict:
 
 # ========== 统一采集接口 ==========
 
-def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
+def collect_user_data(uid: int, client: BiliAPIClient, log=None) -> dict:
     """
     采集用户完整深度数据（四维度）
-    
+
+    log: 日志输出函数（默认 print）。多号并行分片采集时调用方传入行缓冲，
+    把单用户的采集日志攒成原子块输出，避免多线程交错混排。
+
     Returns:
         包含所有维度的完整数据dict
     """
-    print(f"  [Collect] UID:{uid} 开始采集...")
+    if log is None:
+        log = print
+    log(f"  [Collect] UID:{uid} 开始采集...")
 
     # 维度1：主页信息
     card = get_user_card(uid, client)
@@ -491,12 +496,12 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
             user_data["favorite_contents"] = get_favorite_contents(folders[0]["id"], client)
         except Exception as e:
             # 收藏夹内容采集失败降级为空列表，不连累已采的主页/追番/收藏夹数据
-            print(f"  [Collect] 警告: UID:{uid} 收藏夹内容采集失败（{e}），降级为空列表")
+            log(f"  [Collect] 警告: UID:{uid} 收藏夹内容采集失败（{e}），降级为空列表")
             user_data["favorite_contents"] = []
     else:
         user_data["favorite_contents"] = []
 
-    print(f"  [Collect] UID:{uid} 维度1(主页/收藏)完成，采集互动足迹...")
+    log(f"  [Collect] UID:{uid} 维度1(主页/收藏)完成，采集互动足迹...")
 
     # 维度2：互动足迹
     try:
@@ -508,7 +513,7 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
     except Exception:
         user_data["dynamics"] = []
 
-    print(f"  [Collect] UID:{uid} 维度2(互动足迹)完成，采集社交关系...")
+    log(f"  [Collect] UID:{uid} 维度2(互动足迹)完成，采集社交关系...")
 
     # 维度3：社交网络
     try:
@@ -520,7 +525,7 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
     except Exception:
         user_data["followers"] = []
 
-    print(f"  [Collect] UID:{uid} 维度3(社交关系)完成，分析关注偏好/行为模式...")
+    log(f"  [Collect] UID:{uid} 维度3(社交关系)完成，分析关注偏好/行为模式...")
 
     # UP主关注偏好：只存关注名单本身（全部关注，uid+name+sign），不再逐个分析
     # 被关注 UP 主的投稿/词频——那部分挪到报告页悬停时按需懒加载（/api/up/<uid>/wordcloud），
@@ -537,5 +542,5 @@ def collect_user_data(uid: int, client: BiliAPIClient) -> dict:
     if dynamic_timestamps:
         user_data["first_seen"] = min(dynamic_timestamps)
 
-    print(f"  [Collect] UID:{uid} {user_data.get('name','')} Lv.{user_data.get('level',0)} 采集完成")
+    log(f"  [Collect] UID:{uid} {user_data.get('name','')} Lv.{user_data.get('level',0)} 采集完成")
     return user_data

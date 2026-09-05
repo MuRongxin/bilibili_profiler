@@ -1160,8 +1160,8 @@ def _cross_video_overlaps() -> list[dict]:
     每个视频附弹幕/评论明细样本（前端 <details> 展开查看「TA 在该视频说了什么」）：
     弹幕按发送时间倒序、评论按点赞降序各取 MAX_FOOTPRINT_*_SAMPLES 条；旧版本分析
     （danmaku 表无行）标注明细未留存。
-    返回 [{uid, name, video_count, total_dm, videos: [{bvid,title,dm_count,dm_samples,
-    cmt_count,cmt_samples,legacy}]}]，按视频数/弹幕数降序。"""
+    返回 [{uid, name, video_count, total_dm, videos: [{bvid,title,pubdate,dm_count,dm_samples,
+    cmt_count,cmt_samples,legacy}]}]（pubdate 为视频发布日期 YYYY-MM-DD，可空），按视频数/弹幕数降序。"""
     with closing(get_db()) as conn:
         rows = conn.execute('''
             SELECT s.uid, u.name, COUNT(DISTINCT s.bvid) AS vcnt, SUM(s.danmaku_count) AS total_dm
@@ -1176,13 +1176,24 @@ def _cross_video_overlaps() -> list[dict]:
         qmarks = ",".join("?" * len(uids))
         # (uid, bvid) → 视频标题、该用户在该视频的 mid_hash 列表与弹幕计数
         vinfo: dict[tuple[int, str], dict] = {}
+        # 视频发布日期按 bvid 只解析一次（video_info_json 里的 pubdate 为 Unix 时间戳，
+        # 非分析时间；解析失败/无 pubdate 留空串，渲染层不显示日期）
+        pubdate_cache: dict[str, str] = {}
         for r in conn.execute(f'''
-                SELECT s.uid, s.bvid, s.mid_hash, s.danmaku_count, v.title FROM senders s
+                SELECT s.uid, s.bvid, s.mid_hash, s.danmaku_count, v.title, v.video_info_json FROM senders s
                 JOIN videos v ON v.bvid = s.bvid
                 WHERE s.uid IN ({qmarks})
         ''', uids).fetchall():
+            if r["bvid"] not in pubdate_cache:
+                ts = 0
+                try:
+                    ts = int(json.loads(r["video_info_json"] or "{}").get("pubdate") or 0)
+                except Exception:
+                    pass
+                pubdate_cache[r["bvid"]] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
             ent = vinfo.setdefault((r["uid"], r["bvid"]), {
-                "title": r["title"] or r["bvid"], "mid_hashes": [], "dm_count": 0})
+                "title": r["title"] or r["bvid"], "pubdate": pubdate_cache[r["bvid"]],
+                "mid_hashes": [], "dm_count": 0})
             if r["mid_hash"] not in ent["mid_hashes"]:
                 ent["mid_hashes"].append(r["mid_hash"])
             ent["dm_count"] += r["danmaku_count"] or 0
@@ -1212,7 +1223,7 @@ def _cross_video_overlaps() -> list[dict]:
                     "ORDER BY like DESC, ctime DESC LIMIT ?",
                     (bvid, uid, MAX_FOOTPRINT_COMMENT_SAMPLES)).fetchall()]
             videos_by_uid.setdefault(uid, []).append({
-                "bvid": bvid, "title": ent["title"],
+                "bvid": bvid, "title": ent["title"], "pubdate": ent["pubdate"],
                 "dm_count": ent["dm_count"], "dm_samples": dm_samples[:MAX_FOOTPRINT_DANMAKU_SAMPLES],
                 "cmt_count": cmt_count, "cmt_samples": cmt_samples,
                 "legacy": legacy_cache[bvid],
@@ -1618,7 +1629,7 @@ def index():
                 cmt_lis = ('<li class="ov-none">评论未留存（该视频为旧版本分析）</li>'
                            if v["legacy"] else '<li class="ov-none">无评论</li>')
             return f'''<details class="xv-detail">
-                <summary><a href="/video/{esc(v["bvid"])}">《{esc(v["title"])}》</a>
+                <summary><a href="/video/{esc(v["bvid"])}">《{esc(v["title"])}》</a>{f'<span class="xv-counts">· {esc(v["pubdate"])}</span>' if v["pubdate"] else ""}
                     <span class="xv-counts">弹幕 {v["dm_count"]:,} · 评论 {v["cmt_count"]:,}</span></summary>
                 <div class="xv-sec">💬 弹幕样本</div><ul class="xv-list">{dm_lis}</ul>
                 <div class="xv-sec">📝 评论样本</div><ul class="xv-list">{cmt_lis}</ul>
@@ -1626,16 +1637,14 @@ def index():
 
         rows_html = "".join(f'''<tr>
             <td><a href="/user/{esc(o["uid"])}">{esc(o["name"])}</a></td>
-            <td>{o["video_count"]}</td>
             <td>{o["total_dm"]:,}</td>
             <td class="xv-videos">{"".join(_xv_video_block(v) for v in o["videos"])}</td>
         </tr>''' for o in overlaps)
         overlap_html = f'''
     <div class="xv-panel">
         <h2>🔁 跨视频重叠用户（{len(overlaps)} 人）</h2>
-        <p class="xv-note">在 ≥ {CROSS_VIDEO_MIN_VIDEOS} 个已分析视频中都发过弹幕的发送者——跨视频重复出现的账号是水军/带节奏的重点嫌疑对象。点视频条目可展开 TA 在该视频里的弹幕/评论明细。</p>
         <table class="video-table xv-table">
-            <thead><tr><th>用户</th><th>涉及视频数</th><th>总弹幕数</th><th>出现的视频（点条目展开明细）</th></tr></thead>
+            <thead><tr><th>用户</th><th>总弹幕数</th><th>出现的视频（点条目展开明细）</th></tr></thead>
             <tbody>{rows_html}</tbody>
         </table>
     </div>'''
@@ -1809,9 +1818,10 @@ def video_page(bvid: str):
         f'更早的弹幕不在统计范围内。已解析发送者是按兴趣分阈值入选的子集，非全部弹幕发送者。</div>'
     )
 
-    # 无属地数据时不渲染地域图
-    region_canvas = ('<div class="chart-card"><h3>地域分布 Top10</h3><canvas id="regionChart"></canvas></div>'
-                     if chart["region_labels"] else "")
+    # 地域分布并入「用户标签 Top10」卡片（同属用户特征 Top10 维度，charts-grid 4 卡→3 卡）；
+    # 无属地数据时不渲染地域小标题+canvas，前端 report.js 对 regionChart 判空
+    region_sub = ('<h4 class="dm-sub-h">地域分布 Top10</h4><canvas id="regionChart"></canvas>'
+                  if chart["region_labels"] else "")
 
     # 弹幕密度时间轴（概览页，宽幅）：无全量弹幕数据（旧版本分析）或时长未知时不渲染；
     # 点击柱条跳转视频对应时段（P1-a，前端 report.js onClick 处理）
@@ -1987,8 +1997,9 @@ def video_page(bvid: str):
         <div class="charts-grid">
             <div class="chart-card"><h3>用户等级分布</h3><canvas id="levelChart"></canvas></div>
             <div class="chart-card"><h3>刷屏风险分布</h3><canvas id="spamChart"></canvas></div>
-            <div class="chart-card"><h3>用户标签 Top10</h3><canvas id="tagChart"></canvas></div>
-            {region_canvas}
+            <div class="chart-card"><h3>用户标签 / 地域分布 Top10</h3>
+                <h4 class="dm-sub-h">用户标签 Top10</h4><canvas id="tagChart"></canvas>
+                {region_sub}</div>
         </div>
         {repeat_block}
         {rq_block}

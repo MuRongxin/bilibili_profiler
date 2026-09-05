@@ -1,31 +1,50 @@
-# TODO —— 识别不友善用户：发现的问题与改进项
+# TODO —— 
 
-目标：找出视频里谁在破坏和谐讨论环境。以下为对现有方案的评估中发现的问题与候选改进，按优先级排列。
 
-## P0 —— 高价值、数据基础已具备
+## 1 Queery:
+- From the output of the console, why was the IP proxy removed when the program started without finding a usable node
+  ```log
+  [ProxyCore] 内置核心就绪: 46 个节点（混合端口 127.0.0.1:52825）
+  [Pool] 自检节点不通，切换到 [🇭🇰HKG-香港01] 重试
+  [Pool] 自检节点不通，切换到 [🇲🇴OMA-澳门01] 重试
+  [Pool] 自检节点不通，切换到 [🇹🇭TH-泰国01] 重试
+  [Pool] 自检节点不通，切换到 [🇹🇼TWN-台湾01-家宽] 重试
+  [Pool] 代理自检失败，摘代理转直连（仅账号轮转）
+  ```
+  
+- The current design is: to collect 100 pages of comments and gather plaintext Uids to a maximum of 500 pages. However, from the logs, why does the UID collection start from 1?(The ending is not 500. It might be that there are no 500 pages in total)
 
-- [x] **问题评论作者未进入画像流水线** ✅ 已实现
-  `main.select_problem_comment_authors`：问题评论 severity≥COMMENT_AUTHOR_MIN_SEVERITY(2) 或命中≥COMMENT_AUTHOR_MIN_HITS(2) 条的作者，凭明文 UID 以合成键 `cmt:{uid}` 直引 resolved 并落 senders 表（method="问题评论"、confidence="高"、danmaku_count=0），正常走采集/画像/深掘；卡片弹幕行为行尾标注「问题评论 N 条（最高严重度 S）」，风险排序纳入 comment_problem 维度。
+  ```log
+  [Comment] 已达采集上限 100 页，评论区可能未采完（可调大 MAX_COMMENT_PAGES）
+  [Comment] 获取到 8968 条评论（含子评论 6972 条），提取 4876 个独立用户UID，4875   个IP属地
+  [Comment] UID收割第 2/500 页: +1（本轮累计 1 个）
+  [Comment] UID收割第 5/500 页: +1（本轮累计 2 个）  
+  ....
+  [Comment] UID收割第 114/500 页: +1（本轮累计 219 个）
+  [Comment] UID收割完成：本轮新收 219 个 uid 映射
+  [Comment] 充电名单: 1 个明文UID
+  ```
+- Where are the analysis results of the LLM's in-depth user profiling? I haven't seen them yet. Are they on the user cards? But there is only the collected information above. (I found the target user card based on the LLM analysis logs. )
+## Improvement:
+- Home page:The section on "跨视频重叠用户", Add the release date of this video after its title. The column "涉及视频数" can be removed. "在 ≥ 2 个已分析视频中都发过弹幕的发送者—跨视频重复出现的账号是水军/带节奏的重点嫌疑对象。点视频条目可展开 TA 在该视频里的弹幕/评论明细。", this sentence can be removied.
+- On the specific video analysis report page:
+  - on the "Overview page",There is no gap between the "弹幕密度时间轴" card and the three cards of “弹幕密度时间轴” 这个卡片与“用户等级分布” “刷屏风险分布” and “用户标签 Top10“ . Merge the contents of the "Top10 Geographical Distribution" and "用户标签 Top10" cards into one card .
+  
+  - 在用户画像的卡片上会收集用户的关注列表，为了了解它所关注的UP主是什么样子的，设计了根据该人投稿标题生成词云的功能，现在这个收集过程改为了懒加载，只有在用户把鼠标移动到这个up的名字词条上时，才会收集，目前的问题是，鼠标悬停时，收集、加载词云的过程太慢了，需要改进。（根本没有这个项目生成词云的速度快：https://github.com/gaogaotiantian/biliscope/,如果你搞不定，可以参考一下） 
+  再增加一个功能点，点击这个UP主的词条，可以新页面跳转该UP的主页；
 
-- [x] **缺少攻击关系建模（谁攻击谁）** ✅ 已实现
-  `web._attack_focus`：问题回复（problem 非空、parent_rpid>0、非自回、未标记误报）JOIN 父评论还原 A→B 攻击边，聚合挑事分/被攻击分；高回复评论页首渲染「⚔️ 争执焦点」双榜（挑事者 Top5 带类别 chips 与主要攻击对象、被围攻者 Top5 带主要来源，均链 /user/<uid>）。
+- 对于需要深度采集的用户，现在的做法是 把号池里面的账户都用上，多线并发同时进行多个账号的采集，但是这导致log输出变得很混乱；在保持精细度的同时需要改进；
+  ```log
+  [29/247] 采集 UID:471579363...
+  [Collect] UID:471579363 开始采集...
+  [Collect] UID:1841627262 维度1(主页/收藏)完成，采集互动足迹...
+  [Collect] UID:471579363 维度1(主页/收藏)完成，采集互动足迹...
+  [Collect] UID:1841627262 维度2(互动足迹)完成，采集社交关系...
+  [Collect] UID:471579363 维度2(互动足迹)完成，采集社交关系...
+  [Collect] UID:471579363 维度3(社交关系)完成，分析关注偏好/行为模式...
+  [Collect] UID:471579363 YouTube精选智慧- Lv.6 采集完成
+  ```
 
-## P1 —— 提升报告可用性
 
-- [x] **弹幕时间线不可跳转核验** ✅ 已实现
-  `_danmaku_density` 输出每桶起始秒数 starts；report.js 密度图 onClick 打开 `bilibili.com/video/{bvid}?t={秒}` 新标签页，悬停指针+tooltip 提示，图表标题注明「点击柱条跳转对应时段核验」。
-
-- [x] **问题评论未按热度加权** ✅ 已实现
-  `web._problem_comment_board`：全部问题评论按热度=点赞+回复数×COMMENT_HEAT_REPLY_WEIGHT(10) 降序取 Top PROBLEM_COMMENT_TOP_N(30)，高回复评论页首「🔥 问题评论榜」展示（昵称/类别 chip/热度明细/原文链接/误报按钮）。
-
-## P2 —— 准确性兜底
-
-- [x] **LLM 判定无人工纠偏机制** ✅ 已实现
-  新增 `false_positive` 表（bvid+kind+target 主键，dm=弹幕内容/cmt=评论rpid）+ `POST /api/video/<bvid>/false_positive` 幂等切换；问题弹幕榜代表原文、高回复评论树根/子节点、问题评论榜均带「误报/撤销」按钮。弹幕侧按内容从 cringe 聚合重算扣除（`_apply_danmaku_fp`，旧 llm_cache 无 items 时回退 examples），用户疑似分（风险排序）随之降级；评论侧剔除出统计/榜单/攻击边、chip 划线可撤销。llm_cache 不动，标记跨重跑保留，删除报告时清除。
-
-- [x] **mid_hash 解析率限制覆盖面** ✅ 已实现
-  `main.build_video_meta_uid_map`：视频元信息明文 UID 源（UP主 owner.mid + 联合投稿 staff + 简介@提及 desc_v2 type=1 的 biz_id）并入阶段4交叉验证映射（method="视频信息"），命中时等同明文验证并沉淀全局映射库。
-
-## 现有方案有效性评估（结论）
-
-有效且方向正确：七类 LLM 检测 + 按发送者聚合 + 兴趣分定员的漏斗设计是合理的；`mid_hash` MITM 反查 + 明文交叉验证解决了匿名弹幕归因这个最难的环节。评论区与弹幕区两条线现已汇合（P0 两项已补），「谁不友善」的画像完整。
+## Feature:
+- 

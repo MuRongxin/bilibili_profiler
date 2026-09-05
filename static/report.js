@@ -29,8 +29,10 @@ new Chart(document.getElementById('spamChart'), {type:'doughnut',
 new Chart(document.getElementById('tagChart'), {type:'bar',
     data:{labels:chartData.tag_labels, datasets:[{label:'出现次数', data:chartData.tag_data, backgroundColor:'#ff9f43', borderRadius:6}]},
     options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
-if (chartData.region_labels.length) {
-    new Chart(document.getElementById('regionChart'), {type:'bar',
+// 地域分布并入用户标签卡：无属地数据时服务端不渲染 regionChart canvas，须判空
+const regionCanvas = document.getElementById('regionChart');
+if (regionCanvas && chartData.region_labels.length) {
+    new Chart(regionCanvas, {type:'bar',
         data:{labels:chartData.region_labels, datasets:[{label:'人数', data:chartData.region_data, backgroundColor:'#fb7299', borderRadius:6}]},
         options:{responsive:true, indexAxis:'y', plugins:{legend:{display:false}}}});
 }
@@ -171,6 +173,13 @@ function showUpWcText(chip, text) {   // 加载中/失败等纯文本提示（�
 }
 
 document.querySelectorAll('.up-chip').forEach(chip => {
+    // 点击 chip 新标签页打开该 UP 主空间主页；data-up-uid 缺失（旧缓存画像）则不响应
+    if (chip.dataset.upUid) {
+        chip.title = (chip.title ? chip.title + ' | ' : '') + '点击打开主页';
+        chip.addEventListener('click', function() {
+            window.open('https://space.bilibili.com/' + encodeURIComponent(this.dataset.upUid), '_blank', 'noopener');
+        });
+    }
     chip.addEventListener('mouseenter', function() {
         const upId = this.dataset.upid;
         if (upId && upWcData[upId] && upWcData[upId].length) {

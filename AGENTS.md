@@ -52,15 +52,15 @@ src/
 ├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新、小号池发现（data/cookies/*.json → load_extra_clients，失效自动尝试刷新）
 ├── danmaku.py           # 实时弹幕 XML 解析，按 mid_hash 聚合发送者
 ├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析+0x0A 特征校验防错误页误判；失败日记账 failed_dates 优先补采、截断写 truncated、done=1 后重跑滚动补采最近 3 天）
-├── comment.py           # 评论区采集（wbi/main 游标 + 子评论补采 + IP属地），建立 UID→CRC32 映射；done=1 视频重跑时 refresh_comments 按时间序（mode=2）增量刷新新评论（撞整页已见即停，旧评论顺带刷新热度）；harvest_comment_uids 纯 UID 收割（翻评论区只取 uid 建 CRC32 映射、不落评论内容，累计上限 UID_HARVEST_MAX_PAGES=500 页，断点续翻，done 后重跑转刷新模式，沉淀全局库）
+├── comment.py           # 评论区采集（wbi/main 游标 + 子评论补采 + IP属地），建立 UID→CRC32 映射；页内各主楼的子评论补采互相独立，组合池多号分片时按账号并发补采（主评论游标翻页为链式依赖无法分片，楼中楼补采才是时间大头）；done=1 视频重跑时 refresh_comments 按时间序（mode=2）增量刷新新评论（撞整页已见即停，旧评论顺带刷新热度）；harvest_comment_uids 纯 UID 收割（翻评论区只取 uid 建 CRC32 映射、不落评论内容；正文未被截断且评论表非空时直接跳过，正文截断时接续其热度序游标续翻不重扫已采页；累计上限 UID_HARVEST_MAX_PAGES=500 页，断点续翻，done 后重跑转刷新模式，沉淀全局库）
 ├── uid_resolver.py      # mid_hash 破解：评论/充电名单/互动弹幕/视频元信息（main.build_video_meta_uid_map）/全局库交叉验证 + MITM 反查碰撞消歧
 ├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（10万条内存小表，覆盖全部 ≤10 位 UID；惰性建表加双检锁线程安全，预计算 adv5 表，约 49ms/hash）
 ├── spam_detector.py     # 刷屏检测：只标记风险等级（高/中/低），绝不删除弹幕数据；四规则组合计分（最高分+每多触发一条加成 SPAM_COMBO_BONUS）、高频爆发按滑动窗口口径、全池 P95 相对离群补强、群体复读事件检测（detect_repeat_events：同内容 60s 窗内 ≥5 人 ≥8 条的接龙/队列，全视频维度）、分布自检（P50/P90/P95 供阈值校准）
 ├── cringe_detector.py   # LLM 问题弹幕检测（八类判定+发送者聚合+llm_cache缓存，key 带口径版本号 v4，批次响应先解析校验成功才落缓存）+ 问题评论检测（同口径，按内容缓存判定、回映 rpid 回写 comments.problem，未配置 LLM_API_KEY 自动跳过；致命 4xx 直接上抛由 phase 层降级，瞬态错误同厂商短退避，整轮重试 LLM_RETRY_BUDGET_SECONDS=1800s 熔断）
-├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；采集全程走账号×IP 组合池（combo_pool，鸭子类型透明接管：多号并行分片（每账号一子池、限速按号独立、线程↔分片绑定、吞吐≈账号数倍）、风控换号+切节点重试，冷却锁外等待，IP 池故障自动降级直连并定时重探恢复））
+├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；采集全程走账号×IP 组合池（combo_pool，鸭子类型透明接管：多号并行分片（每账号一子池、限速按号独立、线程↔分片绑定、吞吐≈账号数倍）、风控换号+切节点重试，冷却锁外等待，IP 池故障自动降级直连并定时重探恢复）；单用户日志行缓冲、完成时原子输出，多线程不交错）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
 ├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存，OpenAI client 初始化时复用、单次调用超时 LLM_DEEP_TIMEOUT=120s；全员粗筛已砍，未配置 Key 自动跳过）
-├── up_analyzer.py       # UP 主相关分析（analyze_up：名片+最近一页投稿标题分词词频；采集阶段不再逐个分析被关注 UP 主，报告页悬停关注 chip 时经 /api/up/<uid>/wordcloud 懒加载调用，结果按 llm_cache 键 up:{uid} 缓存跨视频复用）
+├── up_analyzer.py       # UP 主相关分析（analyze_up：名片+最近一页投稿两请求并行、标题分词词频；采集阶段只存全部关注名单，被关注 UP 主的投稿词云在悬停 chip 时经 /api/up/<uid>/wordcloud 懒加载，`up:{uid}` 缓存）
 ├── report.py            # 报告渲染函数库（用户卡片/问题弹幕榜/图表统计/基础CSS，被 web.py 复用）
 ├── exporter.py          # CSV/JSON 数据导出（report_{BV号}_{时间} 前缀，Web 报告页提供下载链接）
 └── storage.py           # SQLite 持久化（data/profiler.db，get_db 统一 WAL + busy_timeout=10000 + synchronous=NORMAL），支撑断点续采与 LLM 结果缓存（llm_cache 表、danmaku 全量弹幕表（含 mode/color/pool/dmid/page 属性列）、comments 评论表（含 uname 昵称、parent_rpid 回复树、problem 问题标注、location IP属地）、false_positive 误报标记表（kind: dm=弹幕内容/cmt=评论rpid/spam=发送者mid_hash，展示层扣除聚合）、phase_state 阶段检查点表（弹幕历史 last_date/fetched_dates/failed_dates/truncated、评论游标，中断续采））

@@ -137,8 +137,9 @@
 .ov-dl .filter-btn { text-decoration:none; }
 #reportJobStatus { font-size:13px; color:#f57c00; }
 
-/* 弹幕密度时间轴独占整行（宽幅直方图）；图表高度不写死，随容器宽高比自适应 */
-.chart-wide { grid-column:1 / -1; }
+/* 弹幕密度时间轴独占整行（宽幅直方图）；图表高度不写死，随容器宽高比自适应；
+   与下方 charts-grid 图表卡之间补间隔（density 卡独立于网格之外，自身带下边距） */
+.chart-wide { grid-column:1 / -1; margin-bottom:20px; }
 
 /* 解析质量区块（概览页：用户身份可信度） */
 .rq-block { background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); padding:14px 16px; }
