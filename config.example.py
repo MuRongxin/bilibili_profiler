@@ -131,7 +131,6 @@ MAX_FOLLOWING_PAGES = 5       # 关注列表最大翻页（每页20，他人最�
 MAX_FOLLOWER_PAGES = 2       # 粉丝列表最大翻页
 MAX_FAV_CONTENTS = 20        # 收藏夹内容采样数
 COLLECT_WORKERS = 3       # 并发采集线程数（BiliAPIClient已线程安全，限速为全局共享）
-MAX_UP_SAMPLE = 20        # summarize_followings 深度分析的UP主采样上限（控制请求量防爆）
 
 # ========== 画像配置 ==========
 SPAM_HIGH_THRESHOLD = (10, 0.7)    # (弹幕数, 重复率)
@@ -208,6 +207,7 @@ SPAM_BURST_HIGH_COUNT = 5          # 窗口内 ≥N 条判高强度突发（原 
 SPAM_BURST_MEDIUM_COUNT = 3        # 窗口内 ≥N 条判疑似突发（原 spam_detector._BURST_MEDIUM_COUNT）
 SPAM_VARIANT_SIMILARITY = 0.8      # 变种刷屏的平均相似度阈值（原 spam_detector._VARIANT_SPAM_SIMILARITY）
 SPAM_VARIANT_MIN_COUNT = 5         # 变种刷屏判定的最小弹幕数（原 spam_detector._VARIANT_SPAM_MIN_COUNT）
+SPAM_PAIRWISE_UNIQUE_CAP = 200     # 两两相似度计算的唯一内容数上限（超出确定性抽样，防 O(u²) 卡死）
 SPAM_BURST_MIN_COUNT = 10          # 高频爆发判定：滑动窗口内最大条数阈值（原 spam_detector._BURST_SPAM_MIN_COUNT）
 SPAM_COMBO_BONUS = 0.10            # 组合评分：每多触发一条刷屏规则的加分（封顶 1.0，替代旧的 max 取极值）
 SPAM_RELATIVE_MIN_POOL = 10        # 相对离群判定：全池至少 N 个达标发送者才启用（防小样本噪声）

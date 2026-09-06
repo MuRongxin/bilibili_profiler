@@ -22,9 +22,8 @@ python run.py BV1vu4y1b7Y9 --max-users 50 # 手动覆盖动态定员（默认阈
 python run.py --batch videos.txt          # 批量分析（逐行读取BV号，忽略空行与 # 注释行）
 
 # 辅助脚本
-python login.py        # 交互式扫码登录（主号，单独登录用）
+python login.py        # 扫码登录主号（全自动轮询：终端字符码+图片，APP确认后自动落库，无需按键）
 python login.py alt1   # 扫码登录小号 alt1（存 data/cookies/alt1.json，run.py 阶段5自动发现轮转分摊采集）
-python login_bg.py     # 非交互式后台轮询扫码登录（同样可选跟账号名）
 python quick_test.py [BV号] [--top N]  # 快速分析：只分析刷屏得分最高的前 N 个发送者
 python web.py       # 交互式 Web 报告（127.0.0.1:8000，PROFILER_PORT 可覆盖端口）
 python web.py --stop  # 停止后台运行的 web 服务并释放端口（pidfile: data/web_{端口}.pid，防 PID 复用误杀）
@@ -60,7 +59,7 @@ src/
 ├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；采集全程走账号×IP 组合池（combo_pool，鸭子类型透明接管：多号并行分片（每账号一子池、限速按号独立、线程↔分片绑定、吞吐≈账号数倍）、风控换号+切节点重试，冷却锁外等待，IP 池故障自动降级直连并定时重探恢复）；单用户日志行缓冲、完成时原子输出，多线程不交错）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
 ├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存，OpenAI client 初始化时复用、单次调用超时 LLM_DEEP_TIMEOUT=120s；结果注入 profile 并由阶段7回写 users.profile_json（web 报告读库展示，不落库则报告页不可见）；全员粗筛已砍，未配置 Key 自动跳过）
-├── up_analyzer.py       # UP 主相关分析（analyze_up：名片+最近一页投稿两请求并行、标题分词词频；采集阶段只存全部关注名单，被关注 UP 主的投稿词云在悬停 chip 时经 /api/up/<uid>/wordcloud 懒加载——走 fetch_up_wordcloud 轻量路径（单请求+immediate 免限速），`up:{uid}` 缓存；web 启动时后台热身鉴权威胁，前端视口内 chip 慢速队列预热+在途去重）
+├── up_analyzer.py       # UP 主词云懒加载（fetch_up_wordcloud：单请求+immediate 免限速轻量路径；采集阶段只存全部关注名单，被关注 UP 主的投稿词云在悬停 chip 时经 /api/up/<uid>/wordcloud 懒加载，`up:{uid}` 缓存；web 启动时后台热身鉴权威胁，前端视口内 chip 慢速队列预热+在途去重）
 ├── report.py            # 报告渲染函数库（用户卡片/问题弹幕榜/图表统计/基础CSS，被 web.py 复用）
 ├── exporter.py          # CSV/JSON 数据导出（report_{BV号}_{时间} 前缀，Web 报告页提供下载链接）
 └── storage.py           # SQLite 持久化（data/profiler.db，get_db 统一 WAL + busy_timeout=10000 + synchronous=NORMAL），支撑断点续采与 LLM 结果缓存（llm_cache 表、danmaku 全量弹幕表（含 mode/color/pool/dmid/page 属性列）、comments 评论表（含 uname 昵称、parent_rpid 回复树、problem 问题标注、location IP属地）、false_positive 误报标记表（kind: dm=弹幕内容/cmt=评论rpid/spam=发送者mid_hash，展示层扣除聚合）、phase_state 阶段检查点表（弹幕历史 last_date/fetched_dates/failed_dates/truncated、评论游标，中断续采））

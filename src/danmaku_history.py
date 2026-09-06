@@ -205,7 +205,9 @@ def _fetch_day_danmaku(cid: int, date: str, client: BiliAPIClient) -> list[dict]
     避免错误页被静默解析为 0 条照常计天推进。"""
     resp = client.get_raw(DANMAKU_HISTORY_SEG_URL, params={"type": 1, "oid": cid, "date": date})
     body = resp.content
-    if not body or body[0] != 0x0A:
+    if not body:
+        return []   # 当日弹幕池快照为空（索引列出但无内容），按合法空日处理，不计失败
+    if body[0] != 0x0A:
         raise ValueError(f"响应体不符合 DmSegMobileReply 特征（长度 {len(body)}），疑似错误页")
     return parse_danmaku_proto(body)
 
@@ -240,7 +242,6 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         return []
 
     last_date = None
-    fetched_before = 0
     done_before = False
     fetched_dates: set[str] = set()
     failed_dates: set[str] = set()
@@ -248,7 +249,6 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         from storage import (append_danmaku, get_phase_state, load_danmaku,
                              set_phase_state)
         last_date = get_phase_state(bvid, "danmaku", "last_date") or None
-        fetched_before = int(get_phase_state(bvid, "danmaku", "fetched_days") or 0)
         done_before = get_phase_state(bvid, "danmaku", "done") == "1"
         fetched_dates = _load_date_set(bvid, "fetched_dates")
         failed_dates = _load_date_set(bvid, "failed_dates")
@@ -292,7 +292,9 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         print(f"[历史弹幕] 时间跨度超限，仅回溯最近 {HISTORY_MAX_MONTHS} 个月（{months[0]} 起）")
 
     all_danmaku = []
-    fetched_days = fetched_before   # 续采时从检查点累计（HISTORY_MAX_DAYS 上限跨运行生效）
+    # 已采天数以唯一日期集为准（len(fetched_dates)），不再读 fetched_days 检查点：
+    # 计数器口径下滚动补采的近几天会被重复计入，长期重跑会虚涨并提前触发天数上限
+    fetched_days = len(fetched_dates)
     truncated = False               # 天数上限耗尽：更早日期未采集（设计性截断）
     window_complete = True          # 月份索引全部成功才算时间窗完整
 
@@ -342,11 +344,11 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             failed_dates.add(date)
             return
         failed_dates.discard(date)
-        fetched_days += 1
         all_danmaku.extend(dms)
         if bvid:
             # 逐日增量落库 + 检查点：中断后重跑按已采日期集续采
             fetched_dates.add(date)
+            fetched_days = len(fetched_dates)   # 唯一已采日数：滚动补采的重采日不重复计数
             append_danmaku(bvid, dms, seen_dmids)
             if not last_date or date > last_date:
                 last_date = date   # 高水位线
@@ -354,6 +356,8 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             set_phase_state(bvid, "danmaku", "fetched_days", str(fetched_days))
             _save_date_set(bvid, "fetched_dates", fetched_dates)
             _save_date_set(bvid, "failed_dates", failed_dates)
+        else:
+            fetched_days += 1
         print(f"[历史弹幕] {date}: {len(dms)} 条（第 {fetched_days} 天，累计 {len(all_danmaku)} 条）")
 
     if work_dates:

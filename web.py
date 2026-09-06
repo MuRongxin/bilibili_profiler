@@ -52,7 +52,7 @@ from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
 from combo_pool import build_pool
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
-from up_analyzer import analyze_up, fetch_up_wordcloud
+from up_analyzer import fetch_up_wordcloud
 from spam_detector import batch_detect_spam, detect_repeat_events, pool_distribution_from_rows
 from llm_analyzer import LLMAnalyzer
 from up_analyzer import _tokenize
@@ -70,13 +70,14 @@ _PORT = int(os.environ.get("PROFILER_PORT", "8000"))   # 监听端口（PROFILER
 @app.before_request
 def _loopback_guard():
     """本机回环校验：写接口无防护时任意网页可借浏览器跨站调用本服务的删除/重跑等
-    破坏性接口（CSRF），DNS rebinding 还可整站读取。对所有非 GET/HEAD/OPTIONS 请求：
-    Origin 头存在时必须等于本服务回环源，Host 头必须是 127.0.0.1/localhost 系，否则 403。"""
-    if request.method in ("GET", "HEAD", "OPTIONS"):
-        return None
+    破坏性接口（CSRF），DNS rebinding（恶意域名解析到 127.0.0.1）还可整站读取画像数据。
+    所有请求：Host 头必须是 127.0.0.1/localhost 系（封堵 DNS rebinding 读取面）；
+    非 GET/HEAD/OPTIONS 请求：Origin 头存在时必须等于本服务回环源（封堵跨站写）。"""
     host = (request.host or "").split(":")[0]
     if host not in ("127.0.0.1", "localhost"):
         abort(403)
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
     origin = request.headers.get("Origin")
     if origin is not None and origin not in (f"http://127.0.0.1:{_PORT}",
                                              f"http://localhost:{_PORT}"):
@@ -145,8 +146,9 @@ def _page_fingerprint(bvid: str) -> tuple:
         u_cnt, u_max = conn.execute(
             "SELECT COUNT(*), MAX(u.collected_at) FROM senders s "
             "JOIN users u ON u.uid = s.uid WHERE s.bvid = ?", (bvid,)).fetchone()
-        c_cnt, c_prob = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(problem)), 0) FROM comments WHERE bvid = ?",
+        c_cnt, c_prob, c_heat = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(problem)), 0), "
+            "COALESCE(SUM(\"like\" + reply_count), 0) FROM comments WHERE bvid = ?",
             (bvid,)).fetchone()
         d_cnt = conn.execute(
             "SELECT COUNT(*) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
@@ -155,7 +157,8 @@ def _page_fingerprint(bvid: str) -> tuple:
         face_cnt = conn.execute("SELECT COUNT(*) FROM face_cache").fetchone()[0]
         # videos 表（标题/元信息更新）也纳入指纹：外部进程重写该行时报告页需重渲染
         v_cnt, v_max = conn.execute("SELECT COUNT(*), MAX(rowid) FROM videos").fetchone()
-    return (s_cnt, s_uid_cnt, u_cnt, u_max, c_cnt, c_prob, d_cnt, f_cnt, face_cnt,
+    # c_heat（点赞+回复数合计）覆盖 refresh_comments 的热度回写：热度变化也触发重渲染
+    return (s_cnt, s_uid_cnt, u_cnt, u_max, c_cnt, c_prob, c_heat, d_cnt, f_cnt, face_cnt,
             v_cnt, v_max)
 
 
@@ -2308,7 +2311,7 @@ _UP_WC_EVENTS: dict[int, threading.Event] = {}   # uid → 在采事件（并发
 @app.route("/api/up/<int:uid>/wordcloud")
 def api_up_wordcloud(uid: int):
     """关注 UP 主的近期投稿词云（懒加载）：采集阶段只存关注名单、不逐个分析被关注 UP 主，
-    报告页悬停 chip 时才经此接口按需采集（analyze_up：名片+最近一页投稿标题分词）。
+    报告页悬停 chip 时才经此接口按需采集（fetch_up_wordcloud：单请求+immediate 免限速轻量路径）。
 
     结果按 llm_cache 键 up:{uid} 缓存（跨视频复用，--force 清除范围不含 up: 前缀）。
     同一 uid 并发请求只采一次：后到者等在 Event 上（最多 25s）再读缓存。"""
@@ -2650,4 +2653,5 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _on_term)
     print(f"[Web] 交互式报告服务已启动: http://127.0.0.1:{port}")
     print(f"[Web] 停止服务: python web.py --stop")
-    app.run(host="127.0.0.1", port=port, debug=False)
+    # threaded=True：弹幕大查询/词云采集不阻塞其它请求（job 轮询、页面加载）
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

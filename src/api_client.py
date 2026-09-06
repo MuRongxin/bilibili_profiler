@@ -271,6 +271,11 @@ class BiliAPIClient:
                         if attempt < MAX_RETRY - 1:
                             self._penalize_throttle(f"非WBI接口返回 {data.get('code')}")
                             if self.raise_on_risk:
+                                # 编排层模式：与 -412 同口径，先一次短退避原地重试（防瞬时抖动白换号）
+                                if attempt == 0:
+                                    print(f"[API] 非WBI接口返回 {data.get('code')}，短退避后原地重试一次...")
+                                    time.sleep(RETRY_BACKOFF)
+                                    continue
                                 raise RiskControlError(f"非WBI接口 {data['code']}，判定为风控")
                             wait = RISK_COOLDOWN + random.uniform(0, 60)
                             self._risk_cooldown_until = time.time() + wait

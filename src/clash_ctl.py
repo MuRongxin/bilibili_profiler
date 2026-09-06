@@ -81,7 +81,8 @@ class ClashCtl:
         if ent is None:
             return True
         if time.time() >= ent[0]:
-            del self._dead[name]                # TTL 到期，允许复活重试
+            # pop 而非 del：与健康检查通道并发时重复删除不抛 KeyError
+            self._dead.pop(name, None)          # TTL 到期，允许复活重试
             return True
         return False
 

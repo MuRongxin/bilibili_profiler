@@ -5,6 +5,7 @@
 区分正常重复（如应援、玩梗）与恶意刷屏（垃圾内容、机器人）。
 """
 import difflib
+import random
 from collections import Counter
 from typing import Tuple
 
@@ -16,7 +17,7 @@ from config import (SPAM_HIGH_THRESHOLD, SPAM_MEDIUM_THRESHOLD,
                     SPAM_RELATIVE_REPEAT_FLOOR, SPAM_RELATIVE_COUNT_FLOOR,
                     SPAM_RELATIVE_SCORE, REPEAT_EVENT_WINDOW_SECONDS,
                     REPEAT_EVENT_MIN_SENDERS, REPEAT_EVENT_MIN_TOTAL,
-                    REPEAT_EVENT_TOP_N)
+                    REPEAT_EVENT_TOP_N, SPAM_PAIRWISE_UNIQUE_CAP)
 
 
 def content_similarity(a: str, b: str) -> float:
@@ -26,9 +27,15 @@ def content_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
-def analyze_content_repeat(contents: list[str]) -> Tuple[float, float, int]:
+def analyze_content_repeat(contents: list[str], pairwise: bool = True) -> Tuple[float, float, int]:
     """
     分析内容重复率
+
+    Args:
+        pairwise: 是否做两两相似度计算（变种刷屏判定用）。O(u²)×difflib 在唯一内容
+            很多时是性能炸弹（水军号上千条不同弹幕会卡死数小时），调用方应在
+            条数不足 SPAM_VARIANT_MIN_COUNT 时传 False 跳过；唯一内容数超过
+            _PAIRWISE_UNIQUE_CAP 时确定性抽样后再比（结果跨运行稳定）。
 
     Returns:
         (整体重复率, 两两相似度加权和, 两两相似度对数)
@@ -41,6 +48,13 @@ def analyze_content_repeat(contents: list[str]) -> Tuple[float, float, int]:
     counts = Counter(contents)
     unique = list(counts)
     repeat_rate = 1 - len(unique) / n
+
+    if not pairwise:
+        return repeat_rate, 0.0, 0
+
+    # 唯一内容数超限：固定种子抽样（确定性，重跑结果一致），防 O(u²) 爆炸
+    if len(unique) > SPAM_PAIRWISE_UNIQUE_CAP:
+        unique = random.Random(0).sample(unique, SPAM_PAIRWISE_UNIQUE_CAP)
 
     # 先按内容去重，只对唯一内容两两比较，再用出现次数加权展开为全量两两相似度。
     # 与原 O(n²) 全量比较数学等价（相同内容相似度恒为 1，唯一对 (a,b) 贡献
@@ -142,8 +156,10 @@ def analyze_spam(danmaku_contents: list[str], timestamps: list[int]) -> dict:
     unique_contents = set(danmaku_contents)
     unique_count = len(unique_contents)
 
-    # 内容重复率
-    repeat_rate, sim_sum, sim_count = analyze_content_repeat(danmaku_contents)
+    # 内容重复率（两两相似度仅在变种刷屏可能触发时才计算：条数不足
+    # SPAM_VARIANT_MIN_COUNT 时规则3必不触发，O(u²) 的 difflib 全量比较直接跳过）
+    repeat_rate, sim_sum, sim_count = analyze_content_repeat(
+        danmaku_contents, pairwise=count >= SPAM_VARIANT_MIN_COUNT)
     avg_similarity = sim_sum / sim_count if sim_count else 0.0
 
     # 时间间隔

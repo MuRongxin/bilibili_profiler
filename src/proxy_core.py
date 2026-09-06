@@ -214,11 +214,12 @@ class ProxyCore:
             else:
                 self.sub_urls.append(u)
         # 组名同样要进 yaml：含引号/反斜杠/换行会生成非法配置或与 self.group 不一致的组名，
-        # 回退默认组名（\ 结尾会生成未终止字符串；\n/\t 字面两字符会被 yaml 解析成转义）
+        # 回退默认组名（\ 结尾会生成未终止字符串；\n/\t 字面两字符会被 yaml 解析成转义；
+        # 逗号会截断 MATCH 规则语法）
         if not group:
             group = "profiler"   # 未配置组名，直接用默认（非异常，不打警告）
-        elif '"' in group or "\\" in group or "\n" in group or "\r" in group:
-            print("[ProxyCore] 警告：节点组名含非法字符（引号/反斜杠/换行），回退默认组名 profiler")
+        elif any(c in group for c in ('"', "\\", "\n", "\r", ",")):
+            print("[ProxyCore] 警告：节点组名含非法字符（引号/反斜杠/换行/逗号），回退默认组名 profiler")
             group = "profiler"
         self.group = group
         self.mix_port = _free_port()

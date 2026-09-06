@@ -51,6 +51,7 @@ class ComboPool:
         self._proxy_backup = None           # 摘代理降级时备份 (proxy_url, clash) 供恢复
         self._proxy_strip_ts = 0.0          # 摘代理时刻（距上次恢复尝试的计时起点）
         self._lock = threading.Lock()
+        self._restore_lock = threading.Lock()   # 代理恢复自检串行化（_maybe_restore_proxy）
         for _, c in self._accounts:
             c.raise_on_risk = True          # 池成员风控改抛信号，由本池接管
             if proxy_url:
@@ -118,30 +119,38 @@ class ComboPool:
 
     def _maybe_restore_proxy(self):
         """摘代理降级满 PROXY_RETRY_AFTER 秒后，下次请求前重跑代理自检，
-        成功则恢复代理与 clash 控制器（自检走网络，挂回/摘掉在锁内，自检本身锁外）"""
-        with self._lock:
-            if self._proxy_backup is None or self._proxy_url is not None:
-                return
-            if time.time() - self._proxy_strip_ts < PROXY_RETRY_AFTER:
-                return
-            # 本次尝试无论成败都重新计时（_strip_proxy 会刷新 _proxy_strip_ts），
-            # 避免每次请求都打自检
-            proxy_url, clash = self._proxy_backup
-            self._proxy_url = proxy_url
-            self._clash = clash
-            self._proxy_fail_streak = 0
-            for _, c in self._accounts:
-                c.set_proxy(proxy_url)
-        print("[Pool] 摘代理已满重试间隔，重跑代理自检尝试恢复...")
-        if _proxy_selfcheck(self, max_tries=3):
-            with self._lock:
-                self._proxy_backup = None
-                self._proxy_strip_ts = 0.0
-            print("[Pool] 代理自检通过，已恢复代理出口与节点控制器")
+        成功则恢复代理与 clash 控制器（自检走网络，挂回/摘掉在锁内，自检本身锁外）。
+
+        _restore_lock 非阻塞串行化：多线程同时到期时只允许一个线程跑自检，
+        其余直接跳过本次（等下一次调用再判），避免并发重复自检与状态挂回竞态。"""
+        if not self._restore_lock.acquire(blocking=False):
             return
-        print("[Pool] 代理自检仍未通过，维持直连降级")
-        with self._lock:
-            self._strip_proxy()
+        try:
+            with self._lock:
+                if self._proxy_backup is None or self._proxy_url is not None:
+                    return
+                if time.time() - self._proxy_strip_ts < PROXY_RETRY_AFTER:
+                    return
+                # 本次尝试无论成败都重新计时（_strip_proxy 会刷新 _proxy_strip_ts），
+                # 避免每次请求都打自检
+                proxy_url, clash = self._proxy_backup
+                self._proxy_url = proxy_url
+                self._clash = clash
+                self._proxy_fail_streak = 0
+                for _, c in self._accounts:
+                    c.set_proxy(proxy_url)
+            print("[Pool] 摘代理已满重试间隔，重跑代理自检尝试恢复...")
+            if _proxy_selfcheck(self, max_tries=3):
+                with self._lock:
+                    self._proxy_backup = None
+                    self._proxy_strip_ts = 0.0
+                print("[Pool] 代理自检通过，已恢复代理出口与节点控制器")
+                return
+            print("[Pool] 代理自检仍未通过，维持直连降级")
+            with self._lock:
+                self._strip_proxy()
+        finally:
+            self._restore_lock.release()
 
     def run(self, fn, desc: str = ""):
         """执行 fn(client)；风控→rotate 重试；整圈风控→长冷却；冷却 MAX_RISK_ROUNDS 圈仍败→抛"""
@@ -242,6 +251,7 @@ class ComboPool:
             p._proxy_backup = None
             p._proxy_strip_ts = 0.0
             p._lock = threading.Lock()
+            p._restore_lock = threading.Lock()
             pools.append(p)
         return pools
 

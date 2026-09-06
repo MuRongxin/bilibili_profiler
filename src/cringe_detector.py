@@ -241,7 +241,7 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                     break               # 其他错误重试同厂商无意义，直接换下一厂商
         raise last_err
 
-    verdicts = []
+    verdicts: dict[int, list] = {}   # 按批次下标暂存：聚合顺序不随并发完成顺序漂移（examples 跨运行稳定）
 
     def run_pass(pending: list[int]) -> list[int]:
         """跑一轮并发判定，返回仍失败的批次下标；致命错误取消其余批次后直接上抛"""
@@ -274,7 +274,7 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                     continue
                 if not batch_verdicts and raw.strip() not in ("", "[]"):
                     print(f"[{label}] 警告: 批次 {bi + 1} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
-                verdicts.extend(batch_verdicts)
+                verdicts[bi] = batch_verdicts
                 print(f"[{label}] 批次 {bi + 1}/{total} 完成（解析 {len(batch_verdicts)} 条）")
         if fatal is not None:
             raise fatal
@@ -296,7 +296,8 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
         time.sleep(wait)
         pending = run_pass(pending)
         round_no += 1
-    return verdicts, len(pending) + len(final_failed), total
+    flat_verdicts = [v for bi in sorted(verdicts) for v in verdicts[bi]]
+    return flat_verdicts, len(pending) + len(final_failed), total
 
 
 def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dict],

@@ -523,13 +523,14 @@ def collect_user_data(uid: int, client: BiliAPIClient, log=None) -> dict:
     try:
         user_data["followers"] = get_followers(uid, client)
     except Exception:
-        user_data["followers"] = []
+        # 与 get_followers 正常返回结构（{"total", "sample"}）保持同型，防下游踩类型坑
+        user_data["followers"] = {"total": 0, "sample": []}
 
     log(f"  [Collect] UID:{uid} 维度3(社交关系)完成，分析关注偏好/行为模式...")
 
     # UP主关注偏好：只存关注名单本身（全部关注，uid+name+sign），不再逐个分析
     # 被关注 UP 主的投稿/词频——那部分挪到报告页悬停时按需懒加载（/api/up/<uid>/wordcloud），
-    # 初采不再为每个用户扇出 2×MAX_UP_SAMPLE 个请求，阶段5 显著提速
+    # 初采不再为每个用户扇出批量请求，阶段5 显著提速
     user_data["following_summary"] = {"total": len(user_data["followings"])}
 
     # 维度4：行为模式（综合动态 + 视频投稿时间）

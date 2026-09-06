@@ -109,13 +109,15 @@ def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
     return fetched
 
 
-def _collect_page(replies: list, oid: int, client: BiliAPIClient) -> list[dict]:
+def _collect_page(replies: list, oid: int, client: BiliAPIClient, executor=None) -> list[dict]:
     """解析一页主评论及其子评论（含补采）。
 
     子评论补采并行化：各主楼的楼中楼补采互相独立（wbi 主评论游标翻页是链式依赖
     无法分片，这里才是时间大头——实测子评论约占评论总量 3/4），client 为组合池
     且有多个分片时按账号分片并发补采（限速按号独立，吞吐≈账号数倍）；
-    单池/裸 client 时保持串行。组装顺序不变：主评论紧跟其子评论。"""
+    单池/裸 client 时保持串行。组装顺序不变：主评论紧跟其子评论。
+
+    executor 由调用方按整次采集创建并复用（逐页建线程池会造成线程组反复创建销毁）。"""
     # 1) 主评+内嵌预览先按页序落位，需补采的主楼记录待办
     page_items: list[tuple[dict, list]] = []   # (主评论, 预览子评论)
     pending: list[tuple] = []                  # (rpid, rcount, preview)
@@ -136,12 +138,11 @@ def _collect_page(replies: list, oid: int, client: BiliAPIClient) -> list[dict]:
     subs_map: dict = {}
     if pending:
         shards = client.shard_pools() if hasattr(client, "shard_pools") else []
-        if len(shards) > 1:
-            with ThreadPoolExecutor(max_workers=len(shards)) as ex:
-                futs = {ex.submit(_fetch_sub_replies, oid, rpid, rc, pv, shards[i % len(shards)]): rpid
-                        for i, (rpid, rc, pv) in enumerate(pending)}
-                for fut in as_completed(futs):
-                    subs_map[futs[fut]] = fut.result()
+        if len(shards) > 1 and executor is not None:
+            futs = {executor.submit(_fetch_sub_replies, oid, rpid, rc, pv, shards[i % len(shards)]): rpid
+                    for i, (rpid, rc, pv) in enumerate(pending)}
+            for fut in as_completed(futs):
+                subs_map[futs[fut]] = fut.result()
         else:
             for rpid, rc, pv in pending:
                 subs_map[rpid] = _fetch_sub_replies(oid, rpid, rc, pv, client)
@@ -157,9 +158,15 @@ def _collect_page(replies: list, oid: int, client: BiliAPIClient) -> list[dict]:
     return comments
 
 
+def _sub_reply_executor(client) -> ThreadPoolExecutor | None:
+    """组合池多分片时为子评论补采创建线程池（整次采集共享一个，由调用方 try/finally 关闭）"""
+    shards = client.shard_pools() if hasattr(client, "shard_pools") else []
+    return ThreadPoolExecutor(max_workers=len(shards)) if len(shards) > 1 else None
+
+
 def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
                         bvid: str | None = None, resume_offset: str = "",
-                        resume_page: int = 0) -> list[dict] | None:
+                        resume_page: int = 0, executor=None) -> list[dict] | None:
     """wbi/main 游标翻页采集主评论。本轮首个请求（含续采第一页）失败返回 None
     （调用方降级旧接口）。
 
@@ -219,7 +226,7 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
         cursor = page_data.get("cursor") or {}
         next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
 
-        page_comments = _collect_page(new_replies, oid, client)
+        page_comments = _collect_page(new_replies, oid, client, executor=executor)
         all_comments.extend(page_comments)
         if bvid:
             # 整页采完（含子评论补采）才落库+推进检查点：页内中断重跑会整页重采（UNIQUE 去重兜底）
@@ -252,7 +259,7 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
 
 def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int,
                            bvid: str | None = None, resume_next: int = 0,
-                           resume_page: int = 0) -> list[dict]:
+                           resume_page: int = 0, executor=None) -> list[dict]:
     """旧接口 /x/v2/reply/main（next 游标）采集，作为 wbi/main 失败时的降级路径。
     断点续采语义同 _fetch_comments_wbi（next 为整数页游标）。"""
     all_comments = []
@@ -283,7 +290,7 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int,
         if not replies:
             break
 
-        page_comments = _collect_page(replies, oid, client)
+        page_comments = _collect_page(replies, oid, client, executor=executor)
         all_comments.extend(page_comments)
         cursor = page_data.get("cursor") or {}
         next_page = cursor.get("next", 0)
@@ -329,47 +336,52 @@ def refresh_comments(oid: int, client: BiliAPIClient, bvid: str,
             "SELECT rpid FROM comments WHERE bvid = ?", (bvid,))}
     offset = ""
     new_total = 0
-    for page in range(1, max_pages + 1):
-        try:
-            data = client.get(COMMENT_MAIN_WBI_URL, params={
-                "oid": oid,
-                "type": 1,
-                "mode": 2,       # 时间倒序：最新评论在前，增量边界可判定
-                "pagination_str": json.dumps({"offset": offset}),
-            })
-        except Exception as e:
-            print(f"[Comment] 增量刷新第{page}页请求异常（{e}），保留已刷新部分")
-            break
-        if data.get("code") != 0:
-            print(f"[Comment] 增量刷新第{page}页失败: {data.get('message')}，保留已刷新部分")
-            break
-        page_data = data.get("data") or {}
-        replies = page_data.get("replies") or []
-        if not replies:
-            break
+    ex = _sub_reply_executor(client)   # 子评论补采线程池整轮共享（逐页建池会反复创建销毁线程组）
+    try:
+        for page in range(1, max_pages + 1):
+            try:
+                data = client.get(COMMENT_MAIN_WBI_URL, params={
+                    "oid": oid,
+                    "type": 1,
+                    "mode": 2,       # 时间倒序：最新评论在前，增量边界可判定
+                    "pagination_str": json.dumps({"offset": offset}),
+                })
+            except Exception as e:
+                print(f"[Comment] 增量刷新第{page}页请求异常（{e}），保留已刷新部分")
+                break
+            if data.get("code") != 0:
+                print(f"[Comment] 增量刷新第{page}页失败: {data.get('message')}，保留已刷新部分")
+                break
+            page_data = data.get("data") or {}
+            replies = page_data.get("replies") or []
+            if not replies:
+                break
 
-        stale_src = [r for r in replies if r.get("rpid") in seen_rpids]
-        new_replies = [r for r in replies if r.get("rpid") not in seen_rpids]
-        if new_replies:
-            page_comments = _collect_page(new_replies, oid, client)
-            save_comments(bvid, page_comments)
-            seen_rpids.update(r.get("rpid") for r in new_replies)
-            new_total += len(new_replies)
-        # 已见主评论轻量回写：刷新 like/reply_count 等（高回复榜热度不再停在首采快照）
-        stale = [c for c in (_parse_comment(r, is_sub=False) for r in stale_src) if c]
-        if stale:
-            save_comments(bvid, stale)
-        print(f"[Comment] 增量刷新第 {page}/{max_pages} 页: +{len(new_replies)} 条新主评论")
+            stale_src = [r for r in replies if r.get("rpid") in seen_rpids]
+            new_replies = [r for r in replies if r.get("rpid") not in seen_rpids]
+            if new_replies:
+                page_comments = _collect_page(new_replies, oid, client, executor=ex)
+                save_comments(bvid, page_comments)
+                seen_rpids.update(r.get("rpid") for r in new_replies)
+                new_total += len(new_replies)
+            # 已见主评论轻量回写：刷新 like/reply_count 等（高回复榜热度不再停在首采快照）
+            stale = [c for c in (_parse_comment(r, is_sub=False) for r in stale_src) if c]
+            if stale:
+                save_comments(bvid, stale)
+            print(f"[Comment] 增量刷新第 {page}/{max_pages} 页: +{len(new_replies)} 条新主评论")
 
-        if not new_replies:
-            break   # 整页都是已见评论：到达增量边界
-        cursor = page_data.get("cursor") or {}
-        next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
-        if cursor.get("is_end", False) or not next_offset:
-            break
-        offset = next_offset
-    else:
-        print(f"[Comment] 增量刷新达上限 {max_pages} 页，可能还有更多新评论（可调大 COMMENT_REFRESH_MAX_PAGES）")
+            if not new_replies:
+                break   # 整页都是已见评论：到达增量边界
+            cursor = page_data.get("cursor") or {}
+            next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
+            if cursor.get("is_end", False) or not next_offset:
+                break
+            offset = next_offset
+        else:
+            print(f"[Comment] 增量刷新达上限 {max_pages} 页，可能还有更多新评论（可调大 COMMENT_REFRESH_MAX_PAGES）")
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=True)
 
     print(f"[Comment] 增量刷新完成：新增主评论 {new_total} 条")
     return new_total
@@ -530,15 +542,23 @@ def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT
                 resume_next = 0
                 resume_page = 0
     # 检查点 mode 与本次实际走通的接口不一致时，页码/游标一并归零从头翻页（UNIQUE 幂等）
-    comments = _fetch_comments_wbi(oid, client, max_pages, bvid=bvid,
-                                   resume_offset=resume_offset,
-                                   resume_page=resume_page if mode == "wbi" else 0)
-    if comments is None:
-        print("[Comment] wbi/main 接口不可用，降级为旧版 /x/v2/reply/main")
-        comments = _fetch_comments_legacy(oid, client, max_pages, bvid=bvid,
-                                          resume_next=resume_next,
-                                          resume_page=resume_page if mode == "legacy" else 0)
-    return comments
+    # 子评论补采线程池按整次采集共享（逐页建池会反复创建销毁线程组）
+    ex = _sub_reply_executor(client)
+    try:
+        comments = _fetch_comments_wbi(oid, client, max_pages, bvid=bvid,
+                                       resume_offset=resume_offset,
+                                       resume_page=resume_page if mode == "wbi" else 0,
+                                       executor=ex)
+        if comments is None:
+            print("[Comment] wbi/main 接口不可用，降级为旧版 /x/v2/reply/main")
+            comments = _fetch_comments_legacy(oid, client, max_pages, bvid=bvid,
+                                              resume_next=resume_next,
+                                              resume_page=resume_page if mode == "legacy" else 0,
+                                              executor=ex)
+        return comments
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=True)
 
 
 def build_comment_uid_map(comments: list[dict]) -> dict[str, int]:

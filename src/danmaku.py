@@ -6,7 +6,7 @@ from lxml import etree
 from typing import Optional
 
 from api_client import BiliAPIClient
-from config import VIDEO_INFO_URL, DANMAKU_XML_URL, DANMAKU_VIEW_URL, MAX_ANALYZE_USERS_HARD_CAP
+from config import VIDEO_INFO_URL, DANMAKU_XML_URL, DANMAKU_VIEW_URL
 from danmaku_history import _read_varint, _skip_field, _take_bytes  # 复用历史弹幕的 wire 手写解析
 from uid_resolver import calc_crc32
 
@@ -157,19 +157,6 @@ def group_by_sender(danmaku_list: list[dict]) -> dict[str, dict]:
         g["pages"] = sorted(g["pages"])
 
     return dict(groups)
-
-
-def get_top_senders(sender_groups: dict[str, dict], max_users: int = MAX_ANALYZE_USERS_HARD_CAP) -> list[str]:
-    """
-    按弹幕数量降序，获取前N个发送者
-    巨量数据时只分析活跃发送者
-    """
-    sorted_senders = sorted(
-        sender_groups.keys(),
-        key=lambda mh: sender_groups[mh]["count"],
-        reverse=True
-    )
-    return sorted_senders[:max_users]
 
 
 def collect_danmaku_data(bvid: str, client: BiliAPIClient) -> tuple[dict, list[dict], dict[str, dict]]:

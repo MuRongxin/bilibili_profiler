@@ -670,26 +670,25 @@ def save_global_uid(mid_hash: str, uid: int, source: str):
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         new_pri = _GLOBAL_UID_SOURCE_PRIORITY.get(source, 0)
+        # INSERT OR IGNORE 先行占位：先查后插在并发写（web job × run.py）下会撞主键
+        # 抛 IntegrityError，占位后该行必存在，后续只需按来源优先级决定是否覆盖
+        cursor.execute(
+            "INSERT OR IGNORE INTO global_uid_map (mid_hash, uid, source, first_seen, last_seen, hit_count)"
+            " VALUES (?, ?, ?, ?, ?, 0)", (mid_hash, uid, source, now, now))
         row = cursor.execute(
             "SELECT source FROM global_uid_map WHERE mid_hash = ?", (mid_hash,)).fetchone()
-        if row is None:
+        old_pri = _GLOBAL_UID_SOURCE_PRIORITY.get(row["source"], 0)
+        if new_pri >= old_pri:
             cursor.execute('''
-                INSERT INTO global_uid_map (mid_hash, uid, source, first_seen, last_seen, hit_count)
-                VALUES (?, ?, ?, ?, ?, 1)
-            ''', (mid_hash, uid, source, now, now))
+                UPDATE global_uid_map SET uid=?, source=?, last_seen=?, hit_count=hit_count+1
+                WHERE mid_hash=?
+            ''', (uid, source, now, mid_hash))
         else:
-            old_pri = _GLOBAL_UID_SOURCE_PRIORITY.get(row["source"], 0)
-            if new_pri >= old_pri:
-                cursor.execute('''
-                    UPDATE global_uid_map SET uid=?, source=?, last_seen=?, hit_count=hit_count+1
-                    WHERE mid_hash=?
-                ''', (uid, source, now, mid_hash))
-            else:
-                # 低优先级来源不覆盖 uid/source，只累计命中并刷新 last_seen
-                cursor.execute('''
-                    UPDATE global_uid_map SET last_seen=?, hit_count=hit_count+1
-                    WHERE mid_hash=?
-                ''', (now, mid_hash))
+            # 低优先级来源不覆盖 uid/source，只累计命中并刷新 last_seen
+            cursor.execute('''
+                UPDATE global_uid_map SET last_seen=?, hit_count=hit_count+1
+                WHERE mid_hash=?
+            ''', (now, mid_hash))
         conn.commit()
 
 

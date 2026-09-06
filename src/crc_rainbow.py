@@ -76,12 +76,14 @@ def _ensure_tables():
             prefix_crc[n] = c
         # 预计算全部前缀的 5 字节推进值，供每次 lookup 复用（省逐 hash 的 10 万次 _advance5）
         prefix_adv5 = [_advance5(c) for c in prefix_crc]
-        # 全部构建完成后一次性赋给全局
-        _suffix_crc_map = suffix_map
+        # 全部构建完成后一次性赋给全局；_suffix_crc_map 是快路径的"就绪"判据，
+        # 必须最后一个发布——否则并发首次查询可能读到半成品（_prefix_adv5=None 崩、
+        # _zeros5_crc=0 静默漏候选）
         _small_uid_map = small_map
         _prefix_crc = prefix_crc
         _prefix_adv5 = prefix_adv5
         _zeros5_crc = zlib.crc32(b"\x00" * 5)
+        _suffix_crc_map = suffix_map
 
 
 def lookup(crc32_hash: str, max_uid: int = MITM_MAX_UID) -> list:
