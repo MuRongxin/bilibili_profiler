@@ -254,8 +254,6 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         failed_dates = _load_date_set(bvid, "failed_dates")
         if seen_dmids is None:
             seen_dmids = {r["dmid"] for r in load_danmaku(bvid) if r["dmid"]}
-        if last_date:
-            print(f"[历史弹幕] 断点续采：{last_date} 及以前的日期已完成，从下一日期继续")
     seen_dmids = seen_dmids if seen_dmids is not None else set()
 
     # B站弹幕快照按北京时间划日：显式 UTC+8，消除宿主机时区依赖
@@ -263,11 +261,17 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
 
     # done=1 的已完成视频重复调用：回拨检查点滚动补采最近 HISTORY_RECENT_REFRESH_DAYS 天
     # （dmid 幂等去重，重复调用快速；last_date 仍是历史高水位，不落库回拨值）
+    # 注意日志顺序：续采提示必须在回拨判定之后打印——回拨会把 last_date 往前拨，
+    # 先打印就会自相矛盾（"今天已完成"紧接着"重采最近3天"）
     if done_before and last_date and last_date >= today.isoformat():
         cutoff = (today - timedelta(days=HISTORY_RECENT_REFRESH_DAYS)).isoformat()
         fetched_dates = {d for d in fetched_dates if d <= cutoff}
         last_date = cutoff
-        print(f"[历史弹幕] 已完成视频滚动补采：仅补最近 {HISTORY_RECENT_REFRESH_DAYS} 天（{cutoff} 起）")
+        refresh_from = today - timedelta(days=HISTORY_RECENT_REFRESH_DAYS - 1)
+        print(f"[历史弹幕] 已采集完成，滚动补采最近 {HISTORY_RECENT_REFRESH_DAYS} 天"
+              f"（{refresh_from.isoformat()} ~ {today.isoformat()}，弹幕池每日滚动，dmid 幂等去重）")
+    elif bvid and last_date:
+        print(f"[历史弹幕] 断点续采：{last_date} 及以前的日期已完成，新日期与失败日将续采")
 
     # 续采高水位快照：进入循环前固定，循环内 last_date 只增用于落库持久化——
     # 降序遍历中若用活值做跳过判据，会先推高水位再把同轮更早日全部误跳过
@@ -358,7 +362,7 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             _save_date_set(bvid, "failed_dates", failed_dates)
         else:
             fetched_days += 1
-        print(f"[历史弹幕] {date}: {len(dms)} 条（第 {fetched_days} 天，累计 {len(all_danmaku)} 条）")
+        print(f"[历史弹幕] {date}: {len(dms)} 条（已采日数 {fetched_days}，本轮新采 {len(all_danmaku)} 条）")
 
     if work_dates:
         if len(shards) > 1:
