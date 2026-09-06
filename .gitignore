@@ -43,3 +43,7 @@ data/mihomo*
 data/*.log
 data/profiler.db-wal
 data/profiler.db-shm
+
+# 内部开发文档（不对外公开）
+docs/
+videos_until_0822.txt
