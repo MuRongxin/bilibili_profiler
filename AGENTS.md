@@ -51,7 +51,7 @@ src/
 ├── combo_pool.py        # 账号×IP 组合池（鸭子类型模拟 BiliAPIClient；风控换"新号+新IP"重试，冷却按截止时刻锁外等待（单账号池冷却缩至 SINGLE_ACCOUNT_RISK_COOLDOWN=120s），IP 池故障摘代理降级直连、每 PROXY_RETRY_AFTER=600s 重探恢复；注意内置核心为单 mixed-port 单 select 组，IP 维度全局单点：所有账号共享同一出口 IP）
 ├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新、小号池发现（data/cookies/*.json → load_extra_clients，失效自动尝试刷新）
 ├── danmaku.py           # 实时弹幕 XML 解析，按 mid_hash 聚合发送者
-├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析+0x0A 特征校验防错误页误判；失败日记账 failed_dates 优先补采、截断写 truncated、done=1 后重跑滚动补采最近 3 天）
+├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析+0x0A 特征校验防错误页误判；失败日记账 failed_dates 优先补采、截断写 truncated、done=1 后重跑滚动补采最近 3 天；每日快照为独立请求无游标链，组合池多号分片时按账号并发采多天，落库/检查点推进在主线程串行）
 ├── comment.py           # 评论区采集（wbi/main 游标 + 子评论补采 + IP属地），建立 UID→CRC32 映射；页内各主楼的子评论补采互相独立，组合池多号分片时按账号并发补采（主评论游标翻页为链式依赖无法分片，楼中楼补采才是时间大头）；done=1 视频重跑时 refresh_comments 按时间序（mode=2）增量刷新新评论（撞整页已见即停，旧评论顺带刷新热度）；harvest_comment_uids 纯 UID 收割（翻评论区只取 uid 建 CRC32 映射、不落评论内容；正文未被截断且评论表非空时直接跳过，正文截断时接续其热度序游标续翻不重扫已采页；累计上限 UID_HARVEST_MAX_PAGES=500 页，断点续翻，done 后重跑转刷新模式，沉淀全局库）
 ├── uid_resolver.py      # mid_hash 破解：评论/充电名单/互动弹幕/视频元信息（main.build_video_meta_uid_map）/全局库交叉验证 + MITM 反查碰撞消歧
 ├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（10万条内存小表，覆盖全部 ≤10 位 UID；惰性建表加双检锁线程安全，预计算 adv5 表，约 49ms/hash）

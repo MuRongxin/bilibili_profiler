@@ -19,6 +19,7 @@ protobuf 结构（DmSegMobileReply）：
 为免引入 protobuf 依赖，wire 格式手写解析。
 """
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -294,9 +295,12 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     fetched_days = fetched_before   # 续采时从检查点累计（HISTORY_MAX_DAYS 上限跨运行生效）
     truncated = False               # 天数上限耗尽：更早日期未采集（设计性截断）
     window_complete = True          # 月份索引全部成功才算时间窗完整
-    # 月份降序 + 月内日期降序：上限耗尽保留最新日期
+
+    # 1) 先串行建待采日期清单（月份索引每月一个请求，远少于天数）；
+    #    月份降序 + 月内日期降序：上限耗尽保留最新日期
+    work_dates: list[str] = []
     for month in reversed(months):
-        if fetched_days >= HISTORY_MAX_DAYS:
+        if fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
             truncated = True
             break
         dates = _fetch_month_dates(cid, month, client)
@@ -306,39 +310,67 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             continue
         if not dates:
             continue
-        month_count = 0
         for date in sorted(dates, reverse=True):
-            if fetched_days >= HISTORY_MAX_DAYS:
+            if fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
                 truncated = True
                 break
             if date not in failed_dates and (
                     date in fetched_dates or (resume_before and date <= resume_before)):
                 continue            # 该日已落库（失败日除外：不被高水位跳过，重试补采）
+            work_dates.append(date)
+
+    # 2) 按日并发采集：历史快照每天一个独立请求、无游标链，组合池多号分片时
+    #    按账号并行（限速按号独立，吞吐≈账号数倍）；单池/裸 client 时串行照旧。
+    #    网络在 worker 线程，落库/检查点推进在主线程 _apply 内串行完成（线程安全）。
+    shards = client.shard_pools() if hasattr(client, "shard_pools") else []
+    if len(shards) > 1:
+        print(f"[历史弹幕] 多号并行分片: {len(shards)} 个账号并行采集 {len(work_dates)} 天")
+
+    def _one_day(args):
+        idx, date = args
+        sp = shards[idx % len(shards)] if len(shards) > 1 else client
+        try:
+            return date, _fetch_day_danmaku(cid, date, sp), None
+        except Exception as e:
+            return date, None, e
+
+    def _apply(date, dms, err):
+        nonlocal fetched_days, last_date
+        if err is not None:
+            # 降级而非中断：单日失败仅跳过该日并记账，后续运行优先补采
+            print(f"[历史弹幕] 警告：{date} 弹幕采集失败，已跳过: {err}")
+            failed_dates.add(date)
+            return
+        failed_dates.discard(date)
+        fetched_days += 1
+        all_danmaku.extend(dms)
+        if bvid:
+            # 逐日增量落库 + 检查点：中断后重跑按已采日期集续采
+            fetched_dates.add(date)
+            append_danmaku(bvid, dms, seen_dmids)
+            if not last_date or date > last_date:
+                last_date = date   # 高水位线
+            set_phase_state(bvid, "danmaku", "last_date", last_date)
+            set_phase_state(bvid, "danmaku", "fetched_days", str(fetched_days))
+            _save_date_set(bvid, "fetched_dates", fetched_dates)
+            _save_date_set(bvid, "failed_dates", failed_dates)
+        print(f"[历史弹幕] {date}: {len(dms)} 条（第 {fetched_days} 天，累计 {len(all_danmaku)} 条）")
+
+    if work_dates:
+        if len(shards) > 1:
+            ex = ThreadPoolExecutor(max_workers=len(shards))
             try:
-                dms = _fetch_day_danmaku(cid, date, client)
-            except Exception as e:
-                # 降级而非中断：单日失败仅跳过该日并记账，后续运行优先补采
-                print(f"[历史弹幕] 警告：{date} 弹幕采集失败，已跳过: {e}")
-                failed_dates.add(date)
-                continue
-            failed_dates.discard(date)
-            fetched_days += 1
-            month_count += len(dms)
-            all_danmaku.extend(dms)
-            if bvid:
-                # 逐日增量落库 + 检查点：中断后重跑按已采日期集续采
-                fetched_dates.add(date)
-                append_danmaku(bvid, dms, seen_dmids)
-                if not last_date or date > last_date:
-                    last_date = date   # 高水位线（降序遍历中只会被更新鲜的日期推高）
-                set_phase_state(bvid, "danmaku", "last_date", last_date)
-                set_phase_state(bvid, "danmaku", "fetched_days", str(fetched_days))
-                _save_date_set(bvid, "fetched_dates", fetched_dates)
-                _save_date_set(bvid, "failed_dates", failed_dates)
-            print(f"[历史弹幕] {date}: {len(dms)} 条（第 {fetched_days} 天，累计 {len(all_danmaku)} 条）")
-        print(f"[历史弹幕] {month}: {len(dates)} 天有弹幕，累计 {len(all_danmaku)} 条")
-        if truncated:
-            break
+                futs = [ex.submit(_one_day, a) for a in enumerate(work_dates)]
+                for fut in as_completed(futs):
+                    _apply(*fut.result())
+            except KeyboardInterrupt:
+                ex.shutdown(wait=False, cancel_futures=True)   # Ctrl+C 立即退，排队日不等
+                raise
+            else:
+                ex.shutdown(wait=True)
+        else:
+            for a in enumerate(work_dates):
+                _apply(*_one_day(a))
 
     if truncated:
         print(f"[历史弹幕] 已达天数上限 {HISTORY_MAX_DAYS}，更早的日期未采集（上限耗尽保留最新日期）")
