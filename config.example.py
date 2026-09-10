@@ -141,6 +141,8 @@ ANALYZE_USERS_FLOOR = 300        # 保底名额（小视频的默认上限）
 ANALYZE_USERS_RATIO = 0.05       # 上限 = max(FLOOR, 独立发送者数 × 该比例)
 MAX_ANALYZE_USERS_HARD_CAP = 1000  # 绝对上限（保险丝；采集成本与风控暴露的硬约束）
 LLM_DEEP_TOP_K = 20                # LLM 重点深掘人数（兴趣分 top K 单人单调用）
+LLM_DEEP_ENABLED = os.environ.get("LLM_DEEP_ENABLED", "1") not in ("0", "false", "False")
+                                   # 阶段7 LLM 重点深掘总开关（False 或环境变量 LLM_DEEP_ENABLED=0 关闭）
 CRINGE_BATCH_SIZE = 200            # 问题弹幕检测每批弹幕条数
 COMMENT_CRINGE_BATCH_SIZE = 100    # 问题评论检测每批条数（评论比弹幕长，批次减半）
 COMMENT_CRINGE_MAX_ITEMS = 2000    # 问题评论检测去重后最大条数（按点赞降序截断）

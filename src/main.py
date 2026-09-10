@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 
 from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USERS_RATIO,
-                    LLM_API_KEY, HISTORY_DANMAKU_ENABLED, REPORT_DIR,
+                    LLM_API_KEY, LLM_DEEP_ENABLED, HISTORY_DANMAKU_ENABLED, REPORT_DIR,
                     COMMENT_AUTHOR_MIN_SEVERITY, COMMENT_AUTHOR_MIN_HITS)
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_video_info
@@ -905,8 +905,11 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     profiles = timer.run("阶段6 画像分析", phase_analyze, resolved, spam_results, user_data_map,
                          sender_groups, comment_location_map, uid_comments)
 
-    # 阶段7: LLM 重点深掘（结果在 phase 内直接注入 profile）
-    timer.run("阶段7 LLM深掘", phase_ai_analysis, video_info, profiles)
+    # 阶段7: LLM 重点深掘（结果在 phase 内直接注入 profile；LLM_DEEP_ENABLED 可整段关闭）
+    if LLM_DEEP_ENABLED:
+        timer.run("阶段7 LLM深掘", phase_ai_analysis, video_info, profiles)
+    else:
+        print("\n[Phase 7] 跳过 (config.py 中 LLM_DEEP_ENABLED=False)")
 
     # 静态单文件 HTML 报告已被交互式 Web 报告（web.py）完全替换，不再生成 .html
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
