@@ -52,6 +52,11 @@ class _ContentFiltered(Exception):
     则该批按最终失败跳过（不进整轮重试，同一内容必然重复触发）"""
 
 
+class _BudgetExhausted(Exception):
+    """退避等待将超出 LLM_RETRY_BUDGET_SECONDS 总耗时预算：该批按最终失败跳过，
+    不再让整轮重试把耗时拖过预算（预算耗尽时重跑可借批次缓存续判）"""
+
+
 def _batch_thinking_extra(base_url: str, model: str) -> dict:
     """判定批次思考参数（强度由 config.LLM_BATCH_THINKING 控制：off/low/default）。
     分类任务推理增益微弱，推理 token 计费且占 max_tokens 预算，故默认 off：
@@ -172,6 +177,17 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
     batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
     total = len(batches)
     workers = max(1, min(total, LLM_CONCURRENCY))
+    # 总耗时预算：整轮重试与单批退避共用同一截止时刻，避免单轮内多次长退避把实际耗时
+    # 拖到远超 LLM_RETRY_BUDGET_SECONDS（此前只在整轮间隙检查，单轮内不受约束）
+    deadline = time.monotonic() + LLM_RETRY_BUDGET_SECONDS
+
+    def _sleep_within_budget(sec: float) -> bool:
+        """预算内退避：把等待压缩进剩余预算；预算已耗尽返回 False，由调用方按最终失败处理"""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(sec, remaining))
+        return True
 
     # 注意：key 固定嵌主用厂商的 LLM_MODEL——备用厂商兜底产出的判定也会存进该命名空间
     # （跨厂商略有混样，换取中断重跑时的缓存命中率；判定口径以内容为准，与厂商基本无关，可接受）
@@ -221,7 +237,8 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                         break           # 本厂商限速重试耗尽，换下一厂商
                     wait = 10 * (retry + 1) + random.uniform(0, 3)
                     print(f"[{label}] 批次 {bi + 1} 触发限速，{wait:.0f}s 后重试...")
-                    time.sleep(wait)
+                    if not _sleep_within_budget(wait):
+                        raise _BudgetExhausted(f"限速退避 {wait:.0f}s 超出剩余预算") from e
                 except openai.BadRequestError as e:
                     if "1301" in str(e) or "contentFilter" in str(e):
                         raise _ContentFiltered(str(e)[:200]) from e   # 内容审核：批次级失败换厂商
@@ -233,7 +250,8 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                         break           # 瞬态错误/空坏响应同厂商重试耗尽，换下一厂商
                     wait = 3 * transient_retries + random.uniform(0, 1)
                     print(f"[{label}] 批次 {bi + 1} 瞬态错误（{type(e).__name__}），{wait:.0f}s 后同厂商重试...")
-                    time.sleep(wait)
+                    if not _sleep_within_budget(wait):
+                        raise _BudgetExhausted(f"瞬态退避 {wait:.0f}s 超出剩余预算") from e
                 except _FATAL_LLM_ERRORS:
                     raise               # 致命错误（鉴权/参数类）重试与换厂商均无意义，直接上抛
                 except Exception as e:
@@ -264,6 +282,11 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                     print(f"[{label}] 警告: 批次 {bi + 1} 被厂商内容审核拦截，该批判空跳过（不重试）")
                     final_failed.append(bi)
                     continue
+                except _BudgetExhausted as e:
+                    # 退避等待超出总耗时预算：该批按最终失败跳过，避免把整轮拖过预算
+                    print(f"[{label}] 警告: 批次 {bi + 1} 等待超出耗时预算（{e}），该批跳过（不重试）")
+                    final_failed.append(bi)
+                    continue
                 except Exception as e:
                     print(f"[{label}] 警告: 批次 {bi + 1} 请求失败（{e}），稍后重试")
                     still_failed.append(bi)
@@ -272,28 +295,31 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                 if batch_verdicts is None:          # 防御：work 已校验，理论不可达
                     still_failed.append(bi)
                     continue
-                if not batch_verdicts and raw.strip() not in ("", "[]"):
-                    print(f"[{label}] 警告: 批次 {bi + 1} 响应解析为空，原始响应前200字符: {raw[:200]!r}")
+                if not batch_verdicts:
+                    # 空数组是合法结果：模型常在 [] 后附一段"未发现问题"的自然语言说明，
+                    # 这不算解析失败（真正的坏响应已在 work() 抛 _UnparseableResponse 重试）
+                    print(f"[{label}] 批次 {bi + 1}/{total} 完成（无问题条目）")
+                else:
+                    print(f"[{label}] 批次 {bi + 1}/{total} 完成（解析 {len(batch_verdicts)} 条）")
                 verdicts[bi] = batch_verdicts
-                print(f"[{label}] 批次 {bi + 1}/{total} 完成（解析 {len(batch_verdicts)} 条）")
         if fatal is not None:
             raise fatal
         return still_failed
 
-    # 失败批次整轮重试：等待递增（60s×轮次，封顶 300s），但总耗时超 LLM_RETRY_BUDGET_SECONDS 熔断放弃
+    # 失败批次整轮重试：等待递增（60s×轮次，封顶 300s），整轮重试与单批退避共用同一
+    # 总耗时预算（deadline）——超预算放弃剩余批次并告警（调用方不得写整段缓存）
     print(f"[{label}] 判定 {total} 批（并发 {workers} 路，LLM请求中）...")
-    start_ts = time.monotonic()
-    final_failed: list[int] = []   # 内容审核拦截等必然重复的批次：跳过不重试
+    final_failed: list[int] = []   # 内容审核拦截/预算耗尽等必然或无需重复的批次：跳过不重试
     pending = run_pass(list(range(total)))
     round_no = 1
     while pending:
-        if time.monotonic() - start_ts >= LLM_RETRY_BUDGET_SECONDS:
-            print(f"[{label}] ⚠ 警告: 重试总耗时超过预算 {LLM_RETRY_BUDGET_SECONDS}s，放弃剩余 {len(pending)}/{total} 个批次"
-                  f"（本次结果不完整、不写整段缓存，重跑可借批次缓存续判）")
-            break
         wait = min(60 * round_no, 300) + random.uniform(0, 10)
         print(f"[{label}] {len(pending)} 个批次未成功，{wait:.0f}s 后重试（第 {round_no} 轮）...")
-        time.sleep(wait)
+        if not _sleep_within_budget(wait):
+            print(f"[{label}] ⚠ 警告: 重试总耗时已达预算 {LLM_RETRY_BUDGET_SECONDS}s，"
+                  f"放弃剩余 {len(pending)}/{total} 个批次"
+                  f"（本次结果不完整、不写整段缓存，重跑可借批次缓存续判）")
+            break
         pending = run_pass(pending)
         round_no += 1
     flat_verdicts = [v for bi in sorted(verdicts) for v in verdicts[bi]]

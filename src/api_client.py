@@ -94,7 +94,7 @@ class BiliAPIClient:
             return ""
         try:
             resp = self._request_locked("GET", NAV_URL, timeout=10)
-            data = resp.json().get("data", {}).get("wbi_img", {})
+            data = (resp.json().get("data") or {}).get("wbi_img") or {}
             img = data.get("img_url", "").split("/")[-1].split(".")[0]
             sub = data.get("sub_url", "").split("/")[-1].split(".")[0]
             val = img + sub
@@ -141,7 +141,7 @@ class BiliAPIClient:
                 "https://api.bilibili.com/x/frontend/finger/spi",
                 timeout=10,
             )
-            data = resp.json().get("data", {})
+            data = resp.json().get("data") or {}    # 风控期 data 可能为 null，避免 AttributeError
             self._buvid3 = data.get("b_3", "")
             if self._buvid3:
                 self.session.cookies.set("buvid3", self._buvid3, domain=".bilibili.com")
@@ -372,27 +372,27 @@ class BiliAPIClient:
             try:
                 resp = self._request_locked("POST", url, data=data, params=params, **kwargs)
                 resp.raise_for_status()
-                data = resp.json()
-                if data.get("code") in (-412, -352, -403):
+                body = resp.json()
+                if body.get("code") in (-412, -352, -403):
                     # 与 get() 相同的风控处理：计圈（自适应降速）、抛信号或冷却重试
-                    self._penalize_throttle(f"触发风控{data.get('code')}(post)")
+                    self._penalize_throttle(f"触发风控{body.get('code')}(post)")
                     if self.raise_on_risk:
                         # 编排层模式：一次短退避原地重试（防瞬时抖动），仍失败抛信号
                         if attempt == 0:
-                            print(f"[API] 触发风控{data.get('code')}(post)，短退避后原地重试一次...")
+                            print(f"[API] 触发风控{body.get('code')}(post)，短退避后原地重试一次...")
                             time.sleep(RETRY_BACKOFF)
                             continue
-                        raise RiskControlError(f"{data['code']} 风控拦截(post)")
+                        raise RiskControlError(f"{body['code']} 风控拦截(post)")
                     if attempt < MAX_RETRY - 1:
                         wait = RISK_COOLDOWN + random.uniform(0, 60)
                         self._risk_cooldown_until = time.time() + wait
-                        print(f"[API] 触发风控{data.get('code')}(post)，冷却 {wait:.0f} 秒后重试...")
+                        print(f"[API] 触发风控{body.get('code')}(post)，冷却 {wait:.0f} 秒后重试...")
                         time.sleep(wait)
                         continue
-                    return {"code": data["code"], "message": "风控拦截(post)"}
+                    return {"code": body["code"], "message": "风控拦截(post)"}
                 # POST 成功：自适应倍率缓慢回落
                 self._reward_throttle()
-                return data
+                return body
             except requests.exceptions.ProxyError as e:
                 # 代理连接失败是 IP 池故障而非目标站风控：立即上报，不消耗重试
                 raise ProxyConnError(str(e)) from e

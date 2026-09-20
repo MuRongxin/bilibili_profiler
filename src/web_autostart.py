@@ -26,7 +26,13 @@ def maybe_launch_web(bvid: str):
 
     WEB_AUTOSTART=False 时只打印手动提示；已有服务在跑则跳过启动直接开页。
     """
-    port = int(os.environ.get("PROFILER_PORT", "8000"))
+    try:
+        port = int(os.environ.get("PROFILER_PORT", "8000"))
+    except ValueError:
+        # 自动启动是锦上添花：环境变量写错也不能影响分析结果与退出码
+        print(f"  [Web] PROFILER_PORT 不是合法端口（{os.environ.get('PROFILER_PORT')!r}），"
+              f"跳过自动启动，请手动运行 python web.py")
+        return
     if not _BVID_RE.fullmatch(bvid or ""):
         print(f"  [Web] bvid 不合法（{bvid!r}），跳过自动启动，请手动运行 python web.py")
         return

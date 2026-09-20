@@ -7,6 +7,8 @@
 import hashlib
 import json
 import time
+
+import openai
 from openai import OpenAI
 from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_DEEP_TOP_K,
                     LLM_FALLBACK, LLM_DEEP_TIMEOUT)
@@ -14,7 +16,9 @@ from storage import load_llm_cache, save_llm_cache
 
 # 深掘结果缓存口径版本号（prompt/证据包结构变更时递增，使旧缓存自动失效）
 _DEEP_CACHE_VERSION = "v2"
-# 深掘单次 LLM 调用超时已迁移至 config.LLM_DEEP_TIMEOUT
+# 深掘的致命错误（鉴权/权限/参数/模型不存在）：重试与换厂商都无意义，直接跳过该用户
+_FATAL_DEEP_ERRORS = (openai.AuthenticationError, openai.PermissionDeniedError,
+                      openai.BadRequestError, openai.NotFoundError)
 
 
 class LLMAnalyzer:
@@ -104,6 +108,10 @@ class LLMAnalyzer:
         results = {}
         for i, p in enumerate(targets, 1):
             uid = p.get("uid")
+            if not uid:
+                # 无 uid 的画像无法归属深掘结果（报告按 uid 取用），且会让 results[None] 互相覆盖
+                print(f"  深掘 {i}/{len(targets)}: 跳过（画像缺 uid）")
+                continue
             evidence = self._build_evidence(p, video_info)
             digest = hashlib.sha256(
                 json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -118,6 +126,10 @@ class LLMAnalyzer:
                   f"（LLM请求中，可能需要数十秒）...")
             try:
                 text = self._analyze_one_deep(p, video_info)
+            except _FATAL_DEEP_ERRORS as e:
+                # 鉴权/参数/模型不存在等致命错误：换厂商与重试都无意义，直接跳过该用户
+                print(f"  警告: UID:{uid} 深掘致命错误（{type(e).__name__}: {e}），跳过该用户")
+                continue
             except Exception as e:
                 # 超时等多为瞬态 API 波动（实测曾整批连续超时后自行恢复），
                 # 退避后重试一次（有备用厂商则换备用），仍失败才降级跳过，不中断整体深掘
@@ -127,6 +139,9 @@ class LLMAnalyzer:
                 time.sleep(20)
                 try:
                     text = self._analyze_one_deep(p, video_info, ci)
+                except _FATAL_DEEP_ERRORS as e2:
+                    print(f"  警告: UID:{uid} 深掘致命错误（{type(e2).__name__}: {e2}），跳过该用户")
+                    continue
                 except Exception as e2:
                     print(f"  警告: UID:{uid} 重试仍失败（{e2}），跳过")
                     continue

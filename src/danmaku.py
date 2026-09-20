@@ -60,7 +60,11 @@ def parse_danmaku_xml(xml_bytes: bytes) -> list[dict]:
             mid_hash = attrs[6].lower()
             if not mid_hash:
                 continue   # p 属性第7段为空串：无发送者标识，不计入发送者聚合
-            # 左补零对齐历史池/calc_crc32 的8位格式（实测实时池个别条目不足8位）
+            # 只接受 1~8 位 hex：B站偶发异常字段若含非 hex 字符，zfill 后也拼不出
+            # 合法 hash（与 calc_crc32 的 8 位键对不上），入聚合只会污染键空间
+            if len(mid_hash) > 8 or any(c not in "0123456789abcdef" for c in mid_hash):
+                continue
+            # 左补零对齐历史池/calc_crc32 的 8 位格式（实测实时池个别条目不足8位）
             mid_hash = mid_hash.zfill(8)
 
             danmaku_list.append({
@@ -95,7 +99,12 @@ def fetch_all_danmaku(video_info: dict, client: BiliAPIClient) -> list[dict]:
     all_danmaku = []
     failed_pages = []
     for idx, page in enumerate(pages):
-        cid = page["cid"]
+        cid = page.get("cid")
+        if not cid:
+            # 分P元信息缺 cid（异常/缺字段）：跳过该页，不让 KeyError 中断整轮采集
+            failed_pages.append(idx + 1)
+            print(f"[Danmaku] 警告：分P {idx + 1} 缺少 cid，已跳过")
+            continue
         try:
             dms = fetch_danmaku(cid, client)
         except Exception as e:

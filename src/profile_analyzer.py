@@ -3,7 +3,7 @@
 
 将原始采集数据转化为结构化画像和标签。
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from collections import Counter
 
 
@@ -141,10 +141,13 @@ def tag_activity_pattern(activity: dict) -> list[str]:
 
     peak_hour = activity.get("peak_hour")
     if peak_hour is not None:
+        # 与 activity_type 的粗粒度时段标签互补而非重复：同一语义只打一次
         if 0 <= peak_hour < 6:
-            tags.append("深夜党")
-        elif 22 <= peak_hour <= 23:
-            tags.append("夜猫子")
+            if "深夜党" not in tags:
+                tags.append("深夜党")
+        elif 22 <= peak_hour < 24:
+            if "夜猫子" not in tags:
+                tags.append("夜猫子")
 
     return tags
 
@@ -207,7 +210,8 @@ def analyze_profile(user_data: dict, danmaku_stats: dict, spam_stats: dict) -> d
     first_seen = user_data.get("first_seen", 0)
     if first_seen:
         try:
-            oldest_activity_days = (datetime.now() - datetime.fromtimestamp(int(first_seen))).days
+            oldest_activity_days = (datetime.now(timezone(timedelta(hours=8)))
+                                     - datetime.fromtimestamp(int(first_seen), tz=timezone(timedelta(hours=8)))).days
         except (ValueError, TypeError, OSError):
             oldest_activity_days = None
 

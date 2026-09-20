@@ -192,7 +192,12 @@ class ProxyCore:
     @staticmethod
     def _pdeathsig_kwargs() -> dict:
         """Linux 下为子进程设置 PR_SET_PDEATHSIG：父进程退出（含崩溃/被 kill）时
-        内核自动 SIGKILL 核心子进程，不留孤儿；非 Linux 平台返回空不加 preexec_fn"""
+        内核自动 SIGKILL 核心子进程，不留孤儿；非 Linux 平台返回空不加 preexec_fn。
+
+        平台差异（已知限制）：Windows/macOS 无 PDEATHSIG，父进程被强杀时 mihomo
+        可能成为孤儿进程继续监听随机端口——正常退出（含 Ctrl+C）仍由 atexit→stop()
+        回收；Windows 上如需彻底清理可手动结束 mihomo.exe 进程。"""
+
         if not sys.platform.startswith("linux"):
             return {}
         libc = ctypes.CDLL(None, use_errno=True)

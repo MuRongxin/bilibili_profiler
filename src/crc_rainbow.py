@@ -28,20 +28,25 @@ _prefix_crc: list | None = None       # [crc32(str(p)) for p in range(100000)]
 _prefix_adv5: list | None = None      # [_advance5(crc32(str(p)))]，建表时预计算，lookup 复用
 _zeros5_crc: int = 0                  # crc32(b"\x00" * 5)
 _crc_byte_table: list | None = None   # 标准 CRC32 字节推进表（多项式 0xEDB88320）
-_build_lock = threading.Lock()        # _ensure_tables 双检锁（防并发首次查询重复/半成品建表）
+_build_lock = threading.RLock()      # 建表双检锁；RLock 允许 _ensure_tables 内嵌套构建字节表
 
 
 def _get_byte_table() -> list:
-    """标准 CRC32 表（与 zlib 相同的多项式），用于手写字节推进"""
+    """标准 CRC32 表（与 zlib 相同的多项式），用于手写字节推进。
+
+    惰性构建结果幂等，加锁只为避免并发首建重复计算；用 RLock 以便 _ensure_tables
+    持锁期间（预计算 _prefix_adv5 时会调用 _advance5）重入构建不死锁。"""
     global _crc_byte_table
     if _crc_byte_table is None:
-        table = []
-        for i in range(256):
-            c = i
-            for _ in range(8):
-                c = (0xEDB88320 ^ (c >> 1)) if (c & 1) else (c >> 1)
-            table.append(c)
-        _crc_byte_table = table
+        with _build_lock:
+            if _crc_byte_table is None:
+                table = []
+                for i in range(256):
+                    c = i
+                    for _ in range(8):
+                        c = (0xEDB88320 ^ (c >> 1)) if (c & 1) else (c >> 1)
+                    table.append(c)
+                _crc_byte_table = table
     return _crc_byte_table
 
 

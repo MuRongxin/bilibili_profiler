@@ -19,6 +19,7 @@ import atexit
 import functools
 import signal
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -38,7 +39,7 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      CROSS_VIDEO_MIN_VIDEOS, CROSS_VIDEO_MAX_USERS, DENSITY_BUCKETS,
                      COMMENT_HEAT_REPLY_WEIGHT, PROBLEM_COMMENT_TOP_N,
                      ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_MAX_N, USER_CARD_URL, NAV_URL,
-                     REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, ANALYZE_MAX_TARGETS)
+                     REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, PAGE_CACHE_MAX, ANALYZE_MAX_TARGETS)
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
 from storage import get_db, init_db
@@ -2050,6 +2051,12 @@ def video_page(bvid: str):
 </html>'''
     with _PAGE_CACHE_LOCK:
         _PAGE_CACHE[(bvid, mask)] = (page_fp, html)
+        # 条目上限：每视频 × mask 两版整页 HTML（单页可达数 MB），超限按写入顺序淘汰最旧
+        while len(_PAGE_CACHE) > PAGE_CACHE_MAX:
+            oldest = next(iter(_PAGE_CACHE))
+            if oldest == (bvid, mask):
+                break
+            _PAGE_CACHE.pop(oldest, None)
     return html
 
 
@@ -2143,9 +2150,13 @@ def api_analyze(bvid: str):
     if _load_video_row(bvid) is None:
         return jsonify({"error": "未知视频"}), 404
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"error": "请求体必须是 JSON 对象"}), 400
+    raw_mids = body.get("mid_hashes")
+    if not isinstance(raw_mids, list):
+        return jsonify({"error": "mid_hashes 必须是数组"}), 400
     # 去重保序；非字符串/空串项丢弃
-    mid_hashes = list(dict.fromkeys(
-        h for h in body.get("mid_hashes", []) if isinstance(h, str) and h))
+    mid_hashes = list(dict.fromkeys(h for h in raw_mids if isinstance(h, str) and h))
     if not mid_hashes:
         return jsonify({"error": "mid_hashes 为空"}), 400
     if len(mid_hashes) > ANALYZE_MAX_TARGETS:
@@ -2239,11 +2250,16 @@ def _run_regen_job(job_id: str, bvid: str):
         with JOBS_LOCK:
             JOBS[job_id].update(done=1, current="", finished=True)
         print(f"[RegenJob {job_id}] 完成: {bvid}")
-    except Exception as e:
+    except (Exception, SystemExit) as e:
+        # SystemExit 不是 Exception 子类：run_analysis 在"视频信息失败且无缓存"等
+        # 场景会 raise SystemExit(1)，不接住就会穿透后台线程 → job 永远 finished=False
+        # → 该视频的删除/重新分析从此恒 409，只能重启服务
+        detail = (f"流水线以退出码 {e.code} 终止（详见服务端日志）"
+                  if isinstance(e, SystemExit) else str(e))
         with JOBS_LOCK:
-            JOBS[job_id]["errors"].append({"mid_hash": None, "error": str(e)})
+            JOBS[job_id]["errors"].append({"mid_hash": None, "error": detail})
             JOBS[job_id]["finished"] = True
-        print(f"[RegenJob {job_id}] 失败: {e}")
+        print(f"[RegenJob {job_id}] 失败: {detail}")
     finally:
         _invalidate_page_cache(bvid)   # 无论成败都重取数据，报告页缓存失效
 
@@ -2358,13 +2374,19 @@ def api_up_wordcloud(uid: int):
         ev.set()
 
 
+_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _norm_color(value) -> str:
+    """弹幕颜色归一：只放行 #rrggbb（旧库/异常数据可能存任意串），其余返回空串。
+
+    颜色会进前端内联 style，白名单化可防 CSS 声明注入（如 background:url(...)）。"""
+    return value if isinstance(value, str) and _COLOR_RE.fullmatch(value) else ""
+
+
 @app.route("/api/video/<bvid>/danmaku")
 def api_danmaku(bvid: str):
     """弹幕 JSON API（spec 4）。
-
-    合并规则：同一 mid_hash 相同 content 合并为一行带 dup_count（GROUP BY mid_hash, content）；
-    不同 mid_hash 的相同内容不合并。
-    参数：search（内容 LIKE）、sender（mid_hash 或昵称/UID 精确）、category（7类之一，
     命中该发送者的问题弹幕类别）、spam（高/中/低/未分析）、analyzed=1（只看已解析用户）、
     sort（video_time/send_time/dup_count/sender_count）、order（asc/desc）、page、page_size（50/100/200，默认100）。
     返回 {rows: [...], total: int, page: int}；每行 content/dup_count/mid_hash/uid/name/
@@ -2509,7 +2531,7 @@ def api_danmaku(bvid: str):
             "content": r["content"],
             "dup_count": r["dup_count"],
             "mid_hash": r["mid_hash"],
-            "uid": _mask_uid(r["uid"]) if (mask and r["uid"] is not None) else r["uid"],
+            "uid": (_mask_uid(r["uid"]) if mask else (int(r["uid"]) if r["uid"] is not None else None)),
             "name": _mask_name(r["name"]) if mask else r["name"],
             "first_video_time": r["first_video_time"],
             "first_send_time": r["first_send_time"],
@@ -2518,7 +2540,7 @@ def api_danmaku(bvid: str):
             "spam_level": m.get("spam_level") or r["spam_level"] or "未分析",
             "sender_count": r["sender_count"],
             "mode": r["mode"] or 1,
-            "color": r["color"] or "",
+            "color": _norm_color(r["color"]),
         })
     return jsonify({"rows": rows, "total": total, "page": page, "page_size": page_size})
 
@@ -2575,7 +2597,20 @@ def _clear_pid(port: int):
 
 
 def _pid_is_webpy(pid: int) -> bool:
-    """进程存活且命令行含 web.py：防止 PID 复用导致 --stop 误杀无关进程"""
+    """进程存活且命令行含 web.py：防止 PID 复用导致 --stop 误杀无关进程。
+
+    POSIX 读 /proc/<pid>/cmdline；Windows 无 /proc，改用 PowerShell CIM 查命令行
+    （wmic 已在新版 Windows 移除，不依赖它）。查询失败一律保守返回 False——
+    宁可不杀也不误杀无关进程。"""
+    if sys.platform.startswith("win"):
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"],
+                capture_output=True, text=True, timeout=15)
+            return "web.py" in (out.stdout or "")
+        except (OSError, subprocess.SubprocessError):
+            return False
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             return "web.py" in f.read().decode(errors="ignore")
@@ -2605,7 +2640,10 @@ def _stop_server(port: int):
             break
         time.sleep(0.1)
     if _pid_is_webpy(pid):
-        os.kill(pid, signal.SIGKILL)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (AttributeError, OSError):
+            pass    # Windows 无 SIGKILL（os.kill 的 SIGTERM 即 TerminateProcess）
         time.sleep(0.1)
     _clear_pid(port)
     print(f"[Web] 已停止 {port} 端口的 web 服务 (pid={pid})，端口已释放")

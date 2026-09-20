@@ -53,6 +53,12 @@ def _parse_comment(r: dict, is_sub: bool) -> dict | None:
     }
 
 
+def _rpid_of(r: dict):
+    """主/子评论的 rpid 归一：缺 rpid 的脏行回退 id 字段；两者皆无返回 None。
+
+    去重判定统一走本函数——直接用 r.get("rpid") 会让多条缺 rpid 的行在集合里
+    塌缩成同一个 None，把"整页脏行"误判成"整页已采过的真重复页"而提前终止翻页。"""
+    return r.get("rpid") or r.get("id") or None
 def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
                        client: BiliAPIClient) -> list[dict]:
     """补采子评论：rcount 超过内嵌预览数时按 pn 翻页拉取全量子评论。
@@ -69,13 +75,18 @@ def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
     fetched = []
     total = 0   # 循环前初始化：首请求即失败 break 时 for-else 不触发，防御引用未赋值
     for pn in range(1, COMMENT_REPLY_MAX_PAGES + 1):
-        data = client.get(COMMENT_REPLY_URL, params={
-            "type": 1,
-            "oid": oid,
-            "root": root_rpid,
-            "pn": pn,
-            "ps": 20,
-        })
+        try:
+            data = client.get(COMMENT_REPLY_URL, params={
+                "type": 1,
+                "oid": oid,
+                "root": root_rpid,
+                "pn": pn,
+                "ps": 20,
+            })
+        except Exception as e:
+            # 单个主楼的子评论补采失败：保留内嵌预览降级，不中断整轮采集
+            print(f"[Comment] 子评论补采请求异常 (root={root_rpid} pn={pn}): {e}，保留预览")
+            break
         if data.get("code") != 0:
             print(f"[Comment] 子评论补采失败 (root={root_rpid} pn={pn}): {data.get('message')}，保留预览")
             break
@@ -193,13 +204,22 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
 
     for page in range(resume_page + 1, max_pages + 1):
         made_request = True
-        data = client.get(COMMENT_MAIN_WBI_URL, params={
-            "oid": oid,
-            "type": 1,
-            "mode": 3,       # 按热度排序
-            # pagination_str 为 JSON 字符串参数，client.get 的 params 会 urlencode
-            "pagination_str": json.dumps({"offset": offset}),
-        })
+        try:
+            data = client.get(COMMENT_MAIN_WBI_URL, params={
+                "oid": oid,
+                "type": 1,
+                "mode": 3,       # 按热度排序
+                # pagination_str 为 JSON 字符串参数，client.get 的 params 会 urlencode
+                "pagination_str": json.dumps({"offset": offset}),
+            })
+        except Exception as e:
+            # 网络抖动/组合池风控兜底耗尽：与"接口返回错误码"同口径降级——首请求异常
+            # 整体降级旧接口，中途异常保留已采部分且不写 done，下次重跑续采
+            print(f"[Comment] wbi/main 第{page}页请求异常（{e}）")
+            natural_end = False
+            if first_request:
+                return None
+            break
 
         if data.get("code") != 0:
             print(f"[Comment] wbi/main 获取评论失败 (第{page}页): {data.get('message')}")
@@ -215,12 +235,14 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
         if not replies:
             break
 
-        # 真重复页检测：整页 rpid 都已见过才终止（next_offset 重复不代表内容重复，实测确认）
-        new_replies = [r for r in replies if r.get("rpid") not in seen_rpids]
+        # 真重复页检测：整页 rpid 都已见过才终止（next_offset 重复不代表内容重复，实测确认）；
+        # rpid 缺失的脏行回退 r.get("id")，仍无则视为新行——否则多条缺 rpid 的行会
+        # 在 seen_rpids 里塌缩成同一个 None 而被误判成"真重复页"提前终止翻页
+        new_replies = [r for r in replies if _rpid_of(r) not in seen_rpids]
         if not new_replies:
             print(f"[Comment] wbi/main 第{page}页无新评论（真重复页），终止翻页")
             break
-        seen_rpids.update(r.get("rpid") for r in new_replies)
+        seen_rpids.update(x for x in (_rpid_of(r) for r in new_replies) if x)
 
         # 翻页：cursor.pagination_reply.next_offset 为不透明游标字符串，is_end 终止
         cursor = page_data.get("cursor") or {}
@@ -271,13 +293,19 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int,
 
     for page in range(resume_page + 1, max_pages + 1):
         made_request = True
-        data = client.get(COMMENT_MAIN_URL, params={
-            "type": 1,
-            "oid": oid,
-            "mode": 3,       # 按热度排序
-            "next": next_page,
-            "ps": 20,
-        })
+        try:
+            data = client.get(COMMENT_MAIN_URL, params={
+                "type": 1,
+                "oid": oid,
+                "mode": 3,       # 按热度排序
+                "next": next_page,
+                "ps": 20,
+            })
+        except Exception as e:
+            # 网络/组合池风控兜底耗尽：与错误码同口径降级（不写 done，保留已采部分）
+            print(f"[Comment] 旧接口第{page}页请求异常（{e}），保留已采部分")
+            natural_end = False
+            break
 
         if data.get("code") != 0:
             print(f"[Comment] 获取评论失败: {data.get('message')}")
@@ -357,12 +385,12 @@ def refresh_comments(oid: int, client: BiliAPIClient, bvid: str,
             if not replies:
                 break
 
-            stale_src = [r for r in replies if r.get("rpid") in seen_rpids]
-            new_replies = [r for r in replies if r.get("rpid") not in seen_rpids]
+            stale_src = [r for r in replies if _rpid_of(r) in seen_rpids]
+            new_replies = [r for r in replies if _rpid_of(r) not in seen_rpids]
             if new_replies:
                 page_comments = _collect_page(new_replies, oid, client, executor=ex)
                 save_comments(bvid, page_comments)
-                seen_rpids.update(r.get("rpid") for r in new_replies)
+                seen_rpids.update(x for x in (_rpid_of(r) for r in new_replies) if x)
                 new_total += len(new_replies)
             # 已见主评论轻量回写：刷新 like/reply_count 等（高回复榜热度不再停在首采快照）
             stale = [c for c in (_parse_comment(r, is_sub=False) for r in stale_src) if c]

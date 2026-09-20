@@ -18,7 +18,6 @@ protobuf 结构（DmSegMobileReply）：
                  weight=9, pool=11, idStr=12(string)
 为免引入 protobuf 依赖，wire 格式手写解析。
 """
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -271,7 +270,13 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         print(f"[历史弹幕] 已采集完成，滚动补采最近 {HISTORY_RECENT_REFRESH_DAYS} 天"
               f"（{refresh_from.isoformat()} ~ {today.isoformat()}，弹幕池每日滚动，dmid 幂等去重）")
     elif bvid and last_date:
-        print(f"[历史弹幕] 断点续采：{last_date} 及以前的日期已完成，新日期与失败日将续采")
+        if fetched_dates:
+            print(f"[历史弹幕] 断点续采：已采 {len(fetched_dates)} 个日期（最新 {last_date}），"
+                  f"未采日期与失败日将续采")
+        else:
+            # 旧版检查点（无日期集）：只能以高水位判断，语义与升序采集时代一致
+            print(f"[历史弹幕] 断点续采（旧版检查点）：{last_date} 及以前的日期视为已完成，"
+                  f"新日期与失败日将续采")
 
     # 续采高水位快照：进入循环前固定，循环内 last_date 只增用于落库持久化——
     # 降序遍历中若用活值做跳过判据，会先推高水位再把同轮更早日全部误跳过
@@ -279,8 +284,9 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
 
     end_ym = (today.year, today.month)
     if pubdate:
-        start = time.localtime(pubdate)
-        start_ym = (start.tm_year, start.tm_mon)
+        # 与 today 一致按北京时间换算发布月：宿主机非东八区时月界会整体偏一个月
+        start = datetime.fromtimestamp(pubdate, timezone(timedelta(hours=8)))
+        start_ym = (start.year, start.month)
     else:
         # 无发布时间时只从当月回溯 HISTORY_MAX_MONTHS 个月
         y, m = end_ym
@@ -309,10 +315,14 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         if fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
             truncated = True
             break
-        dates = _fetch_month_dates(cid, month, client)
-        if dates is None:
-            # 月份索引失败：时间窗不完整（不写 done）；该月内挂账的失败日继续挂账待补
+        try:
+            dates = _fetch_month_dates(cid, month, client)
+        except Exception as e:
+            # 网络/风控异常：该月按失败处理（不写 done），并立即落盘挂账待下轮补采
+            print(f"[历史弹幕] 警告：{month} 月份索引请求异常（{e}），跳过该月")
             window_complete = False
+            if bvid:
+                _save_date_set(bvid, "failed_dates", failed_dates)
             continue
         if not dates:
             continue
@@ -320,8 +330,14 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             if fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
                 truncated = True
                 break
+            # 续采判据：有日期集时**只认日期集**。降序遍历下 last_date 是"最新已采日"，
+            # 拿它当高水位会把中断点之前、从未采集的更早日期整段误跳过（永久漏采且照写 done）。
+            # 高水位兜底只保留两种语义成立的场景：旧版检查点（无日期集，升序时代
+            # "last_date 及以前已完成"成立）、已完成视频的滚动补采（done=1 时窗口内
+            # 日期均已处置，含设计性截断——不该被重新翻出来补采）。
+            watermark_skip = bool(resume_before) and (done_before or not fetched_dates)
             if date not in failed_dates and (
-                    date in fetched_dates or (resume_before and date <= resume_before)):
+                    date in fetched_dates or (watermark_skip and date <= resume_before)):
                 continue            # 该日已落库（失败日除外：不被高水位跳过，重试补采）
             work_dates.append(date)
 
@@ -343,9 +359,12 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     def _apply(date, dms, err):
         nonlocal fetched_days, last_date
         if err is not None:
-            # 降级而非中断：单日失败仅跳过该日并记账，后续运行优先补采
+            # 降级而非中断：单日失败仅跳过该日并记账，后续运行优先补采；
+            # 挂账立即落盘——否则中途异常退出会让本次失败日无人记账
             print(f"[历史弹幕] 警告：{date} 弹幕采集失败，已跳过: {err}")
             failed_dates.add(date)
+            if bvid:
+                _save_date_set(bvid, "failed_dates", failed_dates)
             return
         failed_dates.discard(date)
         all_danmaku.extend(dms)
@@ -367,15 +386,19 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     if work_dates:
         if len(shards) > 1:
             ex = ThreadPoolExecutor(max_workers=len(shards))
+            cancel = False
             try:
                 futs = [ex.submit(_one_day, a) for a in enumerate(work_dates)]
                 for fut in as_completed(futs):
                     _apply(*fut.result())
-            except KeyboardInterrupt:
-                ex.shutdown(wait=False, cancel_futures=True)   # Ctrl+C 立即退，排队日不等
+            except BaseException:
+                # Ctrl+C / 落库或检查点写失败等：取消排队任务并立即收尾，
+                # 异常继续向上传播由调用方降级。在途日期的结果无人消费，
+                # 但未落库即未计入 fetched_dates，下轮重跑按日期集自动补采。
+                cancel = True
                 raise
-            else:
-                ex.shutdown(wait=True)
+            finally:
+                ex.shutdown(wait=not cancel, cancel_futures=cancel)
         else:
             for a in enumerate(work_dates):
                 _apply(*_one_day(a))

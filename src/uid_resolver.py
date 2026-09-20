@@ -66,7 +66,7 @@ def verify_uid_exists(uid: int, client: BiliAPIClient) -> Tuple[str, dict]:
         data = client.get(USER_CARD_URL, params={"mid": uid})
         code = data.get("code")
         if code == 0:
-            card = data.get("data", {}).get("card", {})
+            card = (data.get("data") or {}).get("card") or {}
             if not card or not card.get("mid"):
                 return VERIFY_NOT_EXISTS, {}
             return VERIFY_EXISTS, {

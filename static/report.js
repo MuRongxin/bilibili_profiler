@@ -493,7 +493,8 @@ function drawAfEdges() {
         if (n.na > 0) c.style.fill = aColor[String(n.id)];   // 攻击者节点与边同色
         const t = document.createElementNS(svgNS, 'text');
         const maxLen = 8;   // 标签统一截 8 字，配合簇半径余量防越界
-        const label = n.name.length > maxLen ? n.name.slice(0, maxLen) + '…' : n.name;
+        const nm = String(n.name || '匿名');   // users.name 可能为 NULL → 防 TypeError 白屏
+        const label = nm.length > maxLen ? nm.slice(0, maxLen) + '…' : nm;
         // 计数文本：双角色节点（链条）显示 攻×na 被×nv，单角色显示 ×n
         const cnt = (n.na > 0 && n.nv > 0) ? `攻${n.na} 被${n.nv}` : `×${n.n}`;
         const off = rOf(n) + 8;
@@ -550,7 +551,7 @@ function drawAfEdges() {
             svg.querySelectorAll('.af-edge.af-edge-hot').forEach(p => p.classList.remove('af-edge-hot')));
         gEl.addEventListener('click', () => {
             // 定位明细条目（挑事者/被围攻者两个列表都可能有 ta，取第一个命中）
-            const item = document.querySelector(`.af-item[data-uid="${n.id}"]`);
+            const item = document.querySelector(`.af-item[data-uid="${CSS.escape(String(n.id))}"]`);
             if (item) {
                 item.scrollIntoView({behavior: 'smooth', block: 'center'});
                 item.classList.add('af-flash');
@@ -866,12 +867,17 @@ function loadDanmaku() {
         .then(data => {
             const tbody = document.getElementById('dmTbody');
             tbody.innerHTML = data.rows.map(row => {
-                const sender = row.uid
-                    ? '<a onclick="gotoUser(' + row.uid + ')">' + escHtml(row.name || row.uid) + '</a><br><span class="dm-time">UID:' + row.uid + '</span>'
+                // uid 只接受整数（服务端已归一为 int）：非整数一律不渲染跳转链接，
+                // 避免被污染的值突破内联 JS 上下文（纵深防御）
+                const uidNum = Number(row.uid);
+                const sender = Number.isInteger(uidNum)
+                    ? '<a onclick="gotoUser(' + uidNum + ')">' + escHtml(row.name || uidNum) + '</a><br><span class="dm-time">UID:' + uidNum + '</span>'
                     : '<span class="dm-time">' + escHtml(row.mid_hash) + '</span>';
                 const dup = row.dup_count > 1 ? ' <span class="dm-time">×' + row.dup_count + '</span>' : '';
-                const dot = row.color ? '<span class="dm-dot" style="background:' + escHtml(row.color) +
-                    '" title="' + escHtml(row.color) + '"></span>' : '';
+                // 颜色只接受 #rrggbb（服务端已归一）：否则不渲染色块，防 CSS 声明注入
+                const safeColor = /^#[0-9a-fA-F]{6}$/.test(row.color || '') ? row.color : '';
+                const dot = safeColor ? '<span class="dm-dot" style="background:' + safeColor +
+                    '" title="' + escHtml(safeColor) + '"></span>' : '';
                 const cats = (row.categories || []).map(c =>
                     '<span style="display:inline-block;background:' + (dmCatColors[c] || '#999') +
                     ';color:#fff;font-size:12px;border-radius:4px;padding:1px 8px;margin:1px 2px;">' +

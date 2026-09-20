@@ -189,10 +189,10 @@ def generate_user_card(profile: dict) -> str:
     # 标签HTML
     tag_html = "".join(f'<span class="tag">{esc(t)}</span>' for t in tags)
 
-    # 基础信息
-    follower = profile.get("follower", 0)
-    following = profile.get("following", 0)
-    like_num = profile.get("like_num", 0)
+    # 基础信息（数值字段可能为 None：统一次级默认，避免 :, 格式化崩溃）
+    follower = profile.get("follower") or 0
+    following = profile.get("following") or 0
+    like_num = profile.get("like_num") or 0
 
     # 弹幕信息
     dm = profile.get("danmaku", {})
@@ -267,14 +267,14 @@ def generate_user_card(profile: dict) -> str:
     all_names = profile.get("all_following_names", [])
     all_raw = profile.get("all_followings_raw", [])
     # name → raw info 映射
-    raw_map = {r["name"]: r for r in all_raw}
+    raw_map = {r.get("name", ""): r for r in all_raw}
     fol_section = ""
     if all_names:
         # 构建 name → up_details 映射（旧版缓存画像才有深度分析；新口径采集阶段只存名单，
         # 词云改为悬停时经 /api/up/<uid>/wordcloud 懒加载）
         up_detail_map = {}
         for i, up in enumerate(fol_summary.get("up_details", [])):
-            up_detail_map[up["name"]] = (i, up)
+            up_detail_map[up.get("name", "")] = (i, up)
 
         cats_str = "、".join(f"{esc(c)}({n})" for c, n in fol_summary.get("top_categories", [])[:4])
         up_names = ""

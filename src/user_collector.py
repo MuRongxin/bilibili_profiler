@@ -35,7 +35,7 @@ def get_user_card(uid: int, client: BiliAPIClient) -> dict:
     if data.get("code") != 0:
         return {"error": data.get("message", "获取失败")}
 
-    card = data.get("data", {}).get("card", {})
+    card = (data.get("data") or {}).get("card") or {}
     vip = card.get("vip", {})
     official = card.get("official_verify", {})
 
@@ -53,7 +53,7 @@ def get_user_card(uid: int, client: BiliAPIClient) -> dict:
         "official_title": official.get("desc", ""),
         "follower": card.get("fans", 0),
         "following": card.get("attention", 0),
-        "like_num": data.get("data", {}).get("like_num", 0),
+        "like_num": (data.get("data") or {}).get("like_num", 0),
         "archive_count": card.get("archive_count", 0),
         "article_count": card.get("article_count", 0),
         # ip_location removed (B站已下线该字段)
@@ -108,7 +108,7 @@ def get_user_space_info(uid: int, client: BiliAPIClient) -> dict:
     if data.get("code") != 0:
         return {}
 
-    info = data.get("data", {})
+    info = data.get("data") or {}
     live = info.get("live_room") or {}
 
     return {
@@ -186,7 +186,7 @@ def _get_videos_arc(uid: int, client: BiliAPIClient, max_pages: int) -> list[dic
         if data.get("code") != 0:
             break
 
-        vlist = data.get("data", {}).get("list", {}).get("vlist", [])
+        vlist = ((data.get("data") or {}).get("list") or {}).get("vlist", [])
         if not vlist:
             break
 
@@ -203,7 +203,7 @@ def _get_videos_arc(uid: int, client: BiliAPIClient, max_pages: int) -> list[dic
                 "tag": v.get("tag") or "",
             })
 
-        total = data.get("data", {}).get("page", {}).get("count", 0)
+        total = ((data.get("data") or {}).get("page") or {}).get("count", 0)
         if len(all_videos) >= total:
             break
 
@@ -224,7 +224,7 @@ def get_user_dynamics(uid: int, client: BiliAPIClient, max_pages: int = MAX_DYNA
         if data.get("code") != 0:
             break
 
-        items = data.get("data", {}).get("items", [])
+        items = (data.get("data") or {}).get("items", [])
         if not items:
             break
 
@@ -267,8 +267,8 @@ def get_user_dynamics(uid: int, client: BiliAPIClient, max_pages: int = MAX_DYNA
                 "video_info": video_info,
             })
 
-        offset = data.get("data", {}).get("offset", "")
-        if not data.get("data", {}).get("has_more", False):
+        offset = (data.get("data") or {}).get("offset", "")
+        if not (data.get("data") or {}).get("has_more", False):
             break
 
     return all_dynamics
@@ -301,7 +301,7 @@ def get_favorite_contents(media_id: int, client: BiliAPIClient, max_items: int =
         return []
 
     items = []
-    for item in data.get("data", {}).get("medias") or []:
+    for item in (data.get("data") or {}).get("medias") or []:
         items.append({
             "id": item.get("id", 0),
             "title": item.get("title", ""),
@@ -325,7 +325,7 @@ def get_followings(uid: int, client: BiliAPIClient, max_pages: int = MAX_FOLLOWI
         if data.get("code") != 0:
             break
 
-        flist = data.get("data", {}).get("list", [])
+        flist = (data.get("data") or {}).get("list", [])
         if not flist:
             break
 
@@ -334,12 +334,12 @@ def get_followings(uid: int, client: BiliAPIClient, max_pages: int = MAX_FOLLOWI
                 "uid": f.get("mid", 0),
                 "name": f.get("uname", ""),
                 "sign": f.get("sign", ""),
-                "official_type": _safe_int(f.get("official", {}).get("type", -1), -1),
-                "vip_type": f.get("vip", {}).get("type", 0),
+                "official_type": _safe_int((f.get("official") or {}).get("type", -1), -1),
+                "vip_type": _safe_int((f.get("vip") or {}).get("type", 0)),
                 "face": f.get("face", ""),
             })
 
-        total = data.get("data", {}).get("total", 0)
+        total = (data.get("data") or {}).get("total", 0)
         if len(all_followings) >= total:
             break
 
@@ -356,7 +356,7 @@ def get_followers(uid: int, client: BiliAPIClient, max_pages: int = MAX_FOLLOWER
         if data.get("code") != 0:
             break
 
-        flist = data.get("data", {}).get("list", [])
+        flist = (data.get("data") or {}).get("list", [])
         if not flist:
             break
 
@@ -365,11 +365,11 @@ def get_followers(uid: int, client: BiliAPIClient, max_pages: int = MAX_FOLLOWER
                 "uid": f.get("mid", 0),
                 "name": f.get("uname", ""),
                 "sign": f.get("sign", ""),
-                "official_type": _safe_int(f.get("official", {}).get("type", -1), -1),
-                "vip_type": f.get("vip", {}).get("type", 0),
+                "official_type": _safe_int((f.get("official") or {}).get("type", -1), -1),
+                "vip_type": _safe_int((f.get("vip") or {}).get("type", 0)),
             })
 
-        total = data.get("data", {}).get("total", 0)
+        total = (data.get("data") or {}).get("total", 0)
         if len(all_followers) >= total:
             break
 
@@ -393,7 +393,7 @@ def get_bangumi_list(uid: int, client: BiliAPIClient, btype: int = 1) -> list[di
         return []
 
     items = []
-    for item in data.get("data", {}).get("list", []):
+    for item in (data.get("data") or {}).get("list", []):
         items.append({
             "title": item.get("title", ""),
             "season_id": item.get("season_id", 0),
@@ -439,7 +439,7 @@ def analyze_activity_pattern(timestamps: list[int]) -> dict:
         elif 18 <= peak_hour < 24:
             activity_type = "晚间活跃"
         else:
-            activity_type = "夜猫子"
+            activity_type = "深夜党"   # 0-5 时：与 profile_analyzer 的"深夜党"标签同名，避免"夜猫子/深夜党"语义重叠
 
     return {
         "peak_hour": peak_hour,

@@ -72,17 +72,26 @@ src/
 - **限速是硬约束**：B站 API 有风控，`config.py` 中 `REQUEST_DELAY` / `REQUEST_DELAY_LONG` 为区间值（基础 0.8–1.6s、高风险 2–4s，区间内随机取时长以消除固定节奏特征），触发风控（-412/HTTP412/重签无效的-352/-403）时自适应倍率 ×1.5 上调（上限 5.0，由 `ADAPTIVE_THROTTLE_*` 控制）、业务成功后缓慢回落，重试最多 3 次指数退避。新增 API 调用必须走 `BiliAPIClient`，不要绕过限速直接发请求。
 - **失败要降级而非中断**：例如评论采集失败时回退为仅用 CRC32 破解；LLM 分析失败只打印警告。单个用户采集异常不得中断整体流水线。
 - **不删除数据**：刷屏检测只标记 `spam_level`，不删除任何弹幕。
-- 采集规模由 `config.py` 中的 `MAX_*` 常量控制（评论 100 页、子评论补采 25 页/条、动态定员上限 ANALYZE_USERS_FLOOR=300 / ANALYZE_USERS_RATIO=0.05 / MAX_ANALYZE_USERS_HARD_CAP=1000（保底/按比例上浮/绝对封顶）、深掘 LLM_DEEP_TOP_K=20、问题弹幕/问题评论判定并发上限 LLM_CONCURRENCY=16（实际路数=min(批次数,上限)，429 限速自动退避重试）、问题弹幕批大小 CRINGE_BATCH_SIZE=200、问题评论批次/上限 COMMENT_CRINGE_BATCH_SIZE=100 / COMMENT_CRINGE_MAX_ITEMS=2000、问题评论作者直引阈值 COMMENT_AUTHOR_MIN_SEVERITY=2 / COMMENT_AUTHOR_MIN_HITS=2、评论 UID 收割上限 UID_HARVEST_MAX_PAGES=500、问题评论榜 COMMENT_HEAT_REPLY_WEIGHT=10 / PROBLEM_COMMENT_TOP_N=30、争执焦点 ATTACK_FOCUS_TOP_N=5 / ATTACK_FOCUS_MAX_N=20（保底/封顶，按攻击边数浮动）、密度时间轴桶数 DENSITY_BUCKETS=60、跨视频面板 CROSS_VIDEO_MIN_VIDEOS=2 / CROSS_VIDEO_MAX_USERS=50、LLM 深掘超时 LLM_DEEP_TIMEOUT=120、LLM 判定整轮重试熔断 LLM_RETRY_BUDGET_SECONDS=1800 / 瞬态重试 LLM_TRANSIENT_RETRIES=2、历史弹幕滚动补采 HISTORY_RECENT_REFRESH_DAYS=3、代理恢复重探 PROXY_RETRY_AFTER=600、单账号池冷却 SINGLE_ACCOUNT_RISK_COOLDOWN=120、WBI 密钥负缓存 WBI_KEY_FAIL_TTL=60、buvid3/bili_ticket 重试 CRED_FAIL_TTL=300、回复树深度 REPLY_TREE_MAX_DEPTH=50、web job 淘汰 WEB_JOB_MAX_KEPT=100、手动分析上限 ANALYZE_MAX_TARGETS=200、刷屏检测 SPAM_BURST_*/SPAM_VARIANT_*/SPAM_COMBO_BONUS/SPAM_RELATIVE_*/REPEAT_EVENT_* 窗口阈值与组合/相对离群/复读事件参数等），调优时改这里而不是散落在代码里的数字。
+- 采集规模由 `config.py` 中的 `MAX_*` 常量控制（评论 100 页、子评论补采 25 页/条、动态定员上限 ANALYZE_USERS_FLOOR=300 / ANALYZE_USERS_RATIO=0.05 / MAX_ANALYZE_USERS_HARD_CAP=1000（保底/按比例上浮/绝对封顶）、深掘 LLM_DEEP_TOP_K=20、问题弹幕/问题评论判定并发上限 LLM_CONCURRENCY=16（实际路数=min(批次数,上限)，429 限速自动退避重试）、问题弹幕批大小 CRINGE_BATCH_SIZE=200、问题评论批次/上限 COMMENT_CRINGE_BATCH_SIZE=100 / COMMENT_CRINGE_MAX_ITEMS=2000、问题评论作者直引阈值 COMMENT_AUTHOR_MIN_SEVERITY=2 / COMMENT_AUTHOR_MIN_HITS=2、评论 UID 收割上限 UID_HARVEST_MAX_PAGES=500、问题评论榜 COMMENT_HEAT_REPLY_WEIGHT=10 / PROBLEM_COMMENT_TOP_N=30、争执焦点 ATTACK_FOCUS_TOP_N=5 / ATTACK_FOCUS_MAX_N=20（保底/封顶，按攻击边数浮动）、密度时间轴桶数 DENSITY_BUCKETS=60、跨视频面板 CROSS_VIDEO_MIN_VIDEOS=2 / CROSS_VIDEO_MAX_USERS=50、LLM 深掘超时 LLM_DEEP_TIMEOUT=120、LLM 判定整轮重试熔断 LLM_RETRY_BUDGET_SECONDS=1800 / 瞬态重试 LLM_TRANSIENT_RETRIES=2、历史弹幕滚动补采 HISTORY_RECENT_REFRESH_DAYS=3、代理恢复重探 PROXY_RETRY_AFTER=600、单账号池冷却 SINGLE_ACCOUNT_RISK_COOLDOWN=120、WBI 密钥负缓存 WBI_KEY_FAIL_TTL=60、buvid3/bili_ticket 重试 CRED_FAIL_TTL=300、回复树深度 REPLY_TREE_MAX_DEPTH=50、web job 淘汰 WEB_JOB_MAX_KEPT=100 / 报告页 HTML 缓存条目上限 PAGE_CACHE_MAX=50、手动分析上限 ANALYZE_MAX_TARGETS=200、刷屏检测 SPAM_BURST_*/SPAM_VARIANT_*/SPAM_COMBO_BONUS/SPAM_RELATIVE_*/REPEAT_EVENT_* 窗口阈值与组合/相对离群/复读事件参数等），调优时改这里而不是散落在代码里的数字。
 - 输出文件：`data/reports/report_{BV号}_{时间}.csv/.json`（CSV/JSON 导出，web.py 报告页提供下载链接）、`data/profiler.db`（数据库）、`data/cookie.json`（登录态）。
 
 ## 测试说明
 
-项目**没有单元测试框架**（无 pytest/unittest 目录）。验证方式是直接运行：
+项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
-- `python quick_test.py` —— 最小化端到端冒烟测试（只分析刷屏 top N 用户，速度快）；
-- 或完整 `python run.py <BV号>` 跑通全流程并用 `python web.py` 检查生成的 Web 报告与控制台各阶段统计。
+```bash
+# 1) 离线回归（31 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合
+python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
 
-改动后请至少跑一次 `quick_test.py` 验证。注意运行需要有效 Cookie 和真实网络，且会真实请求 B站 API。
+# 2) 静态检查（抓未定义名/语法类回归，比运行时踩 NameError 便宜得多）
+python -m pyflakes src/*.py web.py run.py quick_test.py login.py
+
+# 3) 真实端到端冒烟（需有效 Cookie 与网络）
+python quick_test.py [BV号] [--top N]
+```
+
+新增/修改易错路径（断点续采、翻页降级、LLM 判定聚合等）时，请在 `tests/offline/` 补一条离线用例——本轮全库审查中三处缺陷（评论 NameError、判定聚合被清零）正是靠这类用例才被锁住。
 
 ## 安全注意事项
 
