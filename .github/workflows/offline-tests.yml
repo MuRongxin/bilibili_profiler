@@ -1,0 +1,41 @@
+name: 离线回归与静态检查
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline-tests:
+    name: 离线回归（${{ matrix.os }} / Python ${{ matrix.python }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: windows-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: 生成 src/config.py（仓库不含真实配置，只有模板）
+        run: python -c "import shutil; shutil.copyfile('config.example.py', 'src/config.py')"
+
+      - name: 离线回归 + 静态检查（34 项，无需网络 / Cookie / LLM 额度）
+        run: python tests/run_all.py --lint

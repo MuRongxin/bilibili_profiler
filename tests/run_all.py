@@ -43,8 +43,18 @@ SCRIPTS = [
     "tests/offline/regress_comment_path.py",    # 评论采集路径 10 项
     "tests/offline/regress_judge_danmaku.py",   # 问题弹幕判定聚合 4 项
     "tests/offline/regress_judge_comment.py",   # 问题评论判定聚合 3 项
+    "tests/offline/regress_config_template.py", # 配置模板与真实配置同步 3 项
 ]
 SUMMARY_RE = re.compile(r"(\d+) 项通过,\s*(\d+) 项失败")
+
+
+def ensure_local_config() -> None:
+    """全新克隆没有 src/config.py（已被 .gitignore 排除）：从模板生成一份，零配置即可跑回归。"""
+    real, example = ROOT / "src" / "config.py", ROOT / "config.example.py"
+    if real.exists() or not example.exists():
+        return
+    real.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"（已从 config.example.py 生成 {real.relative_to(ROOT)}，仅本地使用、不入库）")
 
 
 def run_offline() -> tuple[int, int, list[str]]:
@@ -97,6 +107,7 @@ def run_lint() -> bool:
 
 def main() -> int:
     print(f"使用解释器: {PY}")
+    ensure_local_config()
     passed, failed, bad = run_offline()
     lint_ok = run_lint() if "--lint" in sys.argv else True
     print("\n" + "=" * 52)

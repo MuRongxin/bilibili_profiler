@@ -190,7 +190,7 @@ src/
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（31 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（34 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -247,7 +247,7 @@ src/
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：31 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：34 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -269,6 +269,7 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_comment_path.py` | 10 | wbi/legacy 翻页与降级、请求异常保留已采、真重复页检测、缺 rpid 脏行、刷新计数 |
 | `tests/offline/regress_judge_danmaku.py` | 4 | 问题弹幕判定必须被采纳并归到正确发送者（防"解析了却没采纳"） |
 | `tests/offline/regress_judge_comment.py` | 3 | 问题评论判定必须回映到正确 rpid |
+| `tests/offline/regress_config_template.py` | 3 | `config.example.py` 与 `src/config.py` 常量同步（模板漏项会让全新克隆 ImportError） |
 
 `tests/run_all.py` 会自动挑选带依赖的解释器（当前解释器 → 仓库 `.venv`），从任意目录运行均可，失败时退出码非 0，可直接接 CI。
 

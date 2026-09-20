@@ -37,6 +37,8 @@ class FakeOpenAI:
     def __init__(self, **kw):
         self.chat = type("Chat", (), {"completions": _Comp()})()
 
+cd.LLM_API_KEY = "offline-test-key"   # 判定入口在 Key 为空时会直接跳过，离线用例注入占位值
+cd.LLM_FALLBACK = ("", "", "", "")     # 只走主用厂商（假客户端）
 cd.OpenAI = FakeOpenAI
 cd.CRINGE_BATCH_SIZE = 3        # 6 条 → 2 批，第 2 批走"空数组 + 说明文字"
 cd.LLM_CONCURRENCY = 1          # 串行，保证批次与响应一一对应
