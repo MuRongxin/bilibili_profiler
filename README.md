@@ -10,8 +10,8 @@
 
 ```bash
 # 前置：Python ≥ 3.10（开发与 CI 在 3.10 / 3.12 上验证）
-git clone <本仓库的 clone 地址>        # 仓库页 Code 按钮可复制（HTTPS / SSH 均可）
-cd bilibili_profiler
+git clone https://github.com/ChamiTea1/BiliVideoProfiler.git
+cd BiliVideoProfiler
 python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
