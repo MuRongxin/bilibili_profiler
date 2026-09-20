@@ -6,6 +6,34 @@
 
 这是一个开源的 B站弹幕数据分析工具，采用 MIT 许可证。**使用前请务必阅读文末[免责声明](#免责声明)。**
 
+## 快速开始
+
+```bash
+# 前置：Python ≥ 3.10（开发与 CI 在 3.10 / 3.12 上验证）
+git clone <本仓库的 clone 地址>        # 仓库页 Code 按钮可复制（HTTPS / SSH 均可）
+cd bilibili_profiler
+python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+# 生成配置：仓库不含真实配置，只有模板（src/config.py 已在 .gitignore 中，勿提交）
+cp config.example.py src/config.py
+#   需要 AI 判定就在 src/config.py 填 LLM_API_KEY，或 export LLM_API_KEY=...
+#   不填也能跑：问题弹幕/问题评论判定与 AI 深掘会自动跳过，采集、破解、画像、报告全部可用
+
+# 分析一个视频（首次运行会打印二维码，用 B站APP 扫码确认）
+python run.py BV1vu4y1b7Y9
+```
+
+跑完会自动启动本地报告服务并打开浏览器：**http://127.0.0.1:8000**（没自动打开就手动 `python web.py`；换端口用 `PROFILER_PORT=9000 python web.py`）。
+
+**先小规模试跑**（不烧额度、几分钟内出结果）：
+
+```bash
+python quick_test.py BV1vu4y1b7Y9 --top 10    # 采样 100 条弹幕 / 50 条评论，只分析刷屏 top 10
+```
+
+耗时预期：小视频几分钟，热门视频可能 1 小时以上（受限速硬约束）；**任意时刻 Ctrl+C 可中断，重跑自动续采**。
+
 ## 核心特性
 
 - **弹幕采集**：实时弹幕池 + 全量历史弹幕（逐日弹幕池快照，每日上限 1000 条，热门期可能不完整），按发送者聚合
@@ -28,23 +56,6 @@
 - **用户互动时间线**：`/user/<UID>` 页追踪某个用户在全部已分析视频中的弹幕/评论互动（按最近互动倒序，含样本时间；仅覆盖已分析视频范围）
 - **数据导出**：CSV/JSON 导出（report_{BV号}_{时间} 前缀），Web 报告页提供下载链接
 - **断点续采**：SQLite持久化，中断后可恢复
-
-## 安装
-
-```bash
-cd bilibili_profiler
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-首次使用需复制配置模板并按需修改（如需 LLM 分析请填入 `LLM_API_KEY`，或用环境变量覆盖）：
-
-```bash
-cp config.example.py src/config.py
-```
-
-> `src/config.py` 已在 `.gitignore` 中，请勿提交到任何公共仓库。
 
 ## 用法
 
@@ -69,6 +80,8 @@ python run.py --batch videos.txt
 可选 IP 池（风控时换"新号+新IP"继续采集，长冷却仅作最后手段；不配也能正常运行）：
 - 已有运行中的 Clash/ShellCrash：程序自动探测本机控制器（9090/9999/9097），零配置直接用；ShellCrash 建议「模式设置 → 流量劫持范围 → 4 纯净模式」，其它应用流量不受影响。
 - 没有梯子工具：在 config.py 或环境变量填 `SUB_URLS`（支持多个机场订阅，逗号分隔），程序自动下载/拉起内置 mihomo 核心（只监听 127.0.0.1 随机端口，不影响其它应用）。
+
+批量模式（`python run.py --batch videos.txt`）逐个视频分析，**不会自动启动 web 服务**（避免逐视频弹浏览器）；跑完自行 `python web.py` 即可在首页看到全部视频。中途 Ctrl+C 只会跳过后续视频，已完成的仍保存在库里。
 
 ## 断点续采机制
 
@@ -135,6 +148,32 @@ src/
 - 大会员状态、收藏夹等部分数据需要登录后才能获取完整信息
 - 用户关注列表等API可能需要登录态，未登录时可能返回有限数据
 - 分析大量用户时耗时较长，程序支持Ctrl+C中断并恢复
+
+## 常见问题（FAQ）
+
+**一定要配 LLM API Key 吗？**
+不必。不配置（或留空）时，问题弹幕判定、问题评论判定、AI 深掘三个阶段自动跳过，采集、UID 破解、画像、报告全部照常；报告页对应区块显示为空态。
+
+**第一次运行卡在扫码？**
+`run.py` 会同时在终端打印字符码二维码并写出图片 `data/qrcode.png`：用 B站APP → 右上角「扫一扫」→ 扫终端或图片 → 在 APP 点确认。等待上限 3 分钟，超时重跑即可。登录态存 `data/cookie.json`，之后自动复用。
+
+**提示 Cookie 失效 / 又要重新扫码？**
+Cookie 里带 `_refresh_token` 时会自动续期；若没有它（或刷新失败）就重新跑 `python login.py` 扫码。小号同理：`python login.py alt1`。
+
+**报告页打不开 / 提示端口被占用？**
+换端口：`PROFILER_PORT=9000 python web.py`；停掉占用端口的旧实例：`python web.py --stop`（它按 pidfile 校验确实是本项目的 web.py 才动手，不会误杀别的进程）。
+
+**为什么这么慢 / 一直在冷却？**
+B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风险接口 2–4 秒），热门视频必然是小时级。可以：① `--max-users 50` 限制分析人数；② 配小号池（`python login.py alt1`）与 IP 池（`SUB_URLS`）提升吞吐；③ 中途 Ctrl+C，重跑会从检查点续采、不重复已采数据。
+
+**怎么删掉数据？**
+单个视频：报告页点「删除报告」（清空该视频的弹幕/评论/画像/导出文件）。全部清空：停掉服务后删除 `data/profiler.db`、`data/reports/`、`data/cookie.json`。所有数据都在本地 `data/` 目录，没有任何云端存储。
+
+**LLM 会把数据发到哪里？**
+只发给你配置的模型厂商（默认 DeepSeek，可切 GLM / MiMo）：内容是判定所需的弹幕/评论文本与画像证据字段，不含 Cookie、不含 API Key。不配置则完全不外发。
+
+**能只在本地看、不联网吗？**
+采集必须联网（要访问 B站接口）；但报告浏览、导出、离线回归测试都不需要网络，前端依赖（Chart.js / wordcloud2）已本地化到 `static/`。
 
 ## 局限性与已知边界
 
