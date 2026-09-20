@@ -83,6 +83,39 @@ python run.py --batch videos.txt
 
 批量模式（`python run.py --batch videos.txt`）逐个视频分析，**不会自动启动 web 服务**（避免逐视频弹浏览器）；跑完自行 `python web.py` 即可在首页看到全部视频。中途 Ctrl+C 只会跳过后续视频，已完成的仍保存在库里。
 
+分析名单怎么定（不加 `--max-users` 时）：
+
+- 进入画像的是**兴趣分命中者**：中/高风险刷屏、或至少 1 条问题弹幕、或问题评论达阈值的作者（凭评论明文 UID 直引）；
+- 上限随发送者规模浮动：`max(300, 独立发送者数 × 5%)`，绝对封顶 1000；显式传 `--max-users N` 则以 N 为准；
+- 未命中阈值的发送者只留在"未解析"里（报告页会标注"已解析 / 全部发送者"比例）——弹幕匿名，必须逐视频破解才知道是谁。
+
+> ⚠️ `--max-users` 是**按弹幕数降序截断**，而问题评论直引作者的 `danmaku_count=0`、排在最后，用了它这些人会**最先被砍掉**。只想快速试跑可以放心用；想让"问题评论作者"这条线完整进报告就别限制，或给足够大的值。
+
+需要主动登录/换号时（不依赖 `run.py` 的自动提示）：`python login.py`（主号）、`python login.py alt1`（小号）。
+
+## 报告页怎么用
+
+打开 http://127.0.0.1:8000（**只监听本机回环**，默认不能从其他机器访问；确实需要远程请自行加反向代理，并注意页面含敏感画像数据）。
+
+**首页**：已分析视频列表（搜索 / 点列头排序 / 分页）；下方「跨视频重叠用户」面板列出在 ≥2 个视频里都出现过的发送者，点开视频条目可看 TA 在每个视频里的弹幕与评论样本。
+
+**报告页八个标签页**：概览 / 用户画像 / 弹幕浏览器 / 问题弹幕榜 / 争执焦点 / 问题评论榜 / 高回复评论 / 低置信度。按常用动作索引：
+
+| 我想…… | 去哪儿 / 怎么做 |
+|---|---|
+| 先看总体结论 | **概览**：统计卡、用户等级/刷屏/标签/地域图、弹幕密度时间轴、群体复读事件、解析质量区块（解析方式与置信度分布、碰撞风险人数） |
+| 核验某条弹幕出现在视频哪一段 | 概览页**点击密度时间轴的柱条**，直接跳到视频对应时段 |
+| 找某个人的弹幕/评论 | **弹幕浏览器**：按内容搜索、按发送者（mid_hash / 昵称 / UID）筛选、按问题类别或刷屏等级过滤、按重复数/发送时间/视频内时间排序 |
+| 补采一个"未解析"的发送者 | 弹幕浏览器里**勾选发送者** → 触发后台强制分析（UID 解析 + 采集 + 画像 + LLM 深掘），进度实时轮询、失败项可重试，完成后自动刷新并恢复你原来的筛选与滚动位置 |
+| 看谁在跟谁吵 | **争执焦点**：顶部关系图（悬停节点高亮其全部关系边、点节点定位到下方明细）+ 挑事者/被围攻者双榜（附攻击原文与被攻击原评） |
+| 追某个人的跨视频轨迹 | 点任意用户名进入 `/user/<UID>` 互动时间线；用户卡片内的「其他视频足迹」看 TA 在别的视频里的样本 |
+| 看潜在争执热点 | **高回复评论**：回复数达阈值的评论单独成页，回复树按父子嵌套、默认折叠；悬停评论组片刻弹出该组讨论主题词云 |
+| 复核低置信度身份 | **低置信度**：集中列出 CRC32 反查得到的、存在碰撞风险的解析结果，便于人工判断是否误识别 |
+| 纠正 LLM 误判 | 问题弹幕/问题评论条目右侧的「**误报**」按钮：标记后立即从统计与用户疑似分中扣除，可撤销，跨重跑保留 |
+| 脱敏后展示/截图 | 首页或报告页的「隐藏信息」开关：昵称只留末字、UID 只留前三位（全局生效） |
+| 存档或分享 | 浏览器 `Ctrl+P` 打印成 PDF（已配打印样式）；标签页与筛选状态都写在 URL 里，复制链接即可还原现场 |
+| 重跑 / 删除某个视频 | 报告页概览操作条：🔄 重新生成（后台跑完整流水线）/ 🗑 删除报告（清空该视频全部数据与导出文件） |
+
 ## 断点续采机制
 
 全阶段断点续采：任意位置中断（Ctrl+C/崩溃）后重跑自动续上，无需人工干预——
@@ -102,25 +135,54 @@ python run.py --batch videos.txt
 - **数据库**：`data/profiler.db`（支持中断恢复）
 - **Cookie**：`data/cookie.json`（主号登录态）+ `data/cookies/*.json`（可选小号池，自动管理）
 
+## 常用配置
+
+配置集中在 `src/config.py`（由 `config.example.py` 复制而来），敏感项均可用环境变量覆盖：
+
+| 配置项 | 作用 | 默认 |
+|---|---|---|
+| `LLM_API_KEY` / `LLM_MODEL` / `LLM_PROVIDER` | AI 判定与深掘；**留空则自动跳过全部 LLM 阶段** | 空 / `deepseek-v4-flash` / `deepseek`（可选 `glm` `mimo`） |
+| `SUB_URLS` | 机场订阅（逗号分隔多个），内置 IP 池的节点来源 | 空（不启 IP 池） |
+| `WEB_AUTOSTART` | 分析完是否自动起 web 服务并打开浏览器 | `True` |
+| `REQUEST_DELAY` / `REQUEST_DELAY_LONG` | 基础 / 高风险接口的请求间隔区间（秒） | `(0.8, 1.6)` / `(2.0, 4.0)` |
+| `MAX_COMMENT_PAGES` | 评论主楼最多翻页数（每页约 20 条） | `100` |
+| `HISTORY_MAX_MONTHS` / `HISTORY_MAX_DAYS` | 历史弹幕回溯上限 | `24` / `400` |
+| `ANALYZE_USERS_FLOOR` / `_RATIO` / `MAX_ANALYZE_USERS_HARD_CAP` | 定员上限：保底 / 按发送者比例 / 封顶 | `300` / `0.05` / `1000` |
+| `LLM_DEEP_TOP_K` | AI 深掘人数（兴趣分 top K） | `20` |
+| `PROFILER_PORT`（环境变量） | Web 服务端口 | `8000` |
+
+> ⚠️ 调低 `REQUEST_DELAY` 会显著提高触发 B站风控的概率，不建议；其余取值影响的是耗时与覆盖度，可按需调整。
+
 ## 技术架构
 
 ```
-web.py                 # 交互式 Web 报告服务（Flask，127.0.0.1:8000；CSS/JS 在 static/）
-static/                # Web 报告静态资源（report.css/report.js/index.css/index.js）
+web.py                 # 交互式 Web 报告服务（Flask，127.0.0.1:8000；路由 + 数据装配，CSS/JS 在 static/）
+static/                # Web 报告静态资源（report.css/report.js/index.css/index.js + 本地化 Chart.js / wordcloud2）
+tests/                 # 离线回归（tests/run_all.py + tests/offline/*）：秒级、不联网、不用 Cookie、不烧 LLM 额度
+.github/               # Issue/PR 模板 + CI（离线回归与静态检查，Ubuntu/Windows × Python 3.10/3.12）
 src/
-├── main.py              # 主控流程（6阶段流水线）
-├── web_autostart.py     # 分析完毕自动启动Web报告
-├── auth.py              # 扫码登录 + Cookie管理
-├── api_client.py        # HTTP请求封装（限速、重试）
-├── danmaku.py           # 弹幕XML解析 + 发送者聚合
-├── comment.py           # 评论区采集 + UID映射
-├── uid_resolver.py      # mid_hash破解 + 交叉验证引擎
-├── spam_detector.py     # 刷屏智能检测
-├── user_collector.py    # 用户深度数据采集（四维度）
-├── profile_analyzer.py  # 画像分析 + 标签生成
-├── report.py            # 报告渲染函数库（被 web.py 复用）
-├── storage.py           # SQLite持久化
-└── config.py            # 配置常量
+├── main.py              # 主控流程：登录 → 弹幕 → 刷屏检测 → 问题弹幕判定 → 评论 → 问题评论判定 → UID 解析 → 用户采集 → 画像 → AI 深掘 → 导出
+├── web_autostart.py     # 分析完毕自动启动 web.py 并打开报告页（WEB_AUTOSTART 开关）
+├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新、小号池发现
+├── api_client.py        # HTTP 封装：区间随机限速 + 自适应降速 + 重试退避 + 风控冷却 + WBI 签名
+├── combo_pool.py        # 账号×IP 组合池：风控换"新号+新IP"重试，冷却锁外等待，IP 池故障降级直连
+├── clash_ctl.py         # Clash/mihomo 控制器封装（列节点 / 切节点换出口 IP，失败静默降级）
+├── proxy_core.py        # 内置 mihomo 核心生命周期（订阅→本地随机端口；锁定版本 + 官方 SHA256 校验）
+├── danmaku.py           # 实时弹幕 XML 解析、按发送者聚合、互动弹幕明文 mid
+├── danmaku_history.py   # 历史弹幕逐日快照采集（手写 protobuf 解析、失败日记账、断点续采）
+├── comment.py           # 评论区采集（wbi/main 游标 + 楼中楼补采 + IP 属地）、UID 收割、增量刷新
+├── uid_resolver.py      # mid_hash 破解：明文交叉验证 + 存在性验证 + 碰撞消歧
+├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（覆盖全部 ≤10 位 UID）
+├── spam_detector.py     # 本地刷屏检测（只标记不删除）+ 群体复读事件检测
+├── cringe_detector.py   # LLM 问题弹幕/问题评论判定（八类口径 + 批次缓存 + 预算熔断）
+├── user_collector.py    # 四维度用户数据采集（主页信息/互动足迹/社交关系/行为模式）
+├── profile_analyzer.py  # 规则式画像分析与标签生成
+├── llm_analyzer.py      # AI 重点深掘（兴趣分 top K，单人单调用 + 缓存）
+├── up_analyzer.py       # 被关注 UP 主投稿词云（悬停时懒加载）
+├── report.py            # 报告渲染函数库（用户卡片 / 榜单 / 图表，被 web.py 复用）
+├── exporter.py          # CSV / JSON 导出
+├── storage.py           # SQLite 持久化（WAL）+ 断点续采检查点 + LLM 结果缓存
+└── config.py            # 全部配置常量（由 config.example.py 复制；已在 .gitignore 中）
 ```
 
 ## mid_hash 解析策略
