@@ -39,7 +39,7 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      CROSS_VIDEO_MIN_VIDEOS, CROSS_VIDEO_MAX_USERS, DENSITY_BUCKETS,
                      COMMENT_HEAT_REPLY_WEIGHT, PROBLEM_COMMENT_TOP_N,
                      ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_MAX_N, USER_CARD_URL, NAV_URL,
-                     REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, PAGE_CACHE_MAX, ANALYZE_MAX_TARGETS)
+                     REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, ANALYZE_MAX_TARGETS)
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
 from storage import get_db, init_db
@@ -2050,13 +2050,9 @@ def video_page(bvid: str):
 </body>
 </html>'''
     with _PAGE_CACHE_LOCK:
+        # 不设条目上限：缓存规模随使用者浏览过的视频数增长，由使用者自行取舍；
+        # 正确性不依赖淘汰——每条都带数据指纹，落后即重渲染，job/删除/误报也会主动失效
         _PAGE_CACHE[(bvid, mask)] = (page_fp, html)
-        # 条目上限：每视频 × mask 两版整页 HTML（单页可达数 MB），超限按写入顺序淘汰最旧
-        while len(_PAGE_CACHE) > PAGE_CACHE_MAX:
-            oldest = next(iter(_PAGE_CACHE))
-            if oldest == (bvid, mask):
-                break
-            _PAGE_CACHE.pop(oldest, None)
     return html
 
 

@@ -203,7 +203,6 @@ WBI_KEY_FAIL_TTL = 60              # WBI 密钥获取失败负缓存秒数（原
 CRED_FAIL_TTL = 300                # buvid3/bili_ticket 获取失败重试间隔秒数（原 api_client._CRED_FAIL_TTL）
 REPLY_TREE_MAX_DEPTH = 50          # 高回复评论树渲染递归深度上限（原 web.py _REPLY_TREE_MAX_DEPTH）
 WEB_JOB_MAX_KEPT = 100             # web 内存 job 表淘汰上限（原 web.py _JOB_MAX_KEPT）
-PAGE_CACHE_MAX = 50                 # 报告页整页 HTML 内存缓存条目上限（每视频 × 隐藏信息开关两版）
 ANALYZE_MAX_TARGETS = 200          # /api/analyze 单次 mid_hashes 上限（原 web.py _ANALYZE_MAX_TARGETS）
 SPAM_BURST_WINDOW_SECONDS = 10     # 刷屏突发检测的滑动窗口长度（秒，原 spam_detector._BURST_WINDOW_SECONDS）
 SPAM_BURST_HIGH_COUNT = 5          # 窗口内 ≥N 条判高强度突发（原 spam_detector._BURST_HIGH_COUNT）
