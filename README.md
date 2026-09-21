@@ -9,7 +9,6 @@
 ## 快速开始
 
 ```bash
-# 前置：Python ≥ 3.10
 git clone https://github.com/ChamiTea1/BiliVideoProfiler.git
 cd BiliVideoProfiler
 python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
@@ -27,8 +26,10 @@ python run.py BV1vu4y1b7Y9
 ```
 
 跑完会自动启动本地报告服务并打开浏览器：**http://127.0.0.1:8000**
- `python web.py` 可以自己启动报告服务；
- 换端口用 `PROFILER_PORT=9000 python web.py`）。
+
+`python web.py` 可以自己启动报告服务；
+
+换端口用 `PROFILER_PORT=9000 python web.py`。
 
 
 
@@ -76,16 +77,18 @@ python run.py --batch videos.txt
 首次运行会提示扫码登录，请使用B站APP扫描终端显示的二维码。
 
 可选小号池（多号并行提速 + 风控时轮换兜底）：
-`python login.py alt1` 
-`python login.py alt2` 
-`python login.py alt3` 
+``` bash
+python login.py alt1
+python login.py alt2
+python login.py alt3
 ...
+```
 建议配置多个小号，可以显著提高采集速度；
 
 `run.py` 建组合池时自动发现并入池；用户深度采集阶段按账号分片并行（限速按号独立，N 号≈N 倍吞吐），触发风控时换号（+换IP）重试，触发风控的号不剔除、保留在轮询池。
 
 可选 IP 池（风控时换"新号+新IP"继续采集，长冷却仅作最后手段；不配也能正常运行）：
-- 已有运行中的 Clash/ShellCrash：程序自动探测本机控制器（9090/9999/9097），零配置直接用；。
+- 已有运行中的 Clash/ShellCrash：程序自动探测本机控制器（9090/9999/9097），零配置直接用；
 - 没有梯子工具：在 config.py 或环境变量配置 `SUB_URLS`（支持多个机场订阅，逗号分隔），程序自动下载/拉起内置 mihomo 核心（只监听 127.0.0.1 随机端口，不影响其它应用）。
 
 批量模式（`python run.py --batch videos.txt`）逐个视频分析，**不会自动启动 web 服务**（避免逐视频弹浏览器）；跑完自行 `python web.py` 即可在首页看到全部视频。中途 Ctrl+C 只会跳过后续视频，已完成的仍保存在库里。
@@ -103,7 +106,7 @@ python run.py --batch videos.txt
 
 ## 报告页怎么用
 
-打开 http://127.0.0.1:8000（**只监听本机回环**，默认不能从其他机器访问；确实需要远程请自行加反向代理，并注意页面含敏感画像数据）。
+打开 http://127.0.0.1:8000；**只监听本机回环**，默认不能从其他机器访问；确实需要远程请自行加反向代理，并注意页面含敏感画像数据。
 
 **首页**：已分析视频列表（搜索 / 点列头排序 / 分页）；下方「跨视频重叠用户」面板列出在 ≥2 个视频里都出现过的发送者，点开视频条目可看 TA 在每个视频里的弹幕与评论样本。
 
