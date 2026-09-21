@@ -9,28 +9,28 @@
 ## 快速开始
 
 ```bash
-# 前置：Python ≥ 3.10（开发与 CI 在 3.10 / 3.12 上验证）
+# 前置：Python ≥ 3.10
 git clone https://github.com/ChamiTea1/BiliVideoProfiler.git
 cd BiliVideoProfiler
 python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 生成配置：仓库不含真实配置，只有模板（src/config.py 已在 .gitignore 中，勿提交）
-cp config.example.py src/config.py
-#   需要 AI 判定就在 src/config.py 填 LLM_API_KEY，或 export LLM_API_KEY=...
+# 生成配置：仓库不含真实配置，只有模板
+cp config.example.py src/config.py # 把 config.example.py 复制到 ./src 目录并更名为config.py
+# config.py 配置说明在下面的内容有写
+
+# 在 src/config.py 配置 LLM_API_KEY，或 使用环境变量 export LLM_API_KEY=...
 #   不填也能跑：问题弹幕/问题评论判定与 AI 深掘会自动跳过，采集、破解、画像、报告全部可用
 
 # 分析一个视频（首次运行会打印二维码，用 B站APP 扫码确认）
 python run.py BV1vu4y1b7Y9
 ```
 
-跑完会自动启动本地报告服务并打开浏览器：**http://127.0.0.1:8000**（没自动打开就手动 `python web.py`；换端口用 `PROFILER_PORT=9000 python web.py`）。
+跑完会自动启动本地报告服务并打开浏览器：**http://127.0.0.1:8000**
+ `python web.py` 可以自己启动报告服务；
+ 换端口用 `PROFILER_PORT=9000 python web.py`）。
 
-**先小规模试跑**（不烧额度、几分钟内出结果）：
 
-```bash
-python quick_test.py BV1vu4y1b7Y9 --top 10    # 采样 100 条弹幕 / 50 条评论，只分析刷屏 top 10
-```
 
 耗时预期：小视频几分钟，热门视频可能 1 小时以上（受限速硬约束）；**任意时刻 Ctrl+C 可中断，重跑自动续采**。
 
@@ -75,11 +75,18 @@ python run.py --batch videos.txt
 
 首次运行会提示扫码登录，请使用B站APP扫描终端显示的二维码。
 
-可选小号池（多号并行提速 + 风控时轮换兜底）：`python login.py alt1` 扫码登录小号（存 `data/cookies/alt1.json`），`run.py` 建组合池时自动发现并入池；用户深度采集阶段按账号分片并行（限速按号独立，N 号≈N 倍吞吐），触发风控时换号（+换IP）重试，触发风控的号不剔除、保留在轮询池。
+可选小号池（多号并行提速 + 风控时轮换兜底）：
+`python login.py alt1` 
+`python login.py alt2` 
+`python login.py alt3` 
+...
+建议配置多个小号，可以显著提高采集速度；
+
+`run.py` 建组合池时自动发现并入池；用户深度采集阶段按账号分片并行（限速按号独立，N 号≈N 倍吞吐），触发风控时换号（+换IP）重试，触发风控的号不剔除、保留在轮询池。
 
 可选 IP 池（风控时换"新号+新IP"继续采集，长冷却仅作最后手段；不配也能正常运行）：
-- 已有运行中的 Clash/ShellCrash：程序自动探测本机控制器（9090/9999/9097），零配置直接用；ShellCrash 建议「模式设置 → 流量劫持范围 → 4 纯净模式」，其它应用流量不受影响。
-- 没有梯子工具：在 config.py 或环境变量填 `SUB_URLS`（支持多个机场订阅，逗号分隔），程序自动下载/拉起内置 mihomo 核心（只监听 127.0.0.1 随机端口，不影响其它应用）。
+- 已有运行中的 Clash/ShellCrash：程序自动探测本机控制器（9090/9999/9097），零配置直接用；。
+- 没有梯子工具：在 config.py 或环境变量配置 `SUB_URLS`（支持多个机场订阅，逗号分隔），程序自动下载/拉起内置 mihomo 核心（只监听 127.0.0.1 随机端口，不影响其它应用）。
 
 批量模式（`python run.py --batch videos.txt`）逐个视频分析，**不会自动启动 web 服务**（避免逐视频弹浏览器）；跑完自行 `python web.py` 即可在首页看到全部视频。中途 Ctrl+C 只会跳过后续视频，已完成的仍保存在库里。
 
@@ -91,7 +98,8 @@ python run.py --batch videos.txt
 
 > ⚠️ `--max-users` 是**按弹幕数降序截断**，而问题评论直引作者的 `danmaku_count=0`、排在最后，用了它这些人会**最先被砍掉**。只想快速试跑可以放心用；想让"问题评论作者"这条线完整进报告就别限制，或给足够大的值。
 
-需要主动登录/换号时（不依赖 `run.py` 的自动提示）：`python login.py`（主号）、`python login.py alt1`（小号）。
+需要主动登录/换号时：
+`python login.py`（主号）、`python login.py alt*`（小号）。
 
 ## 报告页怎么用
 
