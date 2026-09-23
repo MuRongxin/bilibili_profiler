@@ -13,6 +13,21 @@ from collections import Counter
 from urllib.parse import urlparse
 
 
+# 弹幕样本与时间戳数量不一致的告警去重（web.py 每次页面重建都会调用本模块，
+# 同一视频多用户/多次渲染只告警一次；按 (contents, video_times) 长度对去重，集合有界）
+_DM_MISMATCH_WARNED: set = set()
+
+
+def _warn_dm_mismatch(n_contents: int, n_times: int) -> None:
+    """contents 与 video_times 数量不一致时打印一次告警（历史残留画像/合成键）。"""
+    sig = (n_contents, n_times)
+    if sig in _DM_MISMATCH_WARNED:
+        return
+    _DM_MISMATCH_WARNED.add(sig)
+    print(f"  [Report] 警告: 弹幕样本与时间戳数量不一致 "
+          f"(contents={n_contents}, video_times={n_times})，已按 contents 补齐（缺失时间显示 00:00）")
+
+
 # 报告基础样式（原静态 HTML 骨架的 <style> 内容平移；web.py 页面模板注入）
 REPORT_CSS = """
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -199,8 +214,11 @@ def generate_user_card(profile: dict) -> str:
     dm_count = dm.get("count", 0)
     dm_contents = dm.get("contents", [])
     dm_times = dm.get("video_times", [])
-    # 按时间戳排序
-    paired = list(zip(dm_contents, dm_times)) if dm_times else [(c, 0) for c in dm_contents]
+    # contents 与 video_times 理论同源等长；历史残留画像/合成键可能不等，
+    # 以 contents 为准按索引配对、缺失位用 0 占位，避免 zip 静默截断丢样本，并告警留痕
+    if len(dm_contents) != len(dm_times):
+        _warn_dm_mismatch(len(dm_contents), len(dm_times))
+    paired = [(c, dm_times[i] if i < len(dm_times) else 0) for i, c in enumerate(dm_contents)]
     paired.sort(key=lambda x: x[1])
     dm_items = []
     for c, t in paired:

@@ -106,7 +106,8 @@ python login.py alt3
 
 ## 报告页怎么用
 
-打开 http://127.0.0.1:8000；**只监听本机回环**，默认不能从其他机器访问；确实需要远程请自行加反向代理，并注意页面含敏感画像数据。
+打开 http://127.0.0.1:8000；
+**只监听本机回环**，默认不能从其他机器访问；确实需要远程请自行加反向代理，并注意页面含敏感画像数据。
 
 **首页**：已分析视频列表（搜索 / 点列头排序 / 分页）；下方「跨视频重叠用户」面板列出在 ≥2 个视频里都出现过的发送者，点开视频条目可看 TA 在每个视频里的弹幕与评论样本。
 
@@ -302,7 +303,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（34 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（39 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -359,7 +360,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：34 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：39 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -382,6 +383,7 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_judge_danmaku.py` | 4 | 问题弹幕判定必须被采纳并归到正确发送者（防"解析了却没采纳"） |
 | `tests/offline/regress_judge_comment.py` | 3 | 问题评论判定必须回映到正确 rpid |
 | `tests/offline/regress_config_template.py` | 3 | `config.example.py` 与 `src/config.py` 常量同步（模板漏项会让全新克隆 ImportError） |
+| `tests/offline/regress_danmaku_stats_source.py` | 5 | 缓存命中分支不得泄漏旧快照 `contents`（与阶段6 现取的 `video_times` 同源等长）、报告渲染对长度不一的补齐不丢样本 |
 
 `tests/run_all.py` 会自动挑选带依赖的解释器（当前解释器 → 仓库 `.venv`），从任意目录运行均可，失败时退出码非 0，可直接接 CI。
 

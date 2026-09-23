@@ -44,6 +44,7 @@ SCRIPTS = [
     "tests/offline/regress_judge_danmaku.py",   # 问题弹幕判定聚合 4 项
     "tests/offline/regress_judge_comment.py",   # 问题评论判定聚合 3 项
     "tests/offline/regress_config_template.py", # 配置模板与真实配置同步 3 项
+    "tests/offline/regress_danmaku_stats_source.py", # 弹幕统计同源与报告补齐 5 项
 ]
 SUMMARY_RE = re.compile(r"(\d+) 项通过,\s*(\d+) 项失败")
 

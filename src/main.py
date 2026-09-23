@@ -441,13 +441,16 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
             confidence = c["confidence"]
             if is_crack and confidence == "高":
                 confidence = "中"
+            # 缓存行只承载"解析结论"（uid/方式/置信度）；弹幕统计是廉价本地聚合，
+            # 一律以本轮 sender_groups 为准，避免旧快照 contents 与阶段6 现取的
+            # video_times 在 report.py 被 zip 静默截断/错配（缓存 count/contents 仅兜底）
             resolved[mid_hash] = {
                 "uid": c["uid"],
                 "confidence": confidence,
                 "method": c["method"],
                 "user_info": {},
-                "danmaku_count": c["danmaku_count"],
-                "contents": c["contents"],
+                "danmaku_count": group.get("count", c["danmaku_count"]),
+                "contents": group.get("contents", c["contents"]),
                 "spam_level": c.get("spam_level", "低"),
                 "spam_score": c.get("spam_score", 0.0),
                 "collision_risk": is_crack,
