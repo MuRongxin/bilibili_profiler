@@ -4,8 +4,10 @@
 
 ## 开发环境
 
+需要 **Python 3.12+**（项目使用 PEP 701 嵌套 f-string，3.10 / 3.11 无法运行）。
+
 ```bash
-git clone <repo-url> && cd bilibili_profiler
+git clone https://github.com/MuRongxin/bilibili_profiler.git && cd bilibili_profiler
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt -r requirements-dev.txt
 cp config.example.py src/config.py                 # 仓库不含真实配置，只有模板

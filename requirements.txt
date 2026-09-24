@@ -1,3 +1,4 @@
+# 需要 Python >= 3.12（PEP 701 嵌套 f-string）
 certifi==2026.5.20
 charset-normalizer==3.4.7
 idna==3.17

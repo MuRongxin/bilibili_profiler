@@ -8,9 +8,12 @@
 
 ## 快速开始
 
+> **环境要求：Python 3.12 或更高版本**。项目使用了 Python 3.12 的嵌套 f-string 语法（PEP 701），
+> 3.10 / 3.11 会在 `import report` 时直接 SyntaxError，无法运行。
+
 ```bash
-git clone https://github.com/ChamiTea1/BiliVideoProfiler.git
-cd BiliVideoProfiler
+git clone https://github.com/MuRongxin/bilibili_profiler.git
+cd bilibili_profiler
 python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
@@ -171,7 +174,7 @@ python login.py alt3
 web.py                 # 交互式 Web 报告服务（Flask，127.0.0.1:8000；路由 + 数据装配，CSS/JS 在 static/）
 static/                # Web 报告静态资源（report.css/report.js/index.css/index.js + 本地化 Chart.js / wordcloud2）
 tests/                 # 离线回归（tests/run_all.py + tests/offline/*）：秒级、不联网、不用 Cookie、不烧 LLM 额度
-.github/               # Issue/PR 模板 + CI（离线回归与静态检查，Ubuntu/Windows × Python 3.10/3.12）
+.github/               # Issue/PR 模板 + CI（离线回归与静态检查，Ubuntu/Windows × Python 3.12）
 src/
 ├── main.py              # 主控流程：登录 → 弹幕 → 刷屏检测 → 问题弹幕判定 → 评论 → 问题评论判定 → UID 解析 → 用户采集 → 画像 → AI 深掘 → 导出
 ├── web_autostart.py     # 分析完毕自动启动 web.py 并打开报告页（WEB_AUTOSTART 开关）

@@ -27,6 +27,10 @@ from collections import Counter
 from datetime import datetime
 from contextlib import closing
 
+if sys.version_info < (3, 12):
+    sys.exit(f"本项目需要 Python 3.12 或更高版本（当前 {sys.version.split()[0]}）："
+             "代码使用了 Python 3.12 的嵌套 f-string 语法。")
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from flask import Flask, abort, jsonify, request, send_from_directory

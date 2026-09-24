@@ -63,8 +63,10 @@ def run_offline() -> tuple[int, int, list[str]]:
     bad: list[str] = []
     for rel in SCRIPTS:
         print(f"\n=== {rel} ===")
+        # 显式 UTF-8：用例打印 ✔/✘ 与中文，Windows 默认 cp1252 会 UnicodeEncodeError
         proc = subprocess.run([PY, str(ROOT / rel)], cwd=str(ROOT),
-                              capture_output=True, text=True)
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
         out = (proc.stdout or "") + (proc.stderr or "")
         hits = SUMMARY_RE.findall(out)
         if hits:
@@ -90,7 +92,8 @@ def run_lint() -> bool:
     try:
         proc = subprocess.run([PY, "-m", "pyflakes", "src", "web.py", "run.py",
                                "quick_test.py", "login.py", "tests"],
-                              cwd=str(ROOT), capture_output=True, text=True)
+                              cwd=str(ROOT), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
     except FileNotFoundError:
         print("  未安装 pyflakes，跳过（pip install pyflakes）")
         return True

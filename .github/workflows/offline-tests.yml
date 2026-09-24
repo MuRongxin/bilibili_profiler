@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # 项目要求 Python >= 3.12（使用 PEP 701 嵌套 f-string）；统一输出为 UTF-8，
+  # 避免 Windows 默认 cp1252 打印中文/✔ 时 UnicodeEncodeError
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 jobs:
   offline-tests:
     name: 离线回归（${{ matrix.os }} / Python ${{ matrix.python }}）
@@ -14,8 +20,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            python: "3.10"
           - os: ubuntu-latest
             python: "3.12"
           - os: windows-latest
@@ -37,5 +41,5 @@ jobs:
       - name: 生成 src/config.py（仓库不含真实配置，只有模板）
         run: python -c "import shutil; shutil.copyfile('config.example.py', 'src/config.py')"
 
-      - name: 离线回归 + 静态检查（34 项，无需网络 / Cookie / LLM 额度）
+      - name: 离线回归 + 静态检查（39 项，需 Python >= 3.12；无需网络 / Cookie / LLM 额度）
         run: python tests/run_all.py --lint
