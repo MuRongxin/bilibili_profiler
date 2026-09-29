@@ -524,9 +524,13 @@ def phase_comment_cringe(comments: list, video_info: dict) -> dict | None:
         return None
 
 
-def phase_collect_users(resolved: dict, pool, max_users: int | None = None, force: bool = False):
+def phase_collect_users(resolved: dict, pool, max_users: int | None = None, force: bool = False,
+                         cache_only: bool = False):
     """阶段5: 深度采集用户数据（名单已由阶段4兴趣定员；max_users 为手动硬上限
     （--max-users 传入时），None 不截断；成功立即落库可断点续采；force=True 跳过缓存强制重采）
+
+    cache_only=True（--skip-collect）：只读库内已采数据，完全不发起网络请求——阶段5
+    请求量最大（每人约 21 个请求）、最易触发风控；未采用户本轮不生成画像，去掉参数重跑即续采。
 
     组合池（ComboPool）：每个请求由池透明接管——风控自动换"新号+新IP"重试，
     长冷却为池内兜底；兜底耗尽抛 RiskControlError，本 uid 按失败跳过（流水线不中断）。"""
@@ -560,6 +564,31 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
 
     total = len(uids_to_collect)
     print(f"[Phase 5] 需采集用户: {total} 人" + (f" (上限 {max_users})" if max_users is not None else ""))
+
+    # --skip-collect：只读库内已采数据，一个请求都不发。未采用户本轮不生成画像，
+    # 去掉该参数重跑时会被上方缓存命中逻辑自动续采，不丢数据
+    if cache_only:
+        user_data_map: dict = {}
+        hit = miss = read_fail = 0
+        for mid_hash, uid in uids_to_collect:
+            try:
+                cached_row = load_user_data(uid) if has_user_data(uid) else None
+            except Exception as e:
+                cached_row = None
+                read_fail += 1
+                print(f"  [警告] UID:{uid} 缓存读取失败（{e}），按未采集处理")
+            if cached_row:
+                user_data_map[uid] = cached_row[0]
+                hit += 1
+            else:
+                miss += 1
+        print(f"[Phase 5] 跳过采集（--skip-collect）: 库内命中 {hit} 人，未采集 {miss} 人"
+              + (f"（其中 {read_fail} 人缓存读取失败）" if read_fail else "")
+              + "；未采集者本轮不出画像")
+        if not hit:
+            print("[Phase 5] 警告: 库内无该视频的已采用户数据，本轮不会生成任何用户画像"
+                  "（报告仅剩弹幕/评论相关标签页）")
+        return user_data_map
 
     user_data_map = {}
     processed = set()
@@ -779,11 +808,13 @@ class PhaseTimer:
         print(f"[计时] 总耗时: {self._fmt(total)}")
 
 
-def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, launch_web: bool = True):
+def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, launch_web: bool = True,
+                 skip_collect: bool = False):
     """
     执行完整分析流程
 
     launch_web=False 供批量模式使用（避免逐视频开浏览器标签页）
+    skip_collect=True（--skip-collect）：阶段5 只读库内已采数据、不发起采集请求
     """
     print_banner()
     timer = PhaseTimer()   # 全流程计时：各阶段耗时 + 总耗时，结束时打印
@@ -807,6 +838,13 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     if force:
         clear_video_cache(bvid)
         print(f"[Main] --force 已清除 {bvid} 的缓存，全部重新采集")
+
+    # --skip-collect 提示：明确本轮不碰阶段5，避免误解为"采集失败"
+    if skip_collect:
+        print("[Main] --skip-collect 已启用：阶段5 只读库内已采数据，不发起任何采集请求")
+        if force:
+            print("[Main] 警告: --skip-collect 与 --force 同用，--force 已清除该视频缓存"
+                  "（含不再被其他视频引用的用户画像），本轮可能无画像可复用")
 
     # 断点续采：阶段2/3 各自按库内数据存在性独立判断（phase_danmaku/phase_comment
     # 内部的 resume 逻辑），弹幕/评论/解析/采集任意位置中断后重跑都能续上；
@@ -902,7 +940,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
 
     # 阶段5: 用户采集（组合池透明接管风控轮换）
     user_data_map = timer.run("阶段5 用户采集", phase_collect_users, resolved, pool,
-                              max_users=max_users, force=force)
+                              max_users=max_users, force=force, cache_only=skip_collect)
 
     # 阶段6: 画像分析（评论IP属地/本视频评论/问题弹幕在此贯通进画像）
     profiles = timer.run("阶段6 画像分析", phase_analyze, resolved, spam_results, user_data_map,
@@ -964,7 +1002,8 @@ def load_batch_bvids(path: str) -> list[str]:
     return bvids
 
 
-def run_batch(batch_file: str, force: bool = False, max_users: int | None = None):
+def run_batch(batch_file: str, force: bool = False, max_users: int | None = None,
+              skip_collect: bool = False):
     """批量分析：逐个视频调用 run_analysis，单个失败只警告不中断，最后打印汇总"""
     bvids = load_batch_bvids(batch_file)
     if not bvids:
@@ -985,7 +1024,8 @@ def run_batch(batch_file: str, force: bool = False, max_users: int | None = None
             failed.append(bvid)
             continue
         try:
-            run_analysis(bvid, force=force, max_users=max_users, launch_web=False)
+            run_analysis(bvid, force=force, max_users=max_users, launch_web=False,
+                         skip_collect=skip_collect)
             succeeded.append(bvid)
         except KeyboardInterrupt:
             # Ctrl+C 不再继续后续视频，但仍打印已完成的汇总
@@ -1013,11 +1053,15 @@ def main():
                         help="手动硬上限覆盖阈值制动态定员 (默认按兴趣阈值定员，兜底上限 MAX_ANALYZE_USERS_HARD_CAP)")
     parser.add_argument("--batch", metavar="FILE",
                         help="批量模式：从文件逐行读取BV号（忽略空行与 # 注释行）")
+    parser.add_argument("--skip-collect", action="store_true",
+                        help="跳过阶段5用户采集的网络请求：只用库内已采数据（未采用户本轮不出画像），"
+                             "适合不想再打接口时刷新报告；与 --force 同用会因缓存被清而无画像可用")
     args = parser.parse_args()
 
     if args.batch:
         try:
-            run_batch(args.batch, force=args.force, max_users=args.max_users)
+            run_batch(args.batch, force=args.force, max_users=args.max_users,
+                      skip_collect=args.skip_collect)
         except OSError as e:
             print(f"错误: 批量清单文件不可读: {args.batch} ({e})")
             sys.exit(1)
@@ -1033,7 +1077,8 @@ def main():
         sys.exit(1)
 
     try:
-        run_analysis(bvid, force=args.force, max_users=args.max_users)
+        run_analysis(bvid, force=args.force, max_users=args.max_users,
+                     skip_collect=args.skip_collect)
     except RiskControlError as e:
         print(f"[Main] 风控兜底耗尽（{e}），本视频分析终止")
         raise SystemExit(1)

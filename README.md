@@ -73,6 +73,10 @@ python run.py BV1vu4y1b7Y9 --force
 # 限制最大分析用户数
 python run.py BV1vu4y1b7Y9 --max-users 50
 
+# 跳过阶段5用户采集的网络请求：只用库内已采数据刷新报告（不发任何采集请求）
+# 未采集的用户本轮不出画像，去掉该参数重跑会自动续采，不丢数据
+python run.py BV1vu4y1b7Y9 --skip-collect
+
 # 批量分析（逐行读取BV号，忽略空行与 # 注释行）
 python run.py --batch videos.txt
 ```
@@ -306,7 +310,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（39 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（43 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -363,7 +367,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：39 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：43 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -387,6 +391,7 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_judge_comment.py` | 3 | 问题评论判定必须回映到正确 rpid |
 | `tests/offline/regress_config_template.py` | 3 | `config.example.py` 与 `src/config.py` 常量同步（模板漏项会让全新克隆 ImportError） |
 | `tests/offline/regress_danmaku_stats_source.py` | 5 | 缓存命中分支不得泄漏旧快照 `contents`（与阶段6 现取的 `video_times` 同源等长）、报告渲染对长度不一的补齐不丢样本 |
+| `tests/offline/regress_skip_collect.py` | 4 | `--skip-collect` 阶段5 必须零网络（哨兵池一次都不被触碰）、只带回库内已采数据、未采用户不返回 |
 
 `tests/run_all.py` 会自动挑选带依赖的解释器（当前解释器 → 仓库 `.venv`），从任意目录运行均可，失败时退出码非 0，可直接接 CI。
 
