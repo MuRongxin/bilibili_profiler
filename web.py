@@ -2545,8 +2545,10 @@ def api_danmaku(bvid: str):
     """弹幕 JSON API（spec 4）。
     命中该发送者的问题弹幕类别）、spam（高/中/低/未分析）、analyzed=1（只看已解析用户）、
     sort（video_time/send_time/dup_count/sender_count）、order（asc/desc）、page、page_size（50/100/200，默认100）。
-    返回 {rows: [...], total: int, page: int}；每行 content/dup_count/mid_hash/uid/name/
-    first_video_time/first_send_time/categories/spam_level/mode/color。
+    返回 {rows: [...], total: int, page: int, multi_page: bool}；每行 content/dup_count/
+    mid_hash/uid/name/first_video_time/first_page/first_send_time/categories/spam_level/
+    mode/color。first_page 为该弹幕首次出现的分P（多分P 视频前端渲染成「P{n} mm:ss」，
+    单分P 恒为 1 且不渲染前缀）。
     """
     # 数据库锁定/查询异常 → 500 JSON（spec 7），与下方主查询同一降级口径；
     # 详细错误只打控制台，不外透（防内部路径/SQL 细节泄露）
