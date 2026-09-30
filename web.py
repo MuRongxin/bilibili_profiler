@@ -601,26 +601,84 @@ def _danmaku_panel_stats(bvid: str) -> dict:
     }
 
 
-def _danmaku_density(bvid: str, duration) -> dict | None:
-    """概览页弹幕密度时间轴：按视频内时间分桶计数（一眼看到哪个片段弹幕爆发）。
+def _video_page_meta(video_info: dict | None) -> dict[int, dict]:
+    """分P元信息：{分P序号: {"part": 分P标题, "duration": 该P时长秒数}}。
 
-    桶数约每 10 秒一桶，上限 DENSITY_BUCKETS；无弹幕数据或时长未知返回 None（不渲染）。"""
-    duration = int(duration or 0)
-    if duration <= 0:
-        return None
+    无 pages 字段（旧报告缺 video_info_json / 单P旧数据）返回 {}，调用方自行降级。"""
+    meta: dict[int, dict] = {}
+    for i, p in enumerate((video_info or {}).get("pages") or []):
+        if not isinstance(p, dict):
+            continue
+        try:
+            pno = int(p.get("page") or i + 1)
+        except (TypeError, ValueError):
+            pno = i + 1
+        meta[pno] = {"part": p.get("part") or "", "duration": int(p.get("duration") or 0)}
+    return meta
+
+
+def _danmaku_density(bvid: str, duration, video_info: dict | None = None) -> dict | None:
+    """概览页弹幕密度时间轴：按「分P内部时间」分桶计数（一眼看到哪个片段弹幕爆发）。
+
+    关键：分P（多P）视频的弹幕 time 是各分P内部时间（0~该P时长），而 videos.duration 是
+    各分P时长之和；两者混用会把 P1..Pn 全部挤到时间轴开头、P1 结束后整段恒为 0
+    （BV1mtTD6rEtQ 4 分P、总时长 418s，报告里 02:02 之后全 0 即此故）。
+    故按分P分别建桶，前端用分P选择器切换、跳转链接带 p 参数。
+
+    桶数约每 10 秒一桶，上限 DENSITY_BUCKETS；无弹幕数据或时长未知返回 None（不渲染）。
+    返回 {"multi": 是否多分P, "onepage_fallback": 分P时长未知时的单轴降级,
+          "pages": [{page, part, duration, labels, data, starts}], "default": 默认选中下标}。"""
     with closing(get_db()) as conn:
-        rows = conn.execute("SELECT time FROM danmaku WHERE bvid = ?", (bvid,)).fetchall()
+        rows = conn.execute("SELECT page, time FROM danmaku WHERE bvid = ?", (bvid,)).fetchall()
     if not rows:
         return None
-    buckets = min(DENSITY_BUCKETS, max(10, duration // 10))
-    size = duration / buckets
-    counts = [0] * buckets
+    total = int(duration or 0)
+    grouped: dict[int, list[float]] = {}
     for r in rows:
-        i = int(r["time"] // size)
-        counts[min(max(i, 0), buckets - 1)] += 1
-    labels = [_fmt_video_time(i * size) for i in range(buckets)]
-    # starts：每桶起始秒数（前端点击柱条跳转视频对应时段，P1-a）
-    return {"labels": labels, "data": counts, "starts": [int(i * size) for i in range(buckets)]}
+        try:
+            pno = int(r["page"] or 1)
+        except (TypeError, ValueError):
+            pno = 1
+        grouped.setdefault(pno, []).append(float(r["time"] or 0))
+    meta = _video_page_meta(video_info)
+    # 各分P轴长：分P元信息优先；单分P无元信息时退回 videos.duration（保持旧报告口径不变）
+    axes: dict[int, int] = {}
+    for pno in grouped:
+        d = (meta.get(pno) or {}).get("duration") or 0
+        if d > 0:
+            axes[pno] = d
+        elif len(grouped) == 1 and total > 0:
+            axes[pno] = total
+    fallback = False
+    if not axes and len(grouped) > 1 and total > 0:
+        # 多分P但分P时长全未知（旧报告缺 video_info_json.pages）：降级为旧的单轴口径——
+        # 各分P弹幕合并到同一根轴（宁可后半段为 0 也不整块不渲染，前端会标注该降级）
+        grouped = {0: [t for times in grouped.values() for t in times]}
+        axes = {0: total}
+        fallback = True
+    if not axes:
+        return None
+    pages = []
+    for pno in sorted(axes):
+        times = grouped.get(pno, [])
+        dur = axes[pno]
+        buckets = min(DENSITY_BUCKETS, max(10, dur // 10))
+        size = dur / buckets
+        counts = [0] * buckets
+        for t in times:
+            i = int(t // size)
+            counts[min(max(i, 0), buckets - 1)] += 1
+        pages.append({
+            "page": pno, "part": (meta.get(pno) or {}).get("part") or "", "duration": dur,
+            "labels": [_fmt_video_time(i * size) for i in range(buckets)],
+            # starts：每桶起始秒数（前端点击柱条跳转该分P对应时段，P1-a）
+            "starts": [int(i * size) for i in range(buckets)],
+            "data": counts,
+        })
+    # 默认选中弹幕最多的分P（主内容通常就是它，省去手动切换）
+    default = max(range(len(pages)), key=lambda i: sum(pages[i]["data"]))
+    return {"multi": len(pages) > 1, "onepage_fallback": fallback,
+            "pages": pages, "default": default}
 
 
 def _danmaku_attr_stats(bvid: str) -> dict | None:
@@ -1791,7 +1849,7 @@ def video_page(bvid: str):
                   or '<p class="empty-note">本视频无问题弹幕命中</p>')
     board_html += _fp_dm_block(fp_dm_used)   # 已标记误报弹幕的撤销入口
     panel = _danmaku_panel_stats(bvid)
-    density = _danmaku_density(bvid, row["duration"])   # 概览页弹幕密度时间轴
+    density = _danmaku_density(bvid, row["duration"], video_info)  # 概览页弹幕密度时间轴
     rq = _resolve_quality(bvid)                          # 概览页解析质量区块
     repeat_block = _repeat_events_block(bvid)            # 概览页群体复读事件区块（含全池分布自检）
     dm_attrs = _danmaku_attr_stats(bvid)                 # 弹幕属性分布（mode/color）
@@ -1832,10 +1890,29 @@ def video_page(bvid: str):
                   if chart["region_labels"] else "")
 
     # 弹幕密度时间轴（概览页，宽幅）：无全量弹幕数据（旧版本分析）或时长未知时不渲染；
-    # 点击柱条跳转视频对应时段（P1-a，前端 report.js onClick 处理）
-    density_canvas = ('<div class="chart-card chart-wide"><h3>弹幕密度时间轴'
-                      '<span class="chart-hint">（点击柱条跳转对应时段核验）</span></h3>'
-                      '<canvas id="densityChart"></canvas></div>' if density else "")
+    # 分P视频按分P分别建桶（弹幕 time 是各P内部时间，与全片累计时长不可混用），
+    # 前端 report.js 负责分P切换与「点击柱条跳转该分P对应时段」（P1-a）
+    density_canvas = ""
+    if density:
+        if density["multi"]:
+            dense_hint = (f'（{len(density["pages"])} 个分P，横轴为各分P内部时间；'
+                          f'点击柱条跳转该分P对应时段核验）')
+        else:
+            dense_hint = "（点击柱条跳转对应时段核验）"
+        dense_pager = ('<div class="density-pager" id="densityPager"></div>'
+                       if density["multi"] else "")
+        dense_note = ""
+        if density["multi"]:
+            # 数据边界：历史快照按 cid 维度采集，多分P视频只采了 P1 的历史弹幕
+            dense_note = ('<div class="density-note">分P视频：各分P弹幕时间相互独立，横轴为'
+                          '该分P内部时间。历史弹幕快照仅采集 P1（B站历史接口按 cid 维度），'
+                          '其余分P只有实时弹幕池数据，各P弹幕量不可直接横向比较。</div>')
+        elif density["onepage_fallback"]:
+            dense_note = ('<div class="density-note">本视频为多分P但缺少分P时长元信息，'
+                          '时间轴按全片累计时长降级展示，各分P弹幕会挤在时间轴前段。</div>')
+        density_canvas = (f'<div class="chart-card chart-wide"><h3>弹幕密度时间轴'
+                          f'<span class="chart-hint">{dense_hint}</span></h3>'
+                          f'{dense_pager}<canvas id="densityChart"></canvas>{dense_note}</div>')
 
     # 解析质量区块（概览页）：用户身份可信度——解析方式/置信度分布 + 碰撞风险人数
     rq_block = ""

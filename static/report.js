@@ -38,21 +38,49 @@ if (regionCanvas && chartData.region_labels.length) {
 }
 
 // 弹幕密度时间轴（概览页宽幅；无全量弹幕数据的旧视频无此 canvas）
-// 点击柱条跳转视频对应时段核验（P1-a）：starts 为每桶起始秒数
+// 分P视频按分P分别建桶（弹幕 time 是各P内部时间，与全片累计时长不可混用），
+// 故多分P时先出分P选择器、默认选中弹幕最多的那P；点击柱条跳转该分P对应时段核验（P1-a）
 const densityData = PAGE_DATA.density;
 const densityCanvas = document.getElementById('densityChart');
-if (densityCanvas && densityData) {
-    new Chart(densityCanvas, {type:'bar',
-        data:{labels:densityData.labels, datasets:[{label:'弹幕数', data:densityData.data, backgroundColor:'#00a1d6', borderRadius:2}]},
-        options:{responsive:true, aspectRatio:4,
-            onHover:(e, els) => { e.native.target.style.cursor = els.length ? 'pointer' : 'default'; },
-            onClick:(e, els) => {
-                if (!els.length) return;
-                const t = (densityData.starts || [])[els[0].index] || 0;
-                window.open('https://www.bilibili.com/video/' + PAGE_DATA.bvid + '?t=' + t, '_blank', 'noopener');
-            },
-            plugins:{legend:{display:false}, tooltip:{callbacks:{title: items => '视频时间 ' + items[0].label + '（点击跳转）'}}},
-            scales:{x:{ticks:{autoSkip:true, maxTicksLimit:20}}, y:{beginAtZero:true}}}});
+if (densityCanvas && densityData && (densityData.pages || []).length) {
+    const densityPager = document.getElementById('densityPager');
+    const densityPages = densityData.pages;
+    let densityChart = null;
+    const drawDensity = (idx) => {
+        const p = densityPages[idx];
+        const tag = (densityData.multi ? 'P' + p.page + (p.part ? ' ' + p.part : '') : (p.part || ''));
+        if (densityChart) densityChart.destroy();   // 切换分P需销毁旧实例，否则 canvas 复用出错
+        densityChart = new Chart(densityCanvas, {type:'bar',
+            data:{labels:p.labels, datasets:[{label:'弹幕数', data:p.data, backgroundColor:'#00a1d6', borderRadius:2}]},
+            options:{responsive:true, aspectRatio:4,
+                onHover:(e, els) => { e.native.target.style.cursor = els.length ? 'pointer' : 'default'; },
+                onClick:(e, els) => {
+                    if (!els.length) return;
+                    const t = (p.starts || [])[els[0].index] || 0;
+                    // 分P视频必须带 p 参数，否则跳到 P1 的错误时段
+                    const query = (densityData.multi ? 'p=' + p.page + '&' : '') + 't=' + t;
+                    window.open('https://www.bilibili.com/video/' + PAGE_DATA.bvid + '?' + query, '_blank', 'noopener');
+                },
+                plugins:{legend:{display:false}, tooltip:{callbacks:{title: items => (tag ? tag + ' · ' : '') + '视频时间 ' + items[0].label + '（点击跳转）'}}},
+                scales:{x:{ticks:{autoSkip:true, maxTicksLimit:20}}, y:{beginAtZero:true}}}});
+        if (densityPager) {
+            densityPager.querySelectorAll('button').forEach((b, i) => b.classList.toggle('active', i === idx));
+        }
+    };
+    if (densityPager && densityPages.length > 1) {
+        densityPages.forEach((p, i) => {
+            const total = p.data.reduce((a, b) => a + b, 0);
+            const part = p.part || '';
+            const short = part.length > 12 ? part.slice(0, 12) + '…' : part;
+            const btn = document.createElement('button');
+            btn.className = 'pager-btn';
+            btn.textContent = 'P' + p.page + (short ? ' ' + short : '') + ' · ' + total.toLocaleString() + ' 条';
+            btn.title = (part || '分P ' + p.page) + '（时长 ' + p.duration + ' 秒 · 弹幕 ' + total + ' 条）';
+            btn.onclick = () => drawDensity(i);
+            densityPager.appendChild(btn);
+        });
+    }
+    drawDensity(Math.min(densityData.default || 0, densityPages.length - 1));
 }
 
 // 解析质量区块（概览页）：解析方式分布 + 置信度分布
