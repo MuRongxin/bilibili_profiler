@@ -137,8 +137,7 @@ def group_by_sender(danmaku_list: list[dict]) -> dict[str, dict]:
             "timestamps": [int],
             "video_times": [float],
             "colors": [str],
-            "pages": [int],            # 去重后的分P 列表（该发送者出现在哪些分P）
-            "video_pages": [int],      # 与 contents/video_times 同下标的逐条分P
+            "pages": [int],
         }}
     """
     groups = defaultdict(lambda: {
@@ -149,7 +148,6 @@ def group_by_sender(danmaku_list: list[dict]) -> dict[str, dict]:
         "video_times": [],
         "colors": [],
         "pages": set(),
-        "video_pages": [],
     })
 
     for dm in danmaku_list:
@@ -161,9 +159,6 @@ def group_by_sender(danmaku_list: list[dict]) -> dict[str, dict]:
         g["timestamps"].append(dm["timestamp"])
         g["video_times"].append(dm["time"])
         g["colors"].append(dm["color"])
-        # video_pages 与 contents/video_times 严格同下标：报告要靠它给样本标分P
-        # （time 是"所在分P 内的相对秒数"，多分P 时不标分P 无法解释）
-        g["video_pages"].append(int(dm.get("page", 1) or 1))
         g["pages"].add(dm.get("page", 1))
 
     # 将set转为list以便JSON序列化

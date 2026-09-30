@@ -265,7 +265,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 - **实时弹幕池不全**：接口只保留最近若干条，更早的弹幕已被顶出池子。
 - **历史弹幕 ≠ 全量**：历史接口返回的是"**截至该日的最新 1000 条弹幕池快照**"，不是"当日发送的弹幕"。相邻日快照大量重叠或整体滚动，**热门视频早期的弹幕会被永久丢掉**，逐日遍历只能"逼近"而无法还原。
 - **回溯窗口有上限**：最多 24 个月 / 400 天（`HISTORY_MAX_MONTHS` / `HISTORY_MAX_DAYS`），更早的弹幕不在分析范围内；到了天数上限会写 `truncated` 标记（属设计性截断，不是失败）。
-- **多分P视频只采第 1P**：历史弹幕与互动弹幕都固定取第一个分P（分P 2 及以后只有实时池那点弹幕）。报告层按同一口径处理：**弹幕密度时间轴只统计分P 1、横轴用分P 1 时长**并标注「分P 1/共 NP」；用户卡片与互动时间线的样本时间写成 `P{n} mm:ss`——因为 `danmaku.time` 是「所在分P 内的相对秒数」，跨分P 直接比较没有意义。
+- **多分P视频只采第 1P**：历史弹幕与互动弹幕都固定取第一个分P。
 - **评论采不完**：主评论最多 100 页（≈2000 条），每条主评论的楼中楼最多补采 25 页（500 条）；触顶时写 `truncated=1` 而不写 `done`，之后每次重跑都是 0 请求、也不会推进——想采更多需调大 `MAX_COMMENT_PAGES`。
 - **问题评论判定会截断**：去重后按点赞降序**只判前 2000 条**（`COMMENT_CRINGE_MAX_ITEMS`），低赞评论不参与判定。
 - **用户维度全是采样**：投稿 3 页、动态 5 页、关注 5 页（**他人关注列表接口本身只看得到前 100 人**）、粉丝 2 页、收藏夹内容 20 条。因此"社交关系/兴趣画像"是样本而非全貌。
@@ -310,7 +310,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（49 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（43 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -367,7 +367,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：49 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：43 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -392,7 +392,6 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_config_template.py` | 3 | `config.example.py` 与 `src/config.py` 常量同步（模板漏项会让全新克隆 ImportError） |
 | `tests/offline/regress_danmaku_stats_source.py` | 5 | 缓存命中分支不得泄漏旧快照 `contents`（与阶段6 现取的 `video_times` 同源等长）、报告渲染对长度不一的补齐不丢样本 |
 | `tests/offline/regress_skip_collect.py` | 4 | `--skip-collect` 阶段5 必须零网络（哨兵池一次都不被触碰）、只带回库内已采数据、未采用户不返回 |
-| `tests/offline/regress_multipart.py` | 6 | 多分P 口径：密度时间轴用分P 1 时长且只统计分P 1、单分P 行为不变、样本 `P{n} mm:ss` 且按分P 排序 |
 
 `tests/run_all.py` 会自动挑选带依赖的解释器（当前解释器 → 仓库 `.venv`），从任意目录运行均可，失败时退出码非 0，可直接接 CI。
 

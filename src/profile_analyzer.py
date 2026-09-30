@@ -299,10 +299,6 @@ def analyze_profile(user_data: dict, danmaku_stats: dict, spam_stats: dict) -> d
             "count": danmaku_stats.get("count", 0),
             "contents": danmaku_stats.get("contents", []),
             "video_times": danmaku_stats.get("video_times", []),
-            # 逐条分P（与 contents/video_times 同下标）+ 是否多分P：报告据此把
-            # mm:ss 渲染成「P{n} mm:ss」，否则多分P 视频里的时间无法解释
-            "video_pages": danmaku_stats.get("video_pages", []),
-            "multi_page": bool(danmaku_stats.get("multi_page")),
             "repeat_rate": spam_stats.get("repeat_rate", 0),
             "spam_level": spam_stats.get("spam_level", "低"),
             "spam_score": spam_stats.get("spam_score", 0.0),

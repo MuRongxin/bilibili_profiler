@@ -601,30 +601,15 @@ def _danmaku_panel_stats(bvid: str) -> dict:
     }
 
 
-def _danmaku_density(bvid: str, video_info: dict | None = None, duration_hint=0) -> dict | None:
+def _danmaku_density(bvid: str, duration) -> dict | None:
     """概览页弹幕密度时间轴：按视频内时间分桶计数（一眼看到哪个片段弹幕爆发）。
 
-    分P 口径（重要）：danmaku.time 是「所在分P 内的相对秒数」，而 video_info.duration
-    是各分P 时长之和——多分P 视频若拿总时长铺轴，横轴上后 (P-1)/P 段必然恒为 0（历史
-    弹幕也只覆盖分P 1）。故多分P 时统一按分P 1 口径：只统计 page=1、横轴取分P 1 时长、
-    标题标注「分P 1/共 N」；跳转 ?t= 同样只对当前分P 生效，二者自洽。
-
     桶数约每 10 秒一桶，上限 DENSITY_BUCKETS；无弹幕数据或时长未知返回 None（不渲染）。"""
-    vi = video_info or {}
-    pages = vi.get("pages") or []
-    multi_page = len(pages) > 1
-    if multi_page:
-        duration = int((pages[0] or {}).get("duration") or 0) or int(duration_hint or 0)
-    else:
-        duration = int(vi.get("duration") or duration_hint or 0)
+    duration = int(duration or 0)
     if duration <= 0:
         return None
     with closing(get_db()) as conn:
-        if multi_page:
-            rows = conn.execute(
-                "SELECT time FROM danmaku WHERE bvid = ? AND page = 1", (bvid,)).fetchall()
-        else:
-            rows = conn.execute("SELECT time FROM danmaku WHERE bvid = ?", (bvid,)).fetchall()
+        rows = conn.execute("SELECT time FROM danmaku WHERE bvid = ?", (bvid,)).fetchall()
     if not rows:
         return None
     buckets = min(DENSITY_BUCKETS, max(10, duration // 10))
@@ -635,8 +620,7 @@ def _danmaku_density(bvid: str, video_info: dict | None = None, duration_hint=0)
         counts[min(max(i, 0), buckets - 1)] += 1
     labels = [_fmt_video_time(i * size) for i in range(buckets)]
     # starts：每桶起始秒数（前端点击柱条跳转视频对应时段，P1-a）
-    return {"labels": labels, "data": counts, "starts": [int(i * size) for i in range(buckets)],
-            "page_label": f"（分P 1/共 {len(pages)}P，仅统计分P 1）" if multi_page else ""}
+    return {"labels": labels, "data": counts, "starts": [int(i * size) for i in range(buckets)]}
 
 
 def _danmaku_attr_stats(bvid: str) -> dict | None:
@@ -1563,18 +1547,9 @@ def _user_timeline(uid: int) -> dict:
         if not bvids:
             return result
 
-        titles: dict[str, str] = {}
-        multi_pv: dict[str, bool] = {}   # 多分P 视频：样本 mm:ss 必须标出分P 才可解释
-        for r in conn.execute(
-                f"SELECT bvid, title, video_info_json FROM videos "
-                f"WHERE bvid IN ({','.join('?' * len(bvids))})",
-                tuple(sorted(bvids))).fetchall():
-            titles[r["bvid"]] = r["title"] or ""
-            try:
-                multi_pv[r["bvid"]] = len((json.loads(r["video_info_json"] or "{}")
-                                           .get("pages") or [])) > 1
-            except Exception:
-                multi_pv[r["bvid"]] = False
+        titles = {r["bvid"]: r["title"] or "" for r in conn.execute(
+            f"SELECT bvid, title FROM videos WHERE bvid IN ({','.join('?' * len(bvids))})",
+            tuple(sorted(bvids))).fetchall()}
         mid_hashes_by_bvid: dict[str, list[str]] = {}
         for r in conn.execute("SELECT bvid, mid_hash FROM senders WHERE uid = ?", (uid,)).fetchall():
             mid_hashes_by_bvid.setdefault(r["bvid"], []).append(r["mid_hash"])
@@ -1590,11 +1565,9 @@ def _user_timeline(uid: int) -> dict:
             dm_samples: list[dict] = []
             for mh in mid_hashes_by_bvid.get(b, []):
                 dm_samples.extend(
-                    {"content": r["content"], "ts": r["timestamp"], "vt": r["time"],
-                     # 多分P 视频：time 是分P 内相对秒数，带上分P 才能解释 mm:ss
-                     "vp": r["page"] if multi_pv.get(b) else 0}
+                    {"content": r["content"], "ts": r["timestamp"], "vt": r["time"]}
                     for r in conn.execute(
-                        "SELECT content, timestamp, time, page FROM danmaku "
+                        "SELECT content, timestamp, time FROM danmaku "
                         "WHERE bvid = ? AND mid_hash = ? ORDER BY timestamp DESC LIMIT ?",
                         (b, mh, USER_TIMELINE_SAMPLES)).fetchall())
                 if len(dm_samples) >= USER_TIMELINE_SAMPLES:
@@ -1818,7 +1791,7 @@ def video_page(bvid: str):
                   or '<p class="empty-note">本视频无问题弹幕命中</p>')
     board_html += _fp_dm_block(fp_dm_used)   # 已标记误报弹幕的撤销入口
     panel = _danmaku_panel_stats(bvid)
-    density = _danmaku_density(bvid, video_info, row["duration"])   # 概览页弹幕密度时间轴
+    density = _danmaku_density(bvid, row["duration"])   # 概览页弹幕密度时间轴
     rq = _resolve_quality(bvid)                          # 概览页解析质量区块
     repeat_block = _repeat_events_block(bvid)            # 概览页群体复读事件区块（含全池分布自检）
     dm_attrs = _danmaku_attr_stats(bvid)                 # 弹幕属性分布（mode/color）
@@ -1860,9 +1833,7 @@ def video_page(bvid: str):
 
     # 弹幕密度时间轴（概览页，宽幅）：无全量弹幕数据（旧版本分析）或时长未知时不渲染；
     # 点击柱条跳转视频对应时段（P1-a，前端 report.js onClick 处理）
-    density_label = esc(density.get("page_label", "")) if density else ""
     density_canvas = ('<div class="chart-card chart-wide"><h3>弹幕密度时间轴'
-                      + density_label +
                       '<span class="chart-hint">（点击柱条跳转对应时段核验）</span></h3>'
                       '<canvas id="densityChart"></canvas></div>' if density else "")
 
@@ -2118,9 +2089,7 @@ def user_page(uid: int):
         items = []
         for it in data["items"]:
             dm_html = "".join(
-                f'<li>{esc(s["content"])} <span class="tl-time">视频 '
-                f'{("P%d " % s["vp"]) if s.get("vp") else ""}{_fmt_video_time(s["vt"])}'
-                f' · {_fmt_ts(s["ts"])}</span></li>'
+                f'<li>{esc(s["content"])} <span class="tl-time">视频 {_fmt_video_time(s["vt"])} · {_fmt_ts(s["ts"])}</span></li>'
                 for s in it["dm_samples"]) or (
                 '<li class="ov-none">弹幕明细未留存（该视频为旧版本分析）</li>'
                 if it["dm_count"] else '<li class="ov-none">无弹幕样本</li>')
