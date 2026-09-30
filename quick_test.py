@@ -173,7 +173,10 @@ def main():
         if "error" in user_data:
             print(f"  ❌ 用户数据采集失败: {user_data['error']}")
             continue
-        dm_stats = {"count": group["count"], "contents": group["contents"], "video_times": group.get("video_times", [])}
+        dm_stats = {"count": group["count"], "contents": group["contents"],
+                    "video_times": group.get("video_times", []),
+                    "video_pages": group.get("video_pages", []),
+                    "multi_page": len(video_info.get("pages") or []) > 1}
         spam = spam_results.get(mid_hash, {})
         profile = analyze_profile(user_data, dm_stats, spam)
         profile["collision_risk"] = collision_risk

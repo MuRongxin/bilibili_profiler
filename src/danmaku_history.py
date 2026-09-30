@@ -174,17 +174,23 @@ def _month_range(start_ym: tuple[int, int], end_ym: tuple[int, int]) -> list[str
     return months
 
 
-def _load_date_set(bvid: str, key: str) -> set[str]:
+def _state_key(key: str, page: int) -> str:
+    """分P检查点键：分P 1 沿用原键名（既有报告的分P1检查点照旧生效，不触发重采），
+    其余分P 追加 ":{pN}" 后缀——各分P 的日期集/高水位/done 相互独立，互不污染。"""
+    return key if page <= 1 else f"{key}:p{page}"
+
+
+def _load_date_set(bvid: str, key: str, page: int = 1) -> set[str]:
     """读取 phase_state 中的逗号分隔日期串（failed_dates/fetched_dates）为集合"""
     from storage import get_phase_state
-    raw = get_phase_state(bvid, "danmaku", key) or ""
+    raw = get_phase_state(bvid, "danmaku", _state_key(key, page)) or ""
     return {d for d in raw.split(",") if d}
 
 
-def _save_date_set(bvid: str, key: str, dates: set[str]):
+def _save_date_set(bvid: str, key: str, dates: set[str], page: int = 1):
     """回写逗号分隔日期串（空集合写空串，读取侧按空集处理）"""
     from storage import set_phase_state
-    set_phase_state(bvid, "danmaku", key, ",".join(sorted(dates)))
+    set_phase_state(bvid, "danmaku", _state_key(key, page), ",".join(sorted(dates)))
 
 
 def _fetch_month_dates(cid: int, month: str, client: BiliAPIClient) -> list[str] | None:
@@ -212,9 +218,10 @@ def _fetch_day_danmaku(cid: int, date: str, client: BiliAPIClient) -> list[dict]
 
 
 def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int] = None,
-                          bvid: str | None = None, seen_dmids: set | None = None) -> list[dict]:
+                          bvid: str | None = None, seen_dmids: set | None = None,
+                          page: int = 1) -> list[dict]:
     """
-    采集视频历史弹幕（弹幕池快照逐日遍历）
+    采集视频历史弹幕（弹幕池快照逐日遍历；cid 为待采分P 的 cid）
 
     从 pubdate 月份起到当前月逐月查询日期索引，再逐日拉取 seg.so。月份与月内日期
     均按降序遍历：天数上限（HISTORY_MAX_DAYS）耗尽时保留最新日期（近期弹幕对画像
@@ -225,6 +232,10 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     phase_state 检查点（last_date 高水位 / fetched_dates 已采日期集 / failed_dates
     失败日清单）。续采判据以已采日期集为准（last_date 兼容旧检查点）：失败日不被
     高水位跳过，每次采集（含续采）都会重试补采，成功即销账。
+
+    page 为 cid 对应的分P 序号（弹幕池按 cid 维度，多分P 视频每个分P 各采一份）：
+    落库的每条弹幕带上 page，检查点键按 _state_key 分P 隔离——分P 1 沿用原键名，
+    既有报告不会因升级而重采分P 1；其余分P 从零开始独立续采。
 
     done 语义：仅当时间窗完整迭代且无任何失败才写 done=1（截断属设计性上限，
     done 照写但另写 truncated=1 供查询区分"采完"与"采到上限"）；有失败或月份
@@ -247,13 +258,14 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     if bvid:
         from storage import (append_danmaku, get_phase_state, load_danmaku,
                              set_phase_state)
-        last_date = get_phase_state(bvid, "danmaku", "last_date") or None
-        done_before = get_phase_state(bvid, "danmaku", "done") == "1"
-        fetched_dates = _load_date_set(bvid, "fetched_dates")
-        failed_dates = _load_date_set(bvid, "failed_dates")
+        last_date = get_phase_state(bvid, "danmaku", _state_key("last_date", page)) or None
+        done_before = get_phase_state(bvid, "danmaku", _state_key("done", page)) == "1"
+        fetched_dates = _load_date_set(bvid, "fetched_dates", page)
+        failed_dates = _load_date_set(bvid, "failed_dates", page)
         if seen_dmids is None:
             seen_dmids = {r["dmid"] for r in load_danmaku(bvid) if r["dmid"]}
     seen_dmids = seen_dmids if seen_dmids is not None else set()
+    tag = f"P{page} " if page > 1 else ""   # 日志前缀：多分P 时标明是哪个分P 在采
 
     # B站弹幕快照按北京时间划日：显式 UTC+8，消除宿主机时区依赖
     today = datetime.now(timezone(timedelta(hours=8))).date()
@@ -267,15 +279,15 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         fetched_dates = {d for d in fetched_dates if d <= cutoff}
         last_date = cutoff
         refresh_from = today - timedelta(days=HISTORY_RECENT_REFRESH_DAYS - 1)
-        print(f"[历史弹幕] 已采集完成，滚动补采最近 {HISTORY_RECENT_REFRESH_DAYS} 天"
+        print(f"[历史弹幕] {tag}已采集完成，滚动补采最近 {HISTORY_RECENT_REFRESH_DAYS} 天"
               f"（{refresh_from.isoformat()} ~ {today.isoformat()}，弹幕池每日滚动，dmid 幂等去重）")
     elif bvid and last_date:
         if fetched_dates:
-            print(f"[历史弹幕] 断点续采：已采 {len(fetched_dates)} 个日期（最新 {last_date}），"
+            print(f"[历史弹幕] {tag}断点续采：已采 {len(fetched_dates)} 个日期（最新 {last_date}），"
                   f"未采日期与失败日将续采")
         else:
             # 旧版检查点（无日期集）：只能以高水位判断，语义与升序采集时代一致
-            print(f"[历史弹幕] 断点续采（旧版检查点）：{last_date} 及以前的日期视为已完成，"
+            print(f"[历史弹幕] {tag}断点续采（旧版检查点）：{last_date} 及以前的日期视为已完成，"
                   f"新日期与失败日将续采")
 
     # 续采高水位快照：进入循环前固定，循环内 last_date 只增用于落库持久化——
@@ -299,7 +311,7 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     if len(months) > HISTORY_MAX_MONTHS:
         # 超上限时保留最近的月份（近期弹幕对画像价值更高）
         months = months[-HISTORY_MAX_MONTHS:]
-        print(f"[历史弹幕] 时间跨度超限，仅回溯最近 {HISTORY_MAX_MONTHS} 个月（{months[0]} 起）")
+        print(f"[历史弹幕] {tag}时间跨度超限，仅回溯最近 {HISTORY_MAX_MONTHS} 个月（{months[0]} 起）")
 
     all_danmaku = []
     # 已采天数以唯一日期集为准（len(fetched_dates)），不再读 fetched_days 检查点：
@@ -319,10 +331,10 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             dates = _fetch_month_dates(cid, month, client)
         except Exception as e:
             # 网络/风控异常：该月按失败处理（不写 done），并立即落盘挂账待下轮补采
-            print(f"[历史弹幕] 警告：{month} 月份索引请求异常（{e}），跳过该月")
+            print(f"[历史弹幕] {tag}警告：{month} 月份索引请求异常（{e}），跳过该月")
             window_complete = False
             if bvid:
-                _save_date_set(bvid, "failed_dates", failed_dates)
+                _save_date_set(bvid, "failed_dates", failed_dates, page)
             continue
         if not dates:
             continue
@@ -346,13 +358,17 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     #    网络在 worker 线程，落库/检查点推进在主线程 _apply 内串行完成（线程安全）。
     shards = client.shard_pools() if hasattr(client, "shard_pools") else []
     if len(shards) > 1:
-        print(f"[历史弹幕] 多号并行分片: {len(shards)} 个账号并行采集 {len(work_dates)} 天")
+        print(f"[历史弹幕] {tag}多号并行分片: {len(shards)} 个账号并行采集 {len(work_dates)} 天")
 
     def _one_day(args):
         idx, date = args
         sp = shards[idx % len(shards)] if len(shards) > 1 else client
         try:
-            return date, _fetch_day_danmaku(cid, date, sp), None
+            dms = _fetch_day_danmaku(cid, date, sp)
+            # 落库前打上分P 标记：danmaku.time 是分P 内相对秒数，必须能追溯出自哪个分P
+            for d in dms:
+                d["page"] = page
+            return date, dms, None
         except Exception as e:
             return date, None, e
 
@@ -361,10 +377,10 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         if err is not None:
             # 降级而非中断：单日失败仅跳过该日并记账，后续运行优先补采；
             # 挂账立即落盘——否则中途异常退出会让本次失败日无人记账
-            print(f"[历史弹幕] 警告：{date} 弹幕采集失败，已跳过: {err}")
+            print(f"[历史弹幕] {tag}警告：{date} 弹幕采集失败，已跳过: {err}")
             failed_dates.add(date)
             if bvid:
-                _save_date_set(bvid, "failed_dates", failed_dates)
+                _save_date_set(bvid, "failed_dates", failed_dates, page)
             return
         failed_dates.discard(date)
         all_danmaku.extend(dms)
@@ -375,13 +391,13 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             append_danmaku(bvid, dms, seen_dmids)
             if not last_date or date > last_date:
                 last_date = date   # 高水位线
-            set_phase_state(bvid, "danmaku", "last_date", last_date)
-            set_phase_state(bvid, "danmaku", "fetched_days", str(fetched_days))
-            _save_date_set(bvid, "fetched_dates", fetched_dates)
-            _save_date_set(bvid, "failed_dates", failed_dates)
+            set_phase_state(bvid, "danmaku", _state_key("last_date", page), last_date)
+            set_phase_state(bvid, "danmaku", _state_key("fetched_days", page), str(fetched_days))
+            _save_date_set(bvid, "fetched_dates", fetched_dates, page)
+            _save_date_set(bvid, "failed_dates", failed_dates, page)
         else:
             fetched_days += 1
-        print(f"[历史弹幕] {date}: {len(dms)} 条（已采日数 {fetched_days}，本轮新采 {len(all_danmaku)} 条）")
+        print(f"[历史弹幕] {tag}{date}: {len(dms)} 条（已采日数 {fetched_days}，本轮新采 {len(all_danmaku)} 条）")
 
     if work_dates:
         if len(shards) > 1:
@@ -404,21 +420,21 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
                 _apply(*_one_day(a))
 
     if truncated:
-        print(f"[历史弹幕] 已达天数上限 {HISTORY_MAX_DAYS}，更早的日期未采集（上限耗尽保留最新日期）")
+        print(f"[历史弹幕] {tag}已达天数上限 {HISTORY_MAX_DAYS}，更早的日期未采集（上限耗尽保留最新日期）")
 
     if bvid:
-        _save_date_set(bvid, "failed_dates", failed_dates)
+        _save_date_set(bvid, "failed_dates", failed_dates, page)
         if truncated:
             # 截断语义：已达 HISTORY_MAX_DAYS 上限，更早日期属设计性放弃而非失败——
             # done 照写（重跑不会也不应去补更早日期），truncated=1 单独可查
-            set_phase_state(bvid, "danmaku", "truncated", "1")
+            set_phase_state(bvid, "danmaku", _state_key("truncated", page), "1")
         if done_before:
             pass   # 滚动补采路径：保持 done=1
         elif window_complete and not failed_dates:
             # 时间窗完整迭代且无任何失败（含截断场景）才标完成；否则保留续采入口
-            set_phase_state(bvid, "danmaku", "done", "1")
+            set_phase_state(bvid, "danmaku", _state_key("done", page), "1")
         else:
-            print(f"[历史弹幕] 时间窗未完整采集（失败 {len(failed_dates)} 天"
+            print(f"[历史弹幕] {tag}时间窗未完整采集（失败 {len(failed_dates)} 天"
                   f"{'' if window_complete else '，含月份索引失败'}），不写 done，重跑可续采")
-    print(f"[历史弹幕] 共采集 {fetched_days} 天，{len(all_danmaku)} 条历史弹幕")
+    print(f"[历史弹幕] {tag}共采集 {fetched_days} 天，{len(all_danmaku)} 条历史弹幕")
     return all_danmaku

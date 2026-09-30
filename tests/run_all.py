@@ -47,6 +47,7 @@ SCRIPTS = [
     "tests/offline/regress_danmaku_stats_source.py", # 弹幕统计同源与报告补齐 5 项
     "tests/offline/regress_skip_collect.py",    # --skip-collect 零网络只读缓存 4 项
     "tests/offline/regress_density_multip.py",  # 弹幕密度时间轴分P口径 9 项
+    "tests/offline/regress_multipart_pages.py", # 多分P 历史采集与样本标注 14 项
 ]
 SUMMARY_RE = re.compile(r"(\d+) 项通过,\s*(\d+) 项失败")
 

@@ -232,16 +232,22 @@ def _get_pool(client):
 
 
 def _sender_danmaku_stats(bvid: str, mid_hash: str) -> dict:
-    """从 danmaku 表重建该发送者的弹幕统计（web 端无内存态 sender_groups）"""
+    """从 danmaku 表重建该发送者的弹幕统计（web 端无内存态 sender_groups）。
+
+    video_pages（与 contents/video_times 同下标）与 multi_page 一并带出：多分P 视频
+    手动分析出的画像同样要能标注「P{n} mm:ss」，口径与阶段6 一致。"""
     with closing(get_db()) as conn:
         rows = conn.execute(
-            "SELECT content, time, timestamp FROM danmaku WHERE bvid = ? AND mid_hash = ? ORDER BY time",
+            "SELECT content, time, timestamp, page FROM danmaku "
+            "WHERE bvid = ? AND mid_hash = ? ORDER BY page, time",
             (bvid, mid_hash)).fetchall()
     return {
         "count": len(rows),
         "contents": [r["content"] for r in rows],
         "timestamps": [r["timestamp"] for r in rows],
         "video_times": [r["time"] for r in rows],
+        "video_pages": [int(r["page"] or 1) for r in rows],
+        "multi_page": len(_load_page_meta(bvid)) > 1,
     }
 
 
@@ -424,11 +430,14 @@ def _load_profiles(bvid: str) -> list[dict]:
                 fol = json.loads(r["data_json"]).get("followings", [])
                 uid_by_name = {f.get("name"): f.get("uid") for f in fol if f.get("name")}
                 for item in raw_fol:
-                    if not item.get("uid") and uid_by_name.get(item.get("name")):
+                    if not item.get("uid") and uid_by_name.get(item["name"]):
                         item["uid"] = uid_by_name[item["name"]]
             except Exception:
                 pass
         profiles.append(p)
+    # 样本分P 标注回填（渲染期，不落库）：多分P 视频才需要，见 _fill_sample_pages
+    if len(_load_page_meta(bvid)) > 1:
+        _fill_sample_pages(bvid, profiles)
     return profiles
 
 
@@ -615,6 +624,62 @@ def _video_page_meta(video_info: dict | None) -> dict[int, dict]:
             pno = i + 1
         meta[pno] = {"part": p.get("part") or "", "duration": int(p.get("duration") or 0)}
     return meta
+
+
+def _load_page_meta(bvid: str) -> dict[int, dict]:
+    """从 videos.video_info_json 读该视频的分P元信息（web 端没有现成 video_info 时的入口）。
+
+    读不到（旧数据无元信息/行缺失）返回 {}，调用方按单分P 降级。"""
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT video_info_json FROM videos WHERE bvid = ?", (bvid,)).fetchone()
+    if row is None:
+        return {}
+    try:
+        return _video_page_meta(json.loads(row["video_info_json"] or "{}"))
+    except Exception:
+        return {}
+
+
+def _fill_sample_pages(bvid: str, profiles: list[dict]):
+    """渲染期回填画像样本的分P（不落库）：本特性之前的缓存画像没有 danmaku.video_pages
+    （阶段6 未写），按 danmaku 表的 (mid_hash, content, time) 反查补上，旧报告无需重跑
+    即可显示「P{n} mm:ss」。仅多分P 视频需要（单分P 无歧义、标了也是冗余）。
+
+    歧义保护：同一 (mid_hash, content, time) 在多分P 出现时该样本记 0（不标分P），
+    宁可不标也不标错。时间按毫秒精度 round 后比对。"""
+    todo = [p for p in profiles if not ((p.get("danmaku") or {}).get("video_pages"))]
+    hashes = sorted({p.get("_mid_hash") for p in todo if p.get("_mid_hash")})
+    if not hashes:
+        return
+    page_by_key: dict[tuple, int] = {}
+    with closing(get_db()) as conn:
+        for i in range(0, len(hashes), 500):     # 分块规避 SQLite 变量数上限
+            chunk = hashes[i:i + 500]
+            qmarks = ",".join("?" * len(chunk))
+            for r in conn.execute(
+                    f"SELECT mid_hash, content, time, page FROM danmaku "
+                    f"WHERE bvid = ? AND mid_hash IN ({qmarks})", (bvid, *chunk)).fetchall():
+                key = (r["mid_hash"], r["content"], round(float(r["time"] or 0), 3))
+                pg = int(r["page"] or 1)
+                if key in page_by_key and page_by_key[key] != pg:
+                    page_by_key[key] = 0          # 歧义：不标注
+                else:
+                    page_by_key.setdefault(key, pg)
+    for p in todo:
+        dm = p.get("danmaku") or {}
+        mh = p.get("_mid_hash") or ""
+        times = dm.get("video_times") or []
+        pages = []
+        for i, c in enumerate(dm.get("contents") or []):
+            tv = times[i] if i < len(times) else 0
+            try:
+                key = (mh, c, round(float(tv or 0), 3))
+            except (TypeError, ValueError):
+                key = None
+            pages.append(page_by_key.get(key, 0) if key else 0)
+        dm["video_pages"] = pages
+        dm["multi_page"] = True
 
 
 def _danmaku_density(bvid: str, duration, video_info: dict | None = None) -> dict | None:
@@ -1605,9 +1670,18 @@ def _user_timeline(uid: int) -> dict:
         if not bvids:
             return result
 
-        titles = {r["bvid"]: r["title"] or "" for r in conn.execute(
-            f"SELECT bvid, title FROM videos WHERE bvid IN ({','.join('?' * len(bvids))})",
-            tuple(sorted(bvids))).fetchall()}
+        titles: dict[str, str] = {}
+        multi_pv: dict[str, bool] = {}   # 多分P 视频：样本 mm:ss 必须标出分P 才可解释
+        for r in conn.execute(
+                f"SELECT bvid, title, video_info_json FROM videos "
+                f"WHERE bvid IN ({','.join('?' * len(bvids))})",
+                tuple(sorted(bvids))).fetchall():
+            titles[r["bvid"]] = r["title"] or ""
+            try:
+                multi_pv[r["bvid"]] = len((json.loads(r["video_info_json"] or "{}")
+                                           .get("pages") or [])) > 1
+            except Exception:
+                multi_pv[r["bvid"]] = False
         mid_hashes_by_bvid: dict[str, list[str]] = {}
         for r in conn.execute("SELECT bvid, mid_hash FROM senders WHERE uid = ?", (uid,)).fetchall():
             mid_hashes_by_bvid.setdefault(r["bvid"], []).append(r["mid_hash"])
@@ -1623,9 +1697,11 @@ def _user_timeline(uid: int) -> dict:
             dm_samples: list[dict] = []
             for mh in mid_hashes_by_bvid.get(b, []):
                 dm_samples.extend(
-                    {"content": r["content"], "ts": r["timestamp"], "vt": r["time"]}
+                    {"content": r["content"], "ts": r["timestamp"], "vt": r["time"],
+                     # 多分P 视频：time 是分P 内相对秒数，带上分P 才能解释 mm:ss
+                     "vp": int(r["page"] or 1) if multi_pv.get(b) else 0}
                     for r in conn.execute(
-                        "SELECT content, timestamp, time FROM danmaku "
+                        "SELECT content, timestamp, time, page FROM danmaku "
                         "WHERE bvid = ? AND mid_hash = ? ORDER BY timestamp DESC LIMIT ?",
                         (b, mh, USER_TIMELINE_SAMPLES)).fetchall())
                 if len(dm_samples) >= USER_TIMELINE_SAMPLES:
@@ -1905,8 +1981,9 @@ def video_page(bvid: str):
         if density["multi"]:
             # 数据边界：历史快照按 cid 维度采集，多分P视频只采了 P1 的历史弹幕
             dense_note = ('<div class="density-note">分P视频：各分P弹幕时间相互独立，横轴为'
-                          '该分P内部时间。历史弹幕快照仅采集 P1（B站历史接口按 cid 维度），'
-                          '其余分P只有实时弹幕池数据，各P弹幕量不可直接横向比较。</div>')
+                          '该分P内部时间，各P弹幕量不可直接横向比较。历史弹幕快照按分P分别采集'
+                          '（B站历史接口按 cid 维度）；早于本版本分析的报告里，其余分P可能只有'
+                          '实时弹幕池数据，重跑分析可补齐。</div>')
         elif density["onepage_fallback"]:
             dense_note = ('<div class="density-note">本视频为多分P但缺少分P时长元信息，'
                           '时间轴按全片累计时长降级展示，各分P弹幕会挤在时间轴前段。</div>')
@@ -2166,7 +2243,9 @@ def user_page(uid: int):
         items = []
         for it in data["items"]:
             dm_html = "".join(
-                f'<li>{esc(s["content"])} <span class="tl-time">视频 {_fmt_video_time(s["vt"])} · {_fmt_ts(s["ts"])}</span></li>'
+                f'<li>{esc(s["content"])} <span class="tl-time">视频 '
+                f'{("P%d " % s["vp"]) if s.get("vp") else ""}{_fmt_video_time(s["vt"])}'
+                f' · {_fmt_ts(s["ts"])}</span></li>'
                 for s in it["dm_samples"]) or (
                 '<li class="ov-none">弹幕明细未留存（该视频为旧版本分析）</li>'
                 if it["dm_count"] else '<li class="ov-none">无弹幕样本</li>')
@@ -2558,7 +2637,8 @@ def api_danmaku(bvid: str):
         where.append("s.uid IS NOT NULL")
 
     sort_col = {
-        "video_time": "first_video_time",
+        # 排序键用 first_pt（=分P*1e6+秒）：多分P 视频按 (分P, 分P内时间) 字典序才正确
+        "video_time": "first_pt",
         "send_time": "first_send_time",
         "dup_count": "dup_count",
         "sender_count": "sender_count",
@@ -2580,7 +2660,10 @@ def api_danmaku(bvid: str):
     count_sql = f"SELECT COUNT(*) FROM (SELECT d.mid_hash, d.content {base_sql})"
     rows_sql = f'''
         SELECT d.mid_hash, d.content, COUNT(*) AS dup_count,
-               MIN(d.time) AS first_video_time, MIN(d.timestamp) AS first_send_time,
+               -- 首次出现：多分P 时按 (分P, 分P内时间) 取字典序最小值（MIN(time) 会跨分P 比大小，
+               -- 把 P2 的 00:10 误当成比 P1 的 00:50 更早）；1e6 秒≈11.5 天，远超单P 时长
+               MIN(d.page * 1000000 + CAST(d.time AS INTEGER)) AS first_pt,
+               MIN(d.timestamp) AS first_send_time,
                MIN(d.mode) AS mode, MIN(d.color) AS color,
                s.uid AS uid, u.name AS name, s.spam_level AS spam_level,
                sc.cnt AS sender_count
@@ -2610,7 +2693,9 @@ def api_danmaku(bvid: str):
             "mid_hash": r["mid_hash"],
             "uid": (_mask_uid(r["uid"]) if mask else (int(r["uid"]) if r["uid"] is not None else None)),
             "name": _mask_name(r["name"]) if mask else r["name"],
-            "first_video_time": r["first_video_time"],
+            # first_pt 解码：高位=分P，低位=分P 内秒数（前端多分P 时渲染成「P{n} mm:ss」）
+            "first_video_time": int(r["first_pt"] or 0) % 1000000,
+            "first_page": int(r["first_pt"] or 0) // 1000000,
             "first_send_time": r["first_send_time"],
             "categories": m.get("categories", []),
             # meta 的 spam_level 已扣刷屏误报（降级"低"），优先于 SQL 原值
@@ -2619,7 +2704,9 @@ def api_danmaku(bvid: str):
             "mode": r["mode"] or 1,
             "color": _norm_color(r["color"]),
         })
-    return jsonify({"rows": rows, "total": total, "page": page, "page_size": page_size})
+    return jsonify({"rows": rows, "total": total, "page": page, "page_size": page_size,
+                    # 多分P 视频：前端给「视频内时间」列加 P{n} 前缀（单分P 不显示）
+                    "multi_page": len(_load_page_meta(bvid)) > 1})
 
 
 @app.route("/download/<path:filename>")

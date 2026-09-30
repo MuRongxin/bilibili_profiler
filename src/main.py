@@ -15,7 +15,8 @@ from datetime import datetime
 
 from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USERS_RATIO,
                     LLM_API_KEY, LLM_DEEP_ENABLED, HISTORY_DANMAKU_ENABLED, REPORT_DIR,
-                    COMMENT_AUTHOR_MIN_SEVERITY, COMMENT_AUTHOR_MIN_HITS)
+                    COMMENT_AUTHOR_MIN_SEVERITY, COMMENT_AUTHOR_MIN_HITS,
+                    HISTORY_MULTIPAGE_ENABLED, HISTORY_MULTIPAGE_MAX_PAGES)
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_video_info
 from storage import load_user_data, has_user_data, load_senders, update_user_profile
@@ -26,7 +27,7 @@ from storage import get_phase_state, set_phase_state
 from auth import get_auth_client
 from combo_pool import build_pool
 from api_client import RiskControlError
-from danmaku import collect_danmaku_data, group_by_sender, get_cid_for_page, fetch_command_dms, build_command_uid_map
+from danmaku import collect_danmaku_data, group_by_sender, fetch_command_dms, build_command_uid_map
 from danmaku import get_video_info
 from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map, refresh_comments
@@ -52,6 +53,50 @@ def phase_login():
     """阶段1: 扫码登录"""
     print("[Phase 1/6] 扫码登录...")
     return get_auth_client()
+
+
+def _history_page_targets(video_info: dict) -> list[tuple[int, int]]:
+    """待采历史弹幕的 [(分P序号, cid)] 列表。
+
+    B站历史弹幕接口按 cid 维度（每个分P 一个弹幕池），只采分P 1 会让其余分P 永久
+    只有实时池数据。分P 超上限（HISTORY_MULTIPAGE_MAX_PAGES）或开关关闭时只留分P 1。
+    无 pages 元信息（旧数据/接口未下发）时退回主 cid，行为与旧版一致。"""
+    pages = video_info.get("pages") or []
+    targets: list[tuple[int, int]] = []
+    for i, p in enumerate(pages):
+        if not isinstance(p, dict) or not p.get("cid"):
+            continue
+        try:
+            pno = int(p.get("page") or i + 1)
+        except (TypeError, ValueError):
+            pno = i + 1
+        targets.append((pno, int(p["cid"])))
+    if not targets:
+        cid = video_info.get("cid") or 0
+        if cid:
+            targets.append((1, int(cid)))
+    if not HISTORY_MULTIPAGE_ENABLED:
+        return targets[:1]
+    return targets[:max(1, HISTORY_MULTIPAGE_MAX_PAGES)]
+
+
+def _fetch_history_all_pages(video_info: dict, client, bvid: str,
+                             seen_dmids: set | None = None) -> list[dict]:
+    """逐分P采集历史弹幕（各分P 独立检查点/独立续采；单P失败只跳过该P，不中断整体）。
+
+    返回本轮新采的弹幕（含 page 标记）；全量请读库。"""
+    all_new: list[dict] = []
+    targets = _history_page_targets(video_info)
+    if len(targets) > 1:
+        print(f"[Phase 2] 分P历史弹幕：共 {len(targets)} 个分P（"
+              f"{'、'.join('P%d' % p for p, _ in targets)}），各分P独立续采")
+    for pno, cid in targets:
+        try:
+            all_new.extend(fetch_history_danmaku(cid, client, video_info.get("pubdate", 0),
+                                                bvid=bvid, seen_dmids=seen_dmids, page=pno))
+        except Exception as e:
+            print(f"[Phase 2] 警告: 分P {pno} 历史弹幕采集失败（{e}），跳过该分P")
+    return all_new
 
 
 def phase_danmaku(bvid: str, client, resume: bool = True):
@@ -106,8 +151,8 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
                 # 落库按 dmid 去重，弹幕总量统计读库重算，重复运行幂等
                 if HISTORY_DANMAKU_ENABLED:
                     try:
-                        cid = get_cid_for_page(video_info, 0)
-                        fetch_history_danmaku(cid, client, video_info.get("pubdate", 0), bvid=bvid)
+                        # 逐分P滚动补采（已 done 的分P 只补最近几天；新增分P 从零续采）
+                        _fetch_history_all_pages(video_info, client, bvid)
                     except Exception as e:
                         print(f"[Phase 2] 警告: 历史弹幕滚动补采失败（{e}），沿用库内已有数据")
                 danmaku_list = load_danmaku(bvid)
@@ -119,9 +164,7 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
             else:
                 # 半成品：历史弹幕从检查点续采（实时池已在库）
                 if HISTORY_DANMAKU_ENABLED:
-                    cid = get_cid_for_page(video_info, 0)
-                    history_new_list = fetch_history_danmaku(
-                        cid, client, video_info.get("pubdate", 0), bvid=bvid)
+                    history_new_list = _fetch_history_all_pages(video_info, client, bvid)
                 else:
                     history_new_list = []
                     set_phase_state(bvid, "danmaku", "done", "1")
@@ -163,9 +206,7 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
     # （bvid 传入后逐日增量落库+检查点，中断可续；fetch 内部完成时置 done=1）
     if HISTORY_DANMAKU_ENABLED:
         try:
-            cid = get_cid_for_page(video_info, 0)
-            history_list = fetch_history_danmaku(cid, client, video_info.get("pubdate", 0),
-                                                 bvid=bvid, seen_dmids=seen_dmids)
+            history_list = _fetch_history_all_pages(video_info, client, bvid, seen_dmids)
             merged = load_danmaku(bvid)
             video_info["danmaku_coverage"] = {
                 "realtime": len(danmaku_list),
@@ -695,16 +736,21 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
 
 
 def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict,
-                  comment_location_map: dict | None = None, uid_comments: dict | None = None):
+                  comment_location_map: dict | None = None, uid_comments: dict | None = None,
+                  video_info: dict | None = None):
     """阶段6: 画像分析
 
     comment_location_map（uid→评论IP属地）与 uid_comments（uid→本视频评论）在此处
     注入而非依赖落库数据：users 表缓存的旧 user_data 没有这两个字段，
     每次运行时注入才能保证缓存命中路径也带出属地与评论。
+
+    video_info 仅用于判定是否多分P：danmaku.time 是「所在分P 内的相对秒数」，
+    多分P 时报告必须把样本的分P 标出来，否则同一个 mm:ss 无法解释。
     """
     print("\n[Phase 6/6] 画像分析...")
     comment_location_map = comment_location_map or {}
     uid_comments = uid_comments or {}
+    multi_page = len((video_info or {}).get("pages") or []) > 1
     profiles = []
 
     for mid_hash, info in resolved.items():
@@ -719,11 +765,15 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
             user_data["ip_location"] = comment_location_map[uid]
         spam = spam_results.get(mid_hash, {})
 
-        # 构建弹幕统计
+        # 构建弹幕统计：contents/video_times/video_pages 同源于本轮 sender_groups，
+        # 三者按下标一一对应（见 danmaku.group_by_sender）；multi_page 供报告标注样本分P
+        grp = sender_groups.get(mid_hash, {})
         danmaku_stats = {
             "count": info["danmaku_count"],
             "contents": info["contents"],
-            "video_times": sender_groups.get(mid_hash, {}).get("video_times", []),
+            "video_times": grp.get("video_times", []),
+            "video_pages": grp.get("video_pages", []),
+            "multi_page": multi_page,
         }
 
         # 逐人容错：单个用户分析/落库失败只跳过该用户，不中断整个阶段（对齐阶段5粒度）
@@ -944,7 +994,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
 
     # 阶段6: 画像分析（评论IP属地/本视频评论/问题弹幕在此贯通进画像）
     profiles = timer.run("阶段6 画像分析", phase_analyze, resolved, spam_results, user_data_map,
-                         sender_groups, comment_location_map, uid_comments)
+                         sender_groups, comment_location_map, uid_comments, video_info)
 
     # 阶段7: LLM 重点深掘（结果在 phase 内直接注入 profile；LLM_DEEP_ENABLED 可整段关闭）
     if LLM_DEEP_ENABLED:

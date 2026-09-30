@@ -124,6 +124,10 @@ DENSITY_BUCKETS = 60                  # 按视频内时间分桶的桶数上限
 HISTORY_DANMAKU_ENABLED = True   # 是否采集全量历史弹幕（需登录）
 HISTORY_MAX_MONTHS = 24          # 历史弹幕最多回溯月数
 HISTORY_MAX_DAYS = 400           # 历史弹幕最多采集天数（逐日接口，每日1次请求）
+# 分P视频的历史弹幕：B站历史接口只认 cid（=各分P 各一个弹幕池），只采分P 1 会让
+# 其余分P 永久只有实时池数据（密度图/画像样本严重偏低）。各分P 独立检查点、独立续采。
+HISTORY_MULTIPAGE_ENABLED = True  # False=退回只采分P 1（旧行为，请求量最省）
+HISTORY_MULTIPAGE_MAX_PAGES = 4   # 最多采前 N 个分P的历史弹幕（每P 各 HISTORY_MAX_DAYS 天请求量）
 MAX_VIDEO_PAGES = 3          # 用户视频最大翻页
 MAX_DYNAMIC_PAGES = 5        # 动态最大翻页（对画像而言近 5 页足够，减少高风险请求）
 # 调研实证：他人关注列表接口仅能查看前 100 个（5页×20），超出返回空列表但 code=0

@@ -912,8 +912,11 @@ function loadDanmaku() {
                     escHtml(c) + '</span>').join('');
                 const chk = '<input type="checkbox" class="dm-check" data-mid="' + escHtml(row.mid_hash) + '"' +
                     (dmSelected.has(row.mid_hash) ? ' checked' : '') + '>';
+                // 多分P 视频：该弹幕首次出现的分P 必须标出（time 是分P 内相对秒数）
+                const vt = (data.multi_page && row.first_page
+                    ? 'P' + row.first_page + ' ' : '') + fmtVideoTime(row.first_video_time);
                 return '<tr><td>' + chk + '</td><td>' + dot + escHtml(row.content) + dup + '</td><td>' + sender + '</td><td>' +
-                    fmtVideoTime(row.first_video_time) + '</td><td>' +
+                    vt + '</td><td>' +
                     new Date(row.first_send_time * 1000).toLocaleString() + '</td><td>' + cats + '</td><td>' +
                     escHtml(row.spam_level) + '</td></tr>';
             }).join('') || '<tr><td colspan="7" class="empty-note">无匹配弹幕</td></tr>';
