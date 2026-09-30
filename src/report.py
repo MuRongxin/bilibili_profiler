@@ -218,12 +218,19 @@ def generate_user_card(profile: dict) -> str:
     # 以 contents 为准按索引配对、缺失位用 0 占位，避免 zip 静默截断丢样本，并告警留痕
     if len(dm_contents) != len(dm_times):
         _warn_dm_mismatch(len(dm_contents), len(dm_times))
-    paired = [(c, dm_times[i] if i < len(dm_times) else 0) for i, c in enumerate(dm_contents)]
-    paired.sort(key=lambda x: x[1])
+    dm_pages = dm.get("video_pages") or []
+    # 多分P：画像里记了 multi_page 即标；旧画像无该键时按样本分P 兜底推断
+    multi_page = bool(dm.get("multi_page")) or (bool(dm_pages) and max(dm_pages) > 1)
+    paired = [(c, dm_times[i] if i < len(dm_times) else 0,
+               int(dm_pages[i] or 1) if i < len(dm_pages) else 1)
+              for i, c in enumerate(dm_contents)]
+    # 多分P 时先按分P 再按分P 内时间排序（time 是分P 内相对秒数，跨分P 比大小无意义）
+    paired.sort(key=(lambda x: (x[2], x[1])) if multi_page else (lambda x: x[1]))
     dm_items = []
-    for c, t in paired:
+    for c, t, pg in paired:
         m, s = int(t // 60), int(t % 60)
-        dm_items.append(f"<li>{esc(c)} <span class=\"dm-time\">{m:02d}:{s:02d}</span></li>")
+        stamp = f"P{pg} {m:02d}:{s:02d}" if multi_page else f"{m:02d}:{s:02d}"
+        dm_items.append(f"<li>{esc(c)} <span class=\"dm-time\">{stamp}</span></li>")
     dm_list = "".join(dm_items)
     spam_level = dm.get("spam_level", "低")
     spam_reason = dm.get("spam_reason", "")

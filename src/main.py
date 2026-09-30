@@ -695,16 +695,20 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
 
 
 def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict,
-                  comment_location_map: dict | None = None, uid_comments: dict | None = None):
+                  comment_location_map: dict | None = None, uid_comments: dict | None = None,
+                  video_info: dict | None = None):
     """阶段6: 画像分析
 
     comment_location_map（uid→评论IP属地）与 uid_comments（uid→本视频评论）在此处
     注入而非依赖落库数据：users 表缓存的旧 user_data 没有这两个字段，
     每次运行时注入才能保证缓存命中路径也带出属地与评论。
+    video_info 仅用于判定是否多分P：danmaku.time 是「所在分P 内的相对秒数」，
+    多分P 时报告必须把样本的分P 标出来，否则同一个 mm:ss 无法解释。
     """
     print("\n[Phase 6/6] 画像分析...")
     comment_location_map = comment_location_map or {}
     uid_comments = uid_comments or {}
+    multi_page = len((video_info or {}).get("pages") or []) > 1
     profiles = []
 
     for mid_hash, info in resolved.items():
@@ -719,11 +723,15 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
             user_data["ip_location"] = comment_location_map[uid]
         spam = spam_results.get(mid_hash, {})
 
-        # 构建弹幕统计
+        # 构建弹幕统计：contents/video_times/video_pages 同源于本轮 sender_groups，
+        # 三者按下标一一对应（见 group_by_sender）；multi_page 供报告标注样本分P
+        grp = sender_groups.get(mid_hash, {})
         danmaku_stats = {
             "count": info["danmaku_count"],
             "contents": info["contents"],
-            "video_times": sender_groups.get(mid_hash, {}).get("video_times", []),
+            "video_times": grp.get("video_times", []),
+            "video_pages": grp.get("video_pages", []),
+            "multi_page": multi_page,
         }
 
         # 逐人容错：单个用户分析/落库失败只跳过该用户，不中断整个阶段（对齐阶段5粒度）
@@ -944,7 +952,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
 
     # 阶段6: 画像分析（评论IP属地/本视频评论/问题弹幕在此贯通进画像）
     profiles = timer.run("阶段6 画像分析", phase_analyze, resolved, spam_results, user_data_map,
-                         sender_groups, comment_location_map, uid_comments)
+                         sender_groups, comment_location_map, uid_comments, video_info)
 
     # 阶段7: LLM 重点深掘（结果在 phase 内直接注入 profile；LLM_DEEP_ENABLED 可整段关闭）
     if LLM_DEEP_ENABLED:
