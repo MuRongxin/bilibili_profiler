@@ -122,7 +122,7 @@ python login.py alt3
 
 | 我想…… | 去哪儿 / 怎么做 |
 |---|---|
-| 先看总体结论 | **概览**：统计卡、用户等级/刷屏/标签/地域图、弹幕密度时间轴、群体复读事件、解析质量区块（解析方式与置信度分布、碰撞风险人数） |
+| 先看总体结论 | **概览**：统计卡、用户等级/刷屏/标签/地域图、弹幕密度时间轴、群体复读事件（按视频内时间抓接龙复读，可直接跳转核验）、解析质量区块（解析方式与置信度分布、碰撞风险人数） |
 | 核验某条弹幕出现在视频哪一段 | 概览页**点击密度时间轴的柱条**，直接跳到该分P对应时段；多分P视频先选分P，横轴是**各分P内部时间** |
 | 找某个人的弹幕/评论 | **弹幕浏览器**：按内容搜索、按发送者（mid_hash / 昵称 / UID）筛选、按问题类别或刷屏等级过滤、按重复数/发送时间/视频内时间排序 |
 | 补采一个"未解析"的发送者 | 弹幕浏览器里**勾选发送者** → 触发后台强制分析（UID 解析 + 采集 + 画像 + LLM 深掘），进度实时轮询、失败项可重试，完成后自动刷新并恢复你原来的筛选与滚动位置 |
@@ -193,7 +193,7 @@ src/
 ├── comment.py           # 评论区采集（wbi/main 游标 + 楼中楼补采 + IP 属地）、UID 收割、增量刷新
 ├── uid_resolver.py      # mid_hash 破解：明文交叉验证 + 存在性验证 + 碰撞消歧
 ├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（覆盖全部 ≤10 位 UID）
-├── spam_detector.py     # 本地刷屏检测（只标记不删除）+ 群体复读事件检测
+├── spam_detector.py     # 本地刷屏检测（只标记不删除）+ 群体复读事件检测（视频内时间轴为主）
 ├── cringe_detector.py   # LLM 问题弹幕/问题评论判定（八类口径 + 批次缓存 + 预算熔断）
 ├── user_collector.py    # 四维度用户数据采集（主页信息/互动足迹/社交关系/行为模式）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
@@ -393,6 +393,7 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_config_template.py` | 3 | `config.example.py` 与 `src/config.py` 常量同步（模板漏项会让全新克隆 ImportError） |
 | `tests/offline/regress_danmaku_stats_source.py` | 5 | 缓存命中分支不得泄漏旧快照 `contents`（与阶段6 现取的 `video_times` 同源等长）、报告渲染对长度不一的补齐不丢样本 |
 | `tests/offline/regress_skip_collect.py` | 4 | `--skip-collect` 阶段5 必须零网络（哨兵池一次都不被触碰）、只带回库内已采数据、未采用户不返回 |
+| `tests/offline/regress_repeat_events.py` | 11 | 群体复读事件必须按**视频内时间**检测（跨月发送但同一画面要命中）、分P 不得合并、双轴各自达标、阈值边界与区块渲染 |
 | `tests/offline/regress_density_multip.py` | 9 | 多分P 密度轴按各分P 内部时间分别建桶、默认选弹幕最多的P、单分P 口径不变、缺元信息降级 |
 | `tests/offline/regress_multipart_pages.py` | 14 | 历史弹幕按分P 采集与检查点隔离（分P 1 键名不变）、画像样本「P{n} mm:ss」与排序、旧画像渲染期回填、弹幕浏览器首次出现按 (分P, 时间) |
 

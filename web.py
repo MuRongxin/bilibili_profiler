@@ -810,16 +810,41 @@ def _resolve_quality(bvid: str) -> dict | None:
     }
 
 
+def _repeat_events_window_text(bvid: str, e: dict) -> str:
+    """复读事件的时间标注：视频内时间（可点跳转核验，多分P 带 p 参数）+ 发送时间。
+
+    两个时间轴各自达标才显示（见 spam_detector.detect_repeat_events 的双轴口径）。"""
+    parts = []
+    v = e.get("video")
+    if v:
+        t0, t1 = int(v["start"]), int(v["end"])
+        page = int(v.get("page") or 1)
+        multi = len(_load_page_meta(bvid)) > 1
+        href = (f'https://www.bilibili.com/video/{esc(bvid)}?'
+                + (f'p={page}&' if multi else '') + f't={t0}')
+        parts.append(f'<a href="{href}" target="_blank" rel="noopener" title="跳到该分P 该时刻核验">'
+                     f'视频{" P%d" % page if multi else ""} '
+                     f'{_fmt_video_time(t0)} ~ {_fmt_video_time(t1)}</a>')
+    s = e.get("send")
+    if s:
+        parts.append('发送 ' + time.strftime("%m-%d %H:%M", time.localtime(s["start"]))
+                     + ' ~ ' + time.strftime("%H:%M", time.localtime(s["end"])))
+    return " · ".join(parts) or "—"
+
+
 def _repeat_events_block(bvid: str) -> str:
     """概览页「群体复读事件」区块：全视频维度的接龙/+1 队列刷屏检测
     （spam_detector.detect_repeat_events：同一内容在 60s 窗口内被 ≥5 个不同发送者
     发送且 ≥8 条——单人检测抓不到这种「一人一句」的群体刷屏）。
 
-    底部附全池分布自检行（pool_distribution_from_rows：发送者数、弹幕数与重复率的
-    P50/P95），供刷屏阈值校准参考。无弹幕数据返回 ""（不渲染区块）。"""
+    时间口径为双轴：**视频内时间**（接龙发生在同一画面，观众可横跨数月；按分P 分桶，
+    可点跳转核验）+ **发送时间**（真实时间短窗集中刷屏）。底部附全池分布自检行
+    （pool_distribution_from_rows：发送者数、弹幕数与重复率的 P50/P95），供阈值校准。
+    无弹幕数据返回 ""（不渲染区块）。"""
     with closing(get_db()) as conn:
         rows = conn.execute(
-            "SELECT content, mid_hash, timestamp FROM danmaku WHERE bvid = ?", (bvid,)).fetchall()
+            "SELECT content, mid_hash, time, timestamp, page FROM danmaku WHERE bvid = ?",
+            (bvid,)).fetchall()
     if not rows:
         return ""
     # sqlite3.Row 无 .get，转 dict 再喂给检测函数
@@ -830,11 +855,10 @@ def _repeat_events_block(bvid: str) -> str:
         trs = "".join(
             f'<tr><td title="{esc(e["content"])}">{esc(_truncate(e["content"], 30))}</td>'
             f'<td>{e["sender_count"]}</td><td>{e["total"]}</td>'
-            f'<td>{time.strftime("%m-%d %H:%M", time.localtime(e["start"]))}'
-            f' ~ {time.strftime("%m-%d %H:%M", time.localtime(e["end"]))}</td></tr>'
+            f'<td>{_repeat_events_window_text(bvid, e)}</td></tr>'
             for e in events)
         body = (f'<table><thead><tr><th>内容</th><th>发送者数</th><th>窗口条数</th>'
-                f'<th>时间段</th></tr></thead><tbody>{trs}</tbody></table>')
+                f'<th>时间（视频内可点跳转核验 / 发送时间）</th></tr></thead><tbody>{trs}</tbody></table>')
     else:
         body = '<p class="empty-note">未检出群体复读事件</p>'
     # 全池分布自检：重复率 = 同一发送者所发内容中的重复占比
@@ -844,7 +868,7 @@ def _repeat_events_block(bvid: str) -> str:
                  f'/P95={dist.get("repeat_p95", 0) * 100:.0f}%（阈值校准参考）')
     return f'''
     <div class="cringe-board">
-        <h3>🔁 群体复读事件<span class="chart-hint">（同一内容在 60 秒内被 ≥5 个不同发送者发送且 ≥8 条——接龙/+1 队列式刷屏）</span></h3>
+        <h3>🔁 群体复读事件<span class="chart-hint">（同一内容在 60 秒窗口内被 ≥5 个不同发送者发送且 ≥8 条；时间轴分「视频内时间」＝同一画面接龙/+1 与「发送时间」＝短时间集中刷屏，前者可点跳转核验）</span></h3>
         {body}
         <div class="cringe-reason">{dist_line}</div>
     </div>'''

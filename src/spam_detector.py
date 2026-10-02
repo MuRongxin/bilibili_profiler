@@ -336,6 +336,29 @@ def pool_distribution_from_rows(rows: list[dict]) -> dict:
     }
 
 
+def _peak_window(items: list[tuple[float, str]], window_seconds: int) -> tuple:
+    """滑动窗口求峰值，返回 (不同发送者数, 窗口内条数, 窗口起, 窗口止)。
+
+    items: [(时间, mid_hash)]（内部自行排序；窗口为 [t, t+window_seconds] 闭区间口径）"""
+    if not items:
+        return (0, 0, 0, 0)
+    items = sorted(items, key=lambda x: x[0])
+    best = (0, 0, items[0][0], items[0][0])
+    senders: Counter = Counter()
+    left = 0
+    for right, (t_r, mh_r) in enumerate(items):
+        senders[mh_r] += 1
+        while t_r - items[left][0] > window_seconds:
+            mh_l = items[left][1]
+            senders[mh_l] -= 1
+            if senders[mh_l] <= 0:
+                del senders[mh_l]
+            left += 1
+        if (len(senders), right - left + 1) > (best[0], best[1]):
+            best = (len(senders), right - left + 1, items[left][0], t_r)
+    return best
+
+
 def detect_repeat_events(rows: list[dict],
                          window_seconds: int = REPEAT_EVENT_WINDOW_SECONDS,
                          min_senders: int = REPEAT_EVENT_MIN_SENDERS,
@@ -343,50 +366,76 @@ def detect_repeat_events(rows: list[dict],
                          top_n: int = REPEAT_EVENT_TOP_N) -> list[dict]:
     """群体复读事件检测（全视频维度，补单人检测的最大盲区）。
 
-    单人检测（analyze_spam）抓不到「一人一句的接龙/+1 队列」——每个发送者
-    只发一两条、单看完全正常，合起来才是刷屏事件。这里按内容聚合全体弹幕，
-    同一内容在 window_seconds 内被 ≥min_senders 个不同发送者发送且窗口内
-    总条数 ≥min_total 即记一次事件（每内容只报峰值窗口，避免重叠窗口刷屏列表）。
+    单人检测（analyze_spam）抓不到「一人一句的接龙/+1 队列」——每个发送者只发
+    一两条、单看完全正常，合起来才是刷屏事件。这里按内容聚合全体弹幕，同一内容
+    的窗口内 ≥min_senders 个不同发送者且 ≥min_total 条即记一次（每内容只报峰值）。
+
+    **双时间轴**（两条都算，各自达标才写进结果）：
+    - 视频内时间轴（主，video）：接龙/+1 发生在**同一个视频时间点**——观众可能相隔
+      几个月才看到这里，但都在同一画面刷同一句话。窗口按 time 计算且**必须分P**
+      （time 是分P 内相对秒数，跨分P 比大小无意义）。
+    - 发送时间轴（send）：同一内容在真实时间的短窗口内被集中刷出，是水军/集中刷屏
+      的形态。只看它会把「复读」整体漏掉——实测 BV1mtTD6rEtQ：视频内时间轴命中
+      20 起（「许愿不歪」54 人 / 56 条挤在同一画面），发送时间轴 0 起（观众横跨
+      三个月）；全库 30 个视频则是 331 : 18。
 
     Args:
-        rows: [{content, mid_hash, timestamp}]（timestamp 为真实发送时间戳）
+        rows: [{content, mid_hash, time, timestamp, page}]（time 为分P 内秒数）
 
     Returns:
-        按发送者数降序的事件列表 [{content, sender_count, total, start, end}]，
-        start/end 为窗口起止 Unix 时间戳。
+        按发送者数降序的事件 [{content, sender_count, total, video, send}]，
+        video={"page","start","end"}（分P 内秒数，可能为 None）、
+        send={"start","end"}（Unix 时间戳，可能为 None）；sender_count/total 取
+        达标轴中的较强者。
     """
-    by_content: dict[str, list[tuple[int, str]]] = {}
+    by_content: dict[str, list[dict]] = {}
     for r in rows:
-        ts = int(r.get("timestamp") or 0)
         content = r.get("content") or ""
-        if ts > 0 and content:
-            by_content.setdefault(content, []).append((ts, r.get("mid_hash") or ""))
+        if content:
+            by_content.setdefault(content, []).append(r)
+
+    def _ok(peak: tuple) -> bool:
+        return peak[0] >= min_senders and peak[1] >= min_total
 
     events = []
     for content, items in by_content.items():
         if len(items) < min_total:
             continue
-        items.sort()
-        best = None  # (发送者数, 总条数, 窗口起, 窗口止)
-        left = 0
-        senders_in_win: Counter = Counter()
-        for right in range(len(items)):
-            ts_r, mh_r = items[right]
-            senders_in_win[mh_r] += 1
-            while ts_r - items[left][0] > window_seconds:
-                mh_l = items[left][1]
-                senders_in_win[mh_l] -= 1
-                if senders_in_win[mh_l] <= 0:
-                    del senders_in_win[mh_l]
-                left += 1
-            total = right - left + 1
-            n_senders = len(senders_in_win)
-            if n_senders >= min_senders and total >= min_total:
-                if best is None or (n_senders, total) > (best[0], best[1]):
-                    best = (n_senders, total, items[left][0], ts_r)
-        if best:
-            events.append({"content": content, "sender_count": best[0],
-                           "total": best[1], "start": best[2], "end": best[3]})
+        # 1) 发送时间轴：真实时间戳，跨分P 合并（集中刷屏与分P 无关）
+        send_peak = (0, 0, 0, 0)
+        try:
+            send_peak = _peak_window(
+                [(float(r.get("timestamp") or 0), r.get("mid_hash") or "") for r in items
+                 if r.get("timestamp")], window_seconds)
+        except (TypeError, ValueError):
+            pass
+        # 2) 视频内时间轴：按分P 分别求峰，取各分P 中最强的一处
+        video = None   # (peak, page)
+        by_page: dict[int, list[tuple[float, str]]] = {}
+        for r in items:
+            try:
+                by_page.setdefault(int(r.get("page") or 1), []).append(
+                    (float(r.get("time") or 0), r.get("mid_hash") or ""))
+            except (TypeError, ValueError):
+                continue
+        for pg, its in by_page.items():
+            peak = _peak_window(its, window_seconds)
+            if video is None or (peak[0], peak[1]) > (video[0][0], video[0][1]):
+                video = (peak, pg)
+        video_ok = video is not None and _ok(video[0])
+        send_ok = _ok(send_peak)
+        if not (video_ok or send_ok):
+            continue
+        # 主指标取达标轴中的较强者（同分取条数多者，保证确定性与"更能说明问题"的一侧）
+        head = video[0] if video_ok and (not send_ok or (video[0][0], video[0][1]) >= (send_peak[0], send_peak[1])) else send_peak
+        events.append({
+            "content": content,
+            "sender_count": head[0],
+            "total": head[1],
+            "video": ({"page": video[1], "start": video[0][2], "end": video[0][3]}
+                      if video_ok else None),
+            "send": ({"start": int(send_peak[2]), "end": int(send_peak[3])} if send_ok else None),
+        })
 
     events.sort(key=lambda e: (e["sender_count"], e["total"]), reverse=True)
     return events[:top_n]
