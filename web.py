@@ -43,7 +43,8 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      CROSS_VIDEO_MIN_VIDEOS, CROSS_VIDEO_MAX_USERS, DENSITY_BUCKETS,
                      COMMENT_HEAT_REPLY_WEIGHT, PROBLEM_COMMENT_TOP_N,
                      ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_MAX_N, USER_CARD_URL, NAV_URL,
-                     REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, ANALYZE_MAX_TARGETS)
+                     REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, ANALYZE_MAX_TARGETS,
+                     REPEAT_EVENT_TOP_N)
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
 from storage import get_db, init_db
@@ -832,6 +833,22 @@ def _repeat_events_window_text(bvid: str, e: dict) -> str:
     return " · ".join(parts) or "—"
 
 
+def _variant_badge(e: dict) -> str:
+    """写法变体徽标：归一化合并后仍显示主写法，另标注「＋N 变体」免被误读为只此一句。"""
+    n = int(e.get("variant_count") or 1)
+    if n <= 1:
+        return ""
+    return f' <span class="dm-time" title="同一次复读的其他写法">＋{n - 1} 变体</span>'
+
+
+def _variant_title(e: dict) -> str:
+    """内容单元格 tooltip：主写法 + 各变体条数（写法差异已合并为同一事件）"""
+    lines = [f'{c}（{n} 条）' for c, n in (e.get("variants") or [])]
+    if int(e.get("variant_count") or 1) > len(lines):
+        lines.append(f'…共 {e["variant_count"]} 种写法')
+    return "\n".join(lines) or e.get("content", "")
+
+
 def _repeat_events_block(bvid: str) -> str:
     """概览页「群体复读事件」区块：全视频维度的接龙/+1 队列刷屏检测
     （spam_detector.detect_repeat_events：同一内容在 60s 窗口内被 ≥5 个不同发送者
@@ -853,12 +870,17 @@ def _repeat_events_block(bvid: str) -> str:
     dist = pool_distribution_from_rows(dict_rows)
     if events:
         trs = "".join(
-            f'<tr><td title="{esc(e["content"])}">{esc(_truncate(e["content"], 30))}</td>'
+            f'<tr><td title="{esc(_variant_title(e))}">{esc(_truncate(e["content"], 30))}'
+            f'{_variant_badge(e)}</td>'
             f'<td>{e["sender_count"]}</td><td>{e["total"]}</td>'
             f'<td>{_repeat_events_window_text(bvid, e)}</td></tr>'
             for e in events)
         body = (f'<table><thead><tr><th>内容</th><th>发送者数</th><th>窗口条数</th>'
                 f'<th>时间（视频内可点跳转核验 / 发送时间）</th></tr></thead><tbody>{trs}</tbody></table>')
+        if len(events) >= REPEAT_EVENT_TOP_N:
+            # 命中数达展示上限：明示是"最多的前 N 起"而不是全部
+            body += (f'<div class="cringe-reason">命中数 ≥ 展示上限 {REPEAT_EVENT_TOP_N} 起，'
+                     f'以上为发送者数最多的前 {REPEAT_EVENT_TOP_N} 起</div>')
     else:
         body = '<p class="empty-note">未检出群体复读事件</p>'
     # 全池分布自检：重复率 = 同一发送者所发内容中的重复占比

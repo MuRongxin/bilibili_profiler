@@ -6,6 +6,9 @@
 """
 import difflib
 import random
+import re
+import string
+import unicodedata
 from collections import Counter
 from typing import Tuple
 
@@ -336,6 +339,27 @@ def pool_distribution_from_rows(rows: list[dict]) -> dict:
     }
 
 
+# 复读内容归一化：连续重复的**非 ASCII 字母**折叠成一个（？？？→？、666→6、哈哈哈→哈），
+# 但保留英文单词原样（否则 good→god 这类会被误并成同一句复读）
+_REPEAT_RUN_RE = re.compile(r"([^A-Za-z])\1+")
+# 需要剥掉的首尾装饰（NFKC 后全角标点多已折叠为 ASCII 标点，故两者都列）
+_TRIM_PUNCT = string.punctuation + "。，、！？；：、“”‘’（）《》【】〈〉「」『』—…·～"
+
+
+def _content_key(content: str) -> str:
+    """复读内容的归一化键：全半角、空白、首尾标点、连续重复字符的写法差异视为同一句。
+
+    动机：同一波复读里「原神牛逼」「原神牛逼！」「原神牛逼！！！」会被算成三起事件，
+    榜单被写法变体占满、人数还被拆散（BV1BtoYBaELd 实测 138 组、BV1mtTD6rEtQ 51 组）。
+    纯标点内容（？/…）退化为"折叠自身"而不是空串，否则「？」会与「……」并成一句。"""
+    s = unicodedata.normalize("NFKC", content or "").strip()
+    s = re.sub(r"\s+", "", s)
+    core = s.strip(_TRIM_PUNCT)
+    if core:
+        s = core
+    return _REPEAT_RUN_RE.sub(r"\1", s).lower()
+
+
 def _peak_window(items: list[tuple[float, str]], window_seconds: int) -> tuple:
     """滑动窗口求峰值，返回 (不同发送者数, 窗口内条数, 窗口起, 窗口止)。
 
@@ -383,22 +407,24 @@ def detect_repeat_events(rows: list[dict],
         rows: [{content, mid_hash, time, timestamp, page}]（time 为分P 内秒数）
 
     Returns:
-        按发送者数降序的事件 [{content, sender_count, total, video, send}]，
-        video={"page","start","end"}（分P 内秒数，可能为 None）、
-        send={"start","end"}（Unix 时间戳，可能为 None）；sender_count/total 取
-        达标轴中的较强者。
+        按发送者数降序的事件 [{content, sender_count, total, video, send,
+        variants, variant_count}]，video={"page","start","end"}（分P 内秒数，可能为
+        None）、send={"start","end"}（Unix 时间戳，可能为 None）；sender_count/total
+        取达标轴中的较强者；content 为归一化键下最多的原始写法，variants 为前 5 种
+        写法及条数（「原神牛逼」+「原神牛逼！」这类变体已并入同一事件）。
     """
-    by_content: dict[str, list[dict]] = {}
+    by_key: dict[str, list[dict]] = {}
     for r in rows:
         content = r.get("content") or ""
         if content:
-            by_content.setdefault(content, []).append(r)
+            # 按归一化键聚合：同一波复读的写法变体（标点/重复字符/全半角）算同一句
+            by_key.setdefault(_content_key(content), []).append(r)
 
     def _ok(peak: tuple) -> bool:
         return peak[0] >= min_senders and peak[1] >= min_total
 
     events = []
-    for content, items in by_content.items():
+    for content, items in by_key.items():
         if len(items) < min_total:
             continue
         # 1) 发送时间轴：真实时间戳，跨分P 合并（集中刷屏与分P 无关）
@@ -428,13 +454,17 @@ def detect_repeat_events(rows: list[dict],
             continue
         # 主指标取达标轴中的较强者（同分取条数多者，保证确定性与"更能说明问题"的一侧）
         head = video[0] if video_ok and (not send_ok or (video[0][0], video[0][1]) >= (send_peak[0], send_peak[1])) else send_peak
+        # 展示用主写法＝该归一化键下出现最多的原始内容；其余写法做变体清单（tooltip 用）
+        variant_counts = Counter(r["content"] for r in items).most_common()
         events.append({
-            "content": content,
+            "content": variant_counts[0][0],
             "sender_count": head[0],
             "total": head[1],
             "video": ({"page": video[1], "start": video[0][2], "end": video[0][3]}
                       if video_ok else None),
             "send": ({"start": int(send_peak[2]), "end": int(send_peak[3])} if send_ok else None),
+            "variants": [[c, n] for c, n in variant_counts[:5]],
+            "variant_count": len(variant_counts),
         })
 
     events.sort(key=lambda e: (e["sender_count"], e["total"]), reverse=True)

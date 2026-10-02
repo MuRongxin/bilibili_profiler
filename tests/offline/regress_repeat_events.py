@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""群体复读事件的时间轴口径：必须按「视频内时间」检测（9 项）
+"""群体复读事件的检测口径：视频内时间轴 + 写法变体合并（17 项）
 
 复现并锁死的问题：旧实现只在**真实发送时间戳**上开 60s 窗口，而 B站 的接龙/+1 复读
 发生在**同一个视频时间点**——观众可能相隔几个月才看到这里，却都在同一画面刷同一句
@@ -115,6 +115,59 @@ check("区块渲染出视频内时间与跳转链接（单分P 不带 p 参数�
 check("渲染不再出现旧的「时间段」表头（改为双轴时间列）",
       "时间段" not in html and "时间（视频内可点跳转核验" in html)
 
+print("=== 7. 写法变体合并（同一波复读的不同写法算一句） ===")
+# 「原神牛逼」+「原神牛逼！」+「原神牛逼！！！」本来是三行，人数还被拆散
+va = [row("原神牛逼", "m%d" % i, 400.0 + i, NOW - i) for i in range(6)]
+va += [row("原神牛逼！", "m%d" % i, 401.0 + i * 0.1, NOW - i) for i in range(6)]
+va += [row("原神牛逼！！！", "m%d" % i, 402.0, NOW - i) for i in range(2)]
+va += [row("原神牛逼！", "extra1", 403.0, NOW), row("原神牛逼！！", "extra2", 404.0, NOW)]
+check("标点/重复字符变体合并成一个事件（人数取并集、条数求和）",
+      len(sd.detect_repeat_events(va)) == 1
+      and sd.detect_repeat_events(va)[0]["sender_count"] == 8
+      and sd.detect_repeat_events(va)[0]["total"] == 16,
+      "(得到 %r)" % ([(e["sender_count"], e["total"]) for e in sd.detect_repeat_events(va)],))
+# 条数：原神牛逼×6 + 原神牛逼！×7 + 原神牛逼！！！×2 + 原神牛逼！！×1 = 16 条 / 8 人
+check("主写法取该键下最多的写法，variant_count 统计不同写法数",
+      sd.detect_repeat_events(va)[0]["content"] == "原神牛逼！"
+      and sd.detect_repeat_events(va)[0]["variant_count"] == 4,
+      "(得到 %r)" % (sd.detect_repeat_events(va)[0]["variants"],))
+# 纯标点：？/？？？/？（半角）算一句（8 条 / 6 人），但不能与「……」并成一句
+# ——若把纯标点归一化成空串，「？」就会和「……」并成一个事件
+vp = [row("？", "q%d" % i, 30.0 + i * 0.1, NOW - i) for i in range(5)]
+vp += [row("？？？", "q%d" % i, 30.5, NOW - i) for i in range(2)]
+vp += [row("?", "q7", 31.0, NOW)]
+vp += [row("……", "d%d" % i, 30.2 + i * 0.05, NOW - i) for i in range(8)]
+evp = sd.detect_repeat_events(vp)
+check("纯标点变体合并、且不与「……」误并（纯标点不退化空串）",
+      len(evp) == 2 and {e["content"] for e in evp} == {"？", "……"}
+      and [e for e in evp if e["content"] == "？"][0]["sender_count"] == 6
+      and [e for e in evp if e["content"] == "？"][0]["variant_count"] == 3,
+      "(得到 %r)" % ([(e["content"], e["sender_count"], e["variant_count"]) for e in evp],))
+# 单个写法各自不达标、合并后才达标 → 说明阈值作用在归一化后的事件上
+vt = [row("来了", "k%d" % i, 10.0 + i * 0.1, NOW - i) for i in range(3)]
+vt += [row("来了！", "k%d" % (i + 3), 10.5 + i * 0.1, NOW - i) for i in range(3)]
+vt += [row("来了", "k6", 11.0, NOW), row("来了！", "k7", 11.1, NOW)]
+check("各自不达标、变体合并后达标即命中（阈值作用在归一化事件上）",
+      len(sd.detect_repeat_events(vt)) == 1, "(得到 %r)" % (sd.detect_repeat_events(vt),))
+# 英文单词不得因"折叠重复字母"被误并：good / god 是两句
+vg = [row("good", "g%d" % i, 5.0 + i * 0.1, NOW - i) for i in range(5)]
+vg += [row("good", "g0", 5.5, NOW), row("good", "g1", 5.6, NOW), row("good", "gx", 6.0, NOW)]
+vg += [row("god", "h%d" % i, 5.2 + i * 0.1, NOW - i) for i in range(5)]
+vg += [row("god", "h0", 5.7, NOW), row("god", "h1", 5.8, NOW), row("god", "gy", 6.1, NOW)]
+check("英文不因连续字母折叠被误并（good 与 god 保持两句）",
+      len(sd.detect_repeat_events(vg)) == 2,
+      "(得到 %r)" % ([e["content"] for e in sd.detect_repeat_events(vg)],))
+# 报告区块渲染：变体徽标
+BV2 = "BVrepeat0002"
+storage.save_video_info(BV2, {"bvid": BV2, "title": "变体复读", "duration": 120,
+                              "pages": [{"page": 1, "cid": 2, "duration": 120}], "stat": {}})
+storage.append_danmaku(BV2, [{"mid_hash": "w%d" % i, "content": "原神牛逼" if i % 2 else "原神牛逼！",
+                              "time": 40.0 + i * 0.2, "timestamp": NOW - i, "page": 1,
+                              "dmid": 2000 + i} for i in range(9)], set())
+html2 = webmod._repeat_events_block(BV2)
+check("区块渲染出「＋N 变体」徽标与变体 tooltip",
+      "＋1 变体" in html2 and "原神牛逼！（" in html2, "(片段 %r)" % (html2[html2.find("原神牛逼"):html2.find("原神牛逼") + 120],))
+
 print("")
-print("==== 群体复读事件时间轴口径: %d 项通过, %d 项失败 ====" % (ok, fail))
+print("==== 群体复读事件检测口径: %d 项通过, %d 项失败 ====" % (ok, fail))
 sys.exit(1 if fail else 0)

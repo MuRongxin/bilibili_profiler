@@ -393,7 +393,7 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_config_template.py` | 3 | `config.example.py` 与 `src/config.py` 常量同步（模板漏项会让全新克隆 ImportError） |
 | `tests/offline/regress_danmaku_stats_source.py` | 5 | 缓存命中分支不得泄漏旧快照 `contents`（与阶段6 现取的 `video_times` 同源等长）、报告渲染对长度不一的补齐不丢样本 |
 | `tests/offline/regress_skip_collect.py` | 4 | `--skip-collect` 阶段5 必须零网络（哨兵池一次都不被触碰）、只带回库内已采数据、未采用户不返回 |
-| `tests/offline/regress_repeat_events.py` | 11 | 群体复读事件必须按**视频内时间**检测（跨月发送但同一画面要命中）、分P 不得合并、双轴各自达标、阈值边界与区块渲染 |
+| `tests/offline/regress_repeat_events.py` | 17 | 群体复读事件必须按**视频内时间**检测（跨月发送但同一画面要命中）、分P 不得合并、双轴各自达标、写法变体合并（含纯标点与英文不误并）、阈值边界与区块渲染 |
 | `tests/offline/regress_density_multip.py` | 9 | 多分P 密度轴按各分P 内部时间分别建桶、默认选弹幕最多的P、单分P 口径不变、缺元信息降级 |
 | `tests/offline/regress_multipart_pages.py` | 14 | 历史弹幕按分P 采集与检查点隔离（分P 1 键名不变）、画像样本「P{n} mm:ss」与排序、旧画像渲染期回填、弹幕浏览器首次出现按 (分P, 时间) |
 
