@@ -32,7 +32,12 @@ python run.py BV1vu4y1b7Y9
 
 `python web.py` 可以自己启动报告服务；
 
-换端口用 `PROFILER_PORT=9000 python web.py`。
+换端口用 `python web.py --port 9000`（跨平台，推荐）。
+
+> Windows 注意：`PROFILER_PORT=9000 python web.py` 是 **bash 前置换值语法**，cmd/PowerShell 不支持。
+> Windows 下请用 `--port`，或分开两条命令：cmd 用 `set PROFILER_PORT=9000`、
+> PowerShell 用 `$env:PROFILER_PORT="9000"`，再执行 `python web.py`。
+> 分析时同理：`python run.py <BV号> --port 9000` 会让自动启动的报告页也用该端口。
 
 
 
@@ -149,7 +154,7 @@ python login.py alt3
 
 ## 输出
 
-- **Web 报告**：`python web.py` 后访问 http://127.0.0.1:8000；后台运行时用 `python web.py --stop` 停止并释放端口
+- **Web 报告**：`python web.py` 后访问 http://127.0.0.1:8000；后台运行时用 `python web.py --stop` 停止并释放端口（换过端口要带上：`python web.py --stop --port 9000`）
 - **数据导出**：`data/reports/report_{BV号}_{时间}.csv` / `.json`（与分析运行同时间戳）
 - **数据库**：`data/profiler.db`（支持中断恢复）
 - **Cookie**：`data/cookie.json`（主号登录态）+ `data/cookies/*.json`（可选小号池，自动管理）
@@ -169,7 +174,7 @@ python login.py alt3
 | `HISTORY_MULTIPAGE_ENABLED` / `HISTORY_MULTIPAGE_MAX_PAGES` | 分P视频是否/最多采前几个分P 的历史弹幕 | `True` / `4` |
 | `ANALYZE_USERS_FLOOR` / `_RATIO` / `MAX_ANALYZE_USERS_HARD_CAP` | 定员上限：保底 / 按发送者比例 / 封顶 | `300` / `0.05` / `1000` |
 | `LLM_DEEP_TOP_K` | AI 深掘人数（兴趣分 top K） | `20` |
-| `PROFILER_PORT`（环境变量） | Web 服务端口 | `8000` |
+| `--port`（命令行） / `PROFILER_PORT`（环境变量） | Web 服务端口（**命令行优先**；Windows 上建议用 `--port`） | `8000` |
 
 > ⚠️ 调低 `REQUEST_DELAY` 会显著提高触发 B站风控的概率，不建议；其余取值影响的是耗时与覆盖度，可按需调整。
 
@@ -243,7 +248,7 @@ src/
 Cookie 里带 `_refresh_token` 时会自动续期；若没有它（或刷新失败）就重新跑 `python login.py` 扫码。小号同理：`python login.py alt1`。
 
 **报告页打不开 / 提示端口被占用？**
-换端口：`PROFILER_PORT=9000 python web.py`；停掉占用端口的旧实例：`python web.py --stop`（它按 pidfile 校验确实是本项目的 web.py 才动手，不会误杀别的进程）。
+换端口：`python web.py --port 9000`（Windows 的 cmd/PowerShell 不支持 `PROFILER_PORT=9000 python web.py` 这种 bash 写法，请用 `--port`；环境变量仍可用，写法见「快速开始」）；停掉占用端口的旧实例：`python web.py --stop --port 9000`（不带 `--port` 则针对 8000；它按 pidfile 校验确实是本项目的 web.py 才动手，不会误杀别的进程）。
 
 **为什么这么慢 / 一直在冷却？**
 B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风险接口 2–4 秒），热门视频必然是小时级。可以：① `--max-users 50` 限制分析人数；② 配小号池（`python login.py alt1`）与 IP 池（`SUB_URLS`）提升吞吐；③ 中途 Ctrl+C，重跑会从检查点续采、不重复已采数据。
@@ -311,7 +316,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（43 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（88 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -368,7 +373,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：43 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：88 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -396,6 +401,7 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_repeat_events.py` | 17 | 群体复读事件必须按**视频内时间**检测（跨月发送但同一画面要命中）、分P 不得合并、双轴各自达标、写法变体合并（含纯标点与英文不误并）、阈值边界与区块渲染 |
 | `tests/offline/regress_density_multip.py` | 9 | 多分P 密度轴按各分P 内部时间分别建桶、默认选弹幕最多的P、单分P 口径不变、缺元信息降级 |
 | `tests/offline/regress_multipart_pages.py` | 14 | 历史弹幕按分P 采集与检查点隔离（分P 1 键名不变）、画像样本「P{n} mm:ss」与排序、旧画像渲染期回填、弹幕浏览器首次出现按 (分P, 时间) |
+| `tests/offline/regress_port_config.py` | 5 | 端口解析优先级（`--port` > `PROFILER_PORT` > 8000）、非法/越界回退、两个入口的 `--help` 都暴露 `--port`（Windows 换端口可用性） |
 
 `tests/run_all.py` 会自动挑选带依赖的解释器（当前解释器 → 仓库 `.venv`），从任意目录运行均可，失败时退出码非 0，可直接接 CI。
 
