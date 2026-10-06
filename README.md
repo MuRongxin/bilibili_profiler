@@ -18,11 +18,15 @@ python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\ac
 pip install -r requirements.txt
 
 # 生成配置：仓库不含真实配置，只有模板
-cp config.example.py src/config.py # 把 config.example.py 复制到 ./src 目录并更名为config.py
-# config.py 配置说明在下面的内容有写
+cp config.example.py src/config.py     # macOS / Linux / Git Bash
+copy config.example.py src\config.py   # Windows cmd / PowerShell
 
-# 在 src/config.py 配置 LLM_API_KEY，或 使用环境变量 export LLM_API_KEY=...
-#   不填也能跑：问题弹幕/问题评论判定与 AI 深掘会自动跳过，采集、破解、画像、报告全部可用
+# 然后打开 src/config.py，**只需要改两处**（在文件里搜「替换这里」即可定位）：
+#   ①【替换这里①】LLM_API_KEY  大模型 API Key
+#      不填也能跑：问题弹幕/问题评论判定与 AI 深掘会自动跳过，采集、破解、画像、报告全部可用
+#   ②【替换这里②】SUB_URLS     机场订阅链接
+#      不填也能跑：不走代理、直连，其余功能完全照常（只是少了换 IP 抗风控的能力）
+# 两处都写了逐步填写说明（含 Windows 的 set / $env: 环境变量写法），其余常量不用动。
 
 # 分析一个视频（首次运行会打印二维码，用 B站APP 扫码确认）
 python run.py BV1vu4y1b7Y9
