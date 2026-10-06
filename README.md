@@ -23,10 +23,14 @@ copy config.example.py src\config.py   # Windows cmd / PowerShell
 
 # 然后打开 src/config.py，**只需要改两处**（在文件里搜「替换这里」即可定位）：
 #   ①【替换这里①】LLM_API_KEY  大模型 API Key
+#      改法：把现有的一对空引号 "" 中间填上你的 Key —— 引号保留，只填内容 → "sk-你的key"
 #      不填也能跑：问题弹幕/问题评论判定与 AI 深掘会自动跳过，采集、破解、画像、报告全部可用
 #   ②【替换这里②】SUB_URLS     机场订阅链接
+#      改法：同样只往那对 "" 中间贴链接，引号保留；多个订阅用英文逗号分隔
 #      不填也能跑：不走代理、直连，其余功能完全照常（只是少了换 IP 抗风控的能力）
 # 两处都写了逐步填写说明（含 Windows 的 set / $env: 环境变量写法），其余常量不用动。
+# 改完可自检（只打印条数与是否已填，不打印链接/Key）：
+#   python -c "import sys;sys.path.insert(0,'src');import config;print('订阅条数',len(config.SUB_URLS),'| LLM Key 已填',bool(config.LLM_API_KEY))"
 
 # 分析一个视频（首次运行会打印二维码，用 B站APP 扫码确认）
 python run.py BV1vu4y1b7Y9

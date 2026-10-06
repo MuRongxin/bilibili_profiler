@@ -11,6 +11,9 @@
        不填也能跑：不走代理、直连，其余功能完全照常（只是少了对风控换 IP 的能力）。
 
 其余常量都有合理默认值，不用动。src/config.py 已被 .gitignore 排除，不会被提交。
+
+改完想确认没写错，可跑一句自检（只打印"订阅条数 / Key 是否已填"，不会打印链接或 Key 本身）：
+    python -c "import sys;sys.path.insert(0,'src');import config;print('订阅条数',len(config.SUB_URLS),'| LLM Key 已填',bool(config.LLM_API_KEY))"
 """
 import os
 
@@ -85,16 +88,17 @@ ADAPTIVE_THROTTLE_DECAY = 0.99   # 每次业务成功请求后倍率衰减（约
 #   3. 都不可用 → 无 IP 池，账号轮转 + 长冷却兜底直连。
 #
 # 【替换这里②】机场订阅链接（可选。属凭证，勿提交、勿打印、勿截图）：
-#   把下面这行里 os.environ.get("SUB_URLS", "") 的**第二个引号对**（现在是个空字符串 ""）
-#   整个替换成你的机场订阅链接，改完长这样：
+#   把下面这行 os.environ.get("SUB_URLS", "") 的**第二个参数**（现在是两个紧挨的空引号 ""）
+#   改成你的机场订阅链接。**引号要保留，只把链接贴在两个引号中间**，改完长这样：
 #       SUB_URLS = [u.strip() for u in os.environ.get("SUB_URLS",
 #           "https://example.com/api/v1/client/subscribe?token=你的令牌").split(",") if u.strip()]
-#   · 这一步只是在 "SUB_URLS" 后面的引号里贴链接，其余字符（方括号、split 等）都不要动
-#   · 多个订阅：写在**同一个字符串**里，用英文逗号分隔
+#   · ⚠️ 引号不能删：写成 ...("SUB_URLS", https://example.com/...).split(...) 会直接语法错误
+#   · 除引号中间的内容外，其余字符（方括号、split、逗号等）都不要动
+#   · 多个订阅：写在**同一对引号之间**，用英文逗号分隔
 #   · 不填（保持 ""）：不使用代理，直连运行，其余功能完全照常
 #   · 也可以用环境变量覆盖（优先级更高）：cmd 用 set、PowerShell 用 $env:、Linux/mac 用 export
 SUB_URLS = [u.strip() for u in os.environ.get("SUB_URLS", "").split(",") if u.strip()]
-#                                                      ↑↑↑ 把这里的 "" 换成你的机场订阅链接 ↑↑↑
+#                                                      ↑↑↑ 把 "" 中间填上你的订阅链接（引号保留）↑↑↑
 # 覆盖内置 mihomo 二进制定位（默认依次找 vendor/mihomo、data/mihomo，都没有则自动下载）
 MIHOMO_PATH = os.environ.get("MIHOMO_PATH", "")
 # GitHub 加速前缀列表（下载 mihomo 核心用，按序尝试、全部失败回退直连；
@@ -191,10 +195,11 @@ WEB_AUTOSTART = True   # run.py/quick_test.py 分析完毕自动启动 web.py �
 #   用 DeepSeek（默认，推荐）：
 #     1) 打开 https://platform.deepseek.com 注册/登录
 #     2) 左侧「API keys」→ 创建 → 复制 sk- 开头的那一串
-#     3) 把下面 LLM_API_KEY 那行的**第二个引号对**（现在是个空字符串 ""）
-#        整个替换成你的 Key（连同引号一起替换），改完长这样：
+#     3) 把下面 LLM_API_KEY 那行的**第二个参数**（现在是两个紧挨的空引号 ""）改成你的 Key，
+#        **引号要保留，只把 Key 贴在两个引号中间**，改完长这样：
 #            LLM_API_KEY = os.environ.get("LLM_API_KEY", "sk-你的key")
-#        注意：不是新增一行，而是把 "" 改成 "sk-你的key"，其余字符都不要动
+#        ⚠️ 引号不能删：写成 ...("LLM_API_KEY", sk-你的key) 会直接报错
+#        注意：不是新增一行，而是把 "" 中间的内容补上，其余字符都不要动
 #
 #   用小米 MiMo / 智谱 GLM：把下面 MIMO_API_KEY / GLM_API_KEY 按同样方式填上，
 #   再把 LLM_PROVIDER 改成 "mimo" / "glm"（没填 Key 的厂商会被自动忽略，不会报错）
@@ -205,7 +210,7 @@ WEB_AUTOSTART = True   # run.py/quick_test.py 分析完毕自动启动 web.py �
 #       macOS / Linux:      export LLM_API_KEY=sk-你的key
 #
 # DeepSeek 官方 OpenAI 兼容端点（https://api-docs.deepseek.com），非必要不用改
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "")   # ←【替换这里①】把 "" 换成你的 DeepSeek Key（sk- 开头）
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")   # ←【替换这里①】把 "" 中间填上你的 Key（引号保留，sk- 开头）
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "16384"))
@@ -217,10 +222,10 @@ LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "16"))
 # LLM_PROVIDER 选择主用厂商，备用厂商按 mimo→glm→deepseek 序自动取下一个 key 非空的；
 # 各厂商缓存按模型名隔离（cache key 含模型名），可同视频 A/B 对比判定质量
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "deepseek")   # 主用厂商 deepseek | glm | mimo（填了哪家的 Key 就用哪家）
-MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")   # ← 用小米 MiMo 就把 "" 换成它的 Key，并把上面改成 "mimo"
+MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")   # ← 用小米 MiMo 就把 "" 中间填上它的 Key（引号保留），并把上面改成 "mimo"
 MIMO_BASE_URL = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
 MIMO_MODEL = os.environ.get("MIMO_MODEL", "mimo-v2.5")
-GLM_API_KEY = os.environ.get("GLM_API_KEY", "")        # ← 用智谱就把 "" 换成 bigmodel.cn 的 Key，并把 LLM_PROVIDER 改成 "glm"
+GLM_API_KEY = os.environ.get("GLM_API_KEY", "")        # ← 用智谱就把 "" 中间填上 bigmodel.cn 的 Key（引号保留），并把 LLM_PROVIDER 改成 "glm"
 GLM_BASE_URL = os.environ.get("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/")
 GLM_MODEL = os.environ.get("GLM_MODEL", "glm-5.3-flash")
 _PROVIDERS = {"deepseek": (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL),
