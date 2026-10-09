@@ -35,6 +35,19 @@ def _like_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _migrate_col(cursor, col: str, existing: set, ddl: str):
+    """旧库补列迁移：两进程（web 常驻 + 新起 run.py）并发首迁同一旧库时，
+    PRAGMA 检查与 ALTER 之间无锁，后执行者会撞 duplicate column name——
+    容忍该错误（说明另一进程已把列补好），其余异常正常上抛。"""
+    if col in existing:
+        return
+    try:
+        cursor.execute(ddl)
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+
+
 def get_db() -> sqlite3.Connection:
     """获取数据库连接（每连接设置并发相关 PRAGMA）"""
     conn = sqlite3.connect(DB_PATH)
@@ -87,6 +100,9 @@ def init_db():
                 UNIQUE(bvid, mid_hash)
             )
         ''')
+        # uid 索引：跨视频重叠面板/低置信度页/global 沉淀判重按 uid 查 senders
+        # （无索引则每次全表扫；clear_video_cache 的逐 uid 判重是 O(uids×N)）
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_senders_uid ON senders(uid)")
 
         # 用户深度数据表
         cursor.execute('''
@@ -100,7 +116,9 @@ def init_db():
             )
         ''')
 
-        # 全局 mid_hash→UID 映射表（跨视频复用，只增不删）
+        # 全局 mid_hash→UID 映射表（跨视频沉淀复用；正常只增——删除视频报告时
+        # delete_video_data 会连带删除该视频涉及的映射（用户明确选择"彻底删除"，
+        # 含身份痕迹），跨视频解析率的小幅损失属可接受的代价）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS global_uid_map (
                 mid_hash TEXT PRIMARY KEY,
@@ -139,19 +157,17 @@ def init_db():
         # 复合索引：弹幕浏览器按发送者+时间排序、报告按 bvid 聚合发送者用
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_danmaku_bvid_hash_time ON danmaku(bvid, mid_hash, time)")
 
-        # 旧库迁移：danmaku 表补 mode/color/pool/dmid 列（弹幕属性统计：滚动占比/颜色分布/顶底弹幕）
+        # 旧库迁移：danmaku 表补 mode/color/pool/dmid/page 列（弹幕属性统计：滚动占比/颜色分布/顶底弹幕；
+        # page 为分P序号，断点续采从库读回后 group_by_sender 要用）
         dm_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(danmaku)").fetchall()}
-        if "mode" not in dm_cols:
-            cursor.execute("ALTER TABLE danmaku ADD COLUMN mode INTEGER NOT NULL DEFAULT 1")
-        if "color" not in dm_cols:
-            cursor.execute("ALTER TABLE danmaku ADD COLUMN color TEXT NOT NULL DEFAULT ''")
-        if "pool" not in dm_cols:
-            cursor.execute("ALTER TABLE danmaku ADD COLUMN pool INTEGER NOT NULL DEFAULT 0")
-        if "dmid" not in dm_cols:
-            cursor.execute("ALTER TABLE danmaku ADD COLUMN dmid INTEGER NOT NULL DEFAULT 0")
-        # 旧库迁移：danmaku 表补 page 列（分P序号，断点续采从库读回后 group_by_sender 要用）
-        if "page" not in dm_cols:
-            cursor.execute("ALTER TABLE danmaku ADD COLUMN page INTEGER NOT NULL DEFAULT 1")
+        for col, ddl in (
+            ("mode", "ALTER TABLE danmaku ADD COLUMN mode INTEGER NOT NULL DEFAULT 1"),
+            ("color", "ALTER TABLE danmaku ADD COLUMN color TEXT NOT NULL DEFAULT ''"),
+            ("pool", "ALTER TABLE danmaku ADD COLUMN pool INTEGER NOT NULL DEFAULT 0"),
+            ("dmid", "ALTER TABLE danmaku ADD COLUMN dmid INTEGER NOT NULL DEFAULT 0"),
+            ("page", "ALTER TABLE danmaku ADD COLUMN page INTEGER NOT NULL DEFAULT 1"),
+        ):
+            _migrate_col(cursor, col, dm_cols, ddl)
 
         # 评论表（跨视频足迹 + 高回复评论页数据源；reply_count 只对主评论有意义，
         # root_rpid 记录子评论所属主评论的 rpid，供「高回复评论」页关联争议主楼与回复）
@@ -178,23 +194,18 @@ def init_db():
         # 复合索引：问题评论榜/问题作者直引按 (bvid, problem) 过滤用
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_bvid_problem ON comments(bvid, problem)")
 
-        # 旧库迁移：comments 表补 reply_count / root_rpid 列（高回复评论功能）
+        # 旧库迁移：comments 表补 reply_count / root_rpid / parent_rpid / problem /
+        # uname / location 列（高回复评论功能 + 回复树 + LLM 问题标注 + IP属地）
         comment_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(comments)").fetchall()}
-        if "reply_count" not in comment_cols:
-            cursor.execute("ALTER TABLE comments ADD COLUMN reply_count INTEGER NOT NULL DEFAULT 0")
-        if "root_rpid" not in comment_cols:
-            cursor.execute("ALTER TABLE comments ADD COLUMN root_rpid INTEGER NOT NULL DEFAULT 0")
-        # 旧库迁移：comments 表补 parent_rpid（回复树缩进）与 problem（LLM 问题评论标注）列
-        if "parent_rpid" not in comment_cols:
-            cursor.execute("ALTER TABLE comments ADD COLUMN parent_rpid INTEGER NOT NULL DEFAULT 0")
-        if "problem" not in comment_cols:
-            cursor.execute("ALTER TABLE comments ADD COLUMN problem TEXT NOT NULL DEFAULT ''")
-        # 旧库迁移：comments 表补 uname（高回复评论树直接显示用户名）
-        if "uname" not in comment_cols:
-            cursor.execute("ALTER TABLE comments ADD COLUMN uname TEXT NOT NULL DEFAULT ''")
-        # 旧库迁移：comments 表补 location（IP 属地，断点续采从库读回评论时画像地域维度用）
-        if "location" not in comment_cols:
-            cursor.execute("ALTER TABLE comments ADD COLUMN location TEXT NOT NULL DEFAULT ''")
+        for col, ddl in (
+            ("reply_count", "ALTER TABLE comments ADD COLUMN reply_count INTEGER NOT NULL DEFAULT 0"),
+            ("root_rpid", "ALTER TABLE comments ADD COLUMN root_rpid INTEGER NOT NULL DEFAULT 0"),
+            ("parent_rpid", "ALTER TABLE comments ADD COLUMN parent_rpid INTEGER NOT NULL DEFAULT 0"),
+            ("problem", "ALTER TABLE comments ADD COLUMN problem TEXT NOT NULL DEFAULT ''"),
+            ("uname", "ALTER TABLE comments ADD COLUMN uname TEXT NOT NULL DEFAULT ''"),
+            ("location", "ALTER TABLE comments ADD COLUMN location TEXT NOT NULL DEFAULT ''"),
+        ):
+            _migrate_col(cursor, col, comment_cols, ddl)
 
         # 误报标记表（P2-a）：人工标注 LLM 误判的问题弹幕/评论。
         # kind: dm=问题弹幕（target=弹幕内容，判定按内容去重故同内容同源同罪）
@@ -486,6 +497,14 @@ def load_comments(bvid: str) -> list[dict]:
              "problem": r["problem"], "location": r["location"]} for r in rows]
 
 
+def load_comment_uids(bvid: str) -> set[int]:
+    """该视频已入库评论的 uid 集合（UID 收割的已知集合）。只取 uid 列——
+    大评论区（数万行）全列拉取（含正文数 MB）纯属浪费。"""
+    with closing(get_db()) as conn:
+        return {r[0] for r in conn.execute(
+            "SELECT uid FROM comments WHERE bvid = ?", (bvid,))}
+
+
 def update_comment_problems(bvid: str, verdicts: dict):
     """回写 LLM 问题评论判定：verdicts = {rpid: 类别}；先清该 bvid 旧标注再逐条 UPDATE。
 
@@ -663,8 +682,10 @@ def save_global_uid(mid_hash: str, uid: int, source: str):
     source: 评论区验证 / CRC32破解 / 充电名单 / 互动弹幕 / 视频信息
 
     冲突覆盖按来源优先级（见 _GLOBAL_UID_SOURCE_PRIORITY）：明文来源 > CRC32破解，
-    仅当新来源优先级 >= 旧来源才覆盖 uid/source，防止破解结果被低置信来源反复冲掉；
-    先查旧 source 再决定，同一连接事务内完成。
+    仅当新来源优先级 >= 旧来源才覆盖 uid/source，防止破解结果被低置信来源反复冲掉。
+    覆盖条件带进 UPDATE 的 WHERE（CASE source→优先级）："读旧 source → UPDATE"
+    两步之间可能被并发写插入，无条件 UPDATE 是最后提交者获胜——低优先级来源
+    可能覆盖掉高优先级结果；带条件后条件不满足自动退化为只累计命中。
     """
     now = datetime.now().isoformat()
     with closing(get_db()) as conn:
@@ -675,20 +696,26 @@ def save_global_uid(mid_hash: str, uid: int, source: str):
         cursor.execute(
             "INSERT OR IGNORE INTO global_uid_map (mid_hash, uid, source, first_seen, last_seen, hit_count)"
             " VALUES (?, ?, ?, ?, ?, 0)", (mid_hash, uid, source, now, now))
-        row = cursor.execute(
-            "SELECT source FROM global_uid_map WHERE mid_hash = ?", (mid_hash,)).fetchone()
+        row = cursor.execute("SELECT source FROM global_uid_map WHERE mid_hash = ?", (mid_hash,)).fetchone()
         old_pri = _GLOBAL_UID_SOURCE_PRIORITY.get(row["source"], 0)
         if new_pri >= old_pri:
-            cursor.execute('''
+            # 优先级比较进 SQL（与 _GLOBAL_UID_SOURCE_PRIORITY 对齐生成 CASE）：
+            # 等锁期间/读后写前被并发更高优先级来源抢先覆盖时 rowcount=0，
+            # 自动落到下方"只累计命中"分支
+            pri_case = "CASE source " + " ".join(
+                f"WHEN '{s}' THEN {p}" for s, p in _GLOBAL_UID_SOURCE_PRIORITY.items()) + " ELSE 0 END"
+            cur = cursor.execute(f'''
                 UPDATE global_uid_map SET uid=?, source=?, last_seen=?, hit_count=hit_count+1
-                WHERE mid_hash=?
-            ''', (uid, source, now, mid_hash))
-        else:
-            # 低优先级来源不覆盖 uid/source，只累计命中并刷新 last_seen
-            cursor.execute('''
-                UPDATE global_uid_map SET last_seen=?, hit_count=hit_count+1
-                WHERE mid_hash=?
-            ''', (now, mid_hash))
+                WHERE mid_hash=? AND ? >= {pri_case}
+            ''', (uid, source, now, mid_hash, new_pri))
+            if cur.rowcount > 0:
+                conn.commit()
+                return
+        # 低优先级来源不覆盖 uid/source，只累计命中并刷新 last_seen
+        cursor.execute('''
+            UPDATE global_uid_map SET last_seen=?, hit_count=hit_count+1
+            WHERE mid_hash=?
+        ''', (now, mid_hash))
         conn.commit()
 
 

@@ -50,6 +50,8 @@ SCRIPTS = [
     "tests/offline/regress_multipart_pages.py", # 多分P 历史采集与样本标注 14 项
     "tests/offline/regress_repeat_events.py",   # 群体复读事件检测口径 17 项
     "tests/offline/regress_port_config.py",     # 端口配置（--port/环境变量/回退）5 项
+    "tests/offline/regress_review_fixes.py",    # 本轮 code review 修复定点验证 10 项
+    "tests/offline/regress_blocklist.py",       # B站屏蔽列表导出（选人/误报/低置信度/路由）11 项
 ]
 SUMMARY_RE = re.compile(r"(\d+) 项通过,\s*(\d+) 项失败")
 
@@ -94,15 +96,16 @@ def run_offline() -> tuple[int, int, list[str]]:
 def run_lint() -> bool:
     """pyflakes 静态检查：抓未定义名/语法类回归（比运行时踩 NameError 便宜得多）"""
     print("\n=== pyflakes 静态检查 ===")
-    try:
-        proc = subprocess.run([PY, "-m", "pyflakes", "src", "web.py", "run.py",
-                               "quick_test.py", "login.py", "tests"],
-                              cwd=str(ROOT), capture_output=True, text=True,
-                              encoding="utf-8", errors="replace")
-    except FileNotFoundError:
+    proc = subprocess.run([PY, "-m", "pyflakes", "src", "web.py", "run.py",
+                           "quick_test.py", "login.py", "tests"],
+                          cwd=str(ROOT), capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    out = (proc.stdout or "") + (proc.stderr or "")
+    # 模块缺失时 pyflakes 以非零码退出并在 stderr 报 "No module named"——
+    # （PY 一定是可执行的解释器，FileNotFoundError 分支实际到不了）
+    if proc.returncode != 0 and "No module named" in out:
         print("  未安装 pyflakes，跳过（pip install pyflakes）")
         return True
-    out = (proc.stdout or "") + (proc.stderr or "")
     serious = [l for l in out.splitlines()
                if l.strip() and "imported but unused" not in l and "f-string is missing" not in l]
     if serious:
