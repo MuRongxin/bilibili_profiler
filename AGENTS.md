@@ -87,7 +87,7 @@ src/
 项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
 ```bash
-# 1) 离线回归（189 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+# 1) 离线回归（190 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 多分P 口径（密度轴/历史采集/样本标注）
 python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
 

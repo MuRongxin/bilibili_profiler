@@ -38,8 +38,15 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
+      # 长图用例会真实出图，需要系统 CJK 字体（ubuntu runner 默认没有，
+      # Windows runner 自带 msyh/simhei）。不装的话该用例会走"无字体降级"分支，
+      # Linux 上的出图路径就没人验证了。
+      - name: 安装中文字体（Linux；长图渲染用例需要）
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
+
       - name: 生成 src/config.py（仓库不含真实配置，只有模板）
         run: python -c "import shutil; shutil.copyfile('config.example.py', 'src/config.py')"
 
-      - name: 离线回归 + 静态检查（39 项，需 Python >= 3.12；无需网络 / Cookie / LLM 额度）
+      - name: 离线回归 + 静态检查（需 Python >= 3.12；无需网络 / Cookie / LLM 额度）
         run: python tests/run_all.py --lint
