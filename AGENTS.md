@@ -62,6 +62,7 @@ src/
 ├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；采集全程走账号×IP 组合池（combo_pool，鸭子类型透明接管：多号并行分片（每账号一子池、限速按号独立、线程↔分片绑定、吞吐≈账号数倍）、风控换号+切节点重试，冷却锁外等待，IP 池故障自动降级直连并定时重探恢复）；单用户日志行缓冲、完成时原子输出，多线程不交错）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
 ├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存，OpenAI client 初始化时复用、单次调用超时 LLM_DEEP_TIMEOUT=120s；结果注入 profile 并由阶段7回写 video_profiles（bvid+uid 隔离）（web 报告读库展示，不落库则报告页不可见）；全员粗筛已砍，未配置 Key 自动跳过）
+├── llm_client.py        # make_client()：统一的 OpenAI 兼容客户端构造，显式声明 httpx trust_env（默认不继承环境代理——all_proxy=socks:// 会让 httpx 直接抛 ValueError 导致所有 LLM 调用秒失败；开关 LLM_TRUST_ENV_PROXY）
 ├── up_analyzer.py       # UP 主词云懒加载（fetch_up_wordcloud：单请求+immediate 免限速轻量路径；采集阶段只存全部关注名单，被关注 UP 主的投稿词云在悬停 chip 时经 /api/up/<uid>/wordcloud 懒加载，`up:{uid}` 缓存；web 启动时后台热身鉴权威胁，前端视口内 chip 慢速队列预热+在途去重）
 ├── report.py            # 报告渲染函数库（用户卡片/问题弹幕榜/图表统计/基础CSS，被 web.py 复用）
 ├── exporter.py          # CSV/JSON 数据导出（report_{BV号}_{时间} 前缀，Web 报告页提供下载链接）
@@ -76,6 +77,7 @@ src/
 - **失败要降级而非中断**：例如评论采集失败时回退为仅用 CRC32 破解；LLM 分析失败只打印警告。单个用户采集异常不得中断整体流水线。
 - **不删除数据**：刷屏检测只标记 `spam_level`，不删除任何弹幕。
 - **本机回环调用必须绕开环境代理**：代理客户端会把 `http_proxy/https_proxy/all_proxy` 写进 shell，而 Python 的 `no_proxy` 只做后缀匹配（用户写 `127.*` 不生效），裸 `requests.get("http://127.0.0.1:...`) 会被送进代理收到 502。对本地控制器/本地服务的调用必须用 `trust_env=False` 的 Session 或 `ProxyHandler({})` 的 opener（参考 `clash_ctl._SESSION`、`web_autostart._LOCAL_OPENER`，回归见 `tests/offline/regress_env_proxy.py`）；对 GitHub/订阅等**远程**下载保留环境代理（那是用户需要的加速手段）。
+- **LLM 客户端同样不继承环境代理**：openai SDK 底层 httpx 默认 `trust_env=True`，而代理客户端常写入 `all_proxy=socks://...`——httpx 未装 socks 支持时直接抛 `ValueError: Unknown scheme for proxy URL`，表现为「所有 LLM 调用 0.0 秒秒失败」（api_client 因为已 trust_env=False 反而正常，现象很迷惑）。所有客户端一律经 `llm_client.make_client(...)` 构造，开关 `config.LLM_TRUST_ENV_PROXY`（默认 False），回归见 `tests/offline/regress_llm_proxy.py`。
 - 采集规模由 `config.py` 中的 `MAX_*` 常量控制（评论 100 页、子评论补采 25 页/条、动态定员上限 ANALYZE_USERS_FLOOR=300 / ANALYZE_USERS_RATIO=0.05 / MAX_ANALYZE_USERS_HARD_CAP=1000（保底/按比例上浮/绝对封顶）、深掘 LLM_DEEP_TOP_K=20、问题弹幕/问题评论判定并发上限 LLM_CONCURRENCY=16（实际路数=min(批次数,上限)，429 限速自动退避重试）、问题弹幕批大小 CRINGE_BATCH_SIZE=200、问题评论批次/上限 COMMENT_CRINGE_BATCH_SIZE=100 / COMMENT_CRINGE_MAX_ITEMS=2000、问题评论作者直引阈值 COMMENT_AUTHOR_MIN_SEVERITY=2 / COMMENT_AUTHOR_MIN_HITS=2、评论 UID 收割上限 UID_HARVEST_MAX_PAGES=500、问题评论榜 COMMENT_HEAT_REPLY_WEIGHT=10 / PROBLEM_COMMENT_TOP_N=30、争执焦点 ATTACK_FOCUS_TOP_N=5 / ATTACK_FOCUS_MAX_N=20（保底/封顶，按攻击边数浮动）、密度时间轴桶数 DENSITY_BUCKETS=60、跨视频面板 CROSS_VIDEO_MIN_VIDEOS=2 / CROSS_VIDEO_MAX_USERS=50、LLM 深掘超时 LLM_DEEP_TIMEOUT=120、LLM 判定整轮重试熔断 LLM_RETRY_BUDGET_SECONDS=1800 / 瞬态重试 LLM_TRANSIENT_RETRIES=2、历史弹幕滚动补采 HISTORY_RECENT_REFRESH_DAYS=3 / 分P历史采集 HISTORY_MULTIPAGE_ENABLED / HISTORY_MULTIPAGE_MAX_PAGES=4、代理恢复重探 PROXY_RETRY_AFTER=600、单账号池冷却 SINGLE_ACCOUNT_RISK_COOLDOWN=120、WBI 密钥负缓存 WBI_KEY_FAIL_TTL=60、buvid3/bili_ticket 重试 CRED_FAIL_TTL=300、回复树深度 REPLY_TREE_MAX_DEPTH=50、web job 淘汰 WEB_JOB_MAX_KEPT=100 、手动分析上限 ANALYZE_MAX_TARGETS=200、刷屏检测 SPAM_BURST_*/SPAM_VARIANT_*/SPAM_COMBO_BONUS/SPAM_RELATIVE_*/REPEAT_EVENT_* 窗口阈值与组合/相对离群/复读事件参数等），调优时改这里而不是散落在代码里的数字。
 - 输出文件：`data/reports/report_{BV号}_{时间}.csv/.json`（CSV/JSON 导出，web.py 报告页提供下载链接）、`data/profiler.db`（数据库）、`data/cookie.json`（登录态）。
 
@@ -84,7 +86,7 @@ src/
 项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
 ```bash
-# 1) 离线回归（178 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+# 1) 离线回归（184 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 多分P 口径（密度轴/历史采集/样本标注）
 python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
 

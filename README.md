@@ -182,6 +182,7 @@ python login.py alt3
 | `HISTORY_MULTIPAGE_ENABLED` / `HISTORY_MULTIPAGE_MAX_PAGES` | 分P视频是否/最多采前几个分P 的历史弹幕 | `True` / `4` |
 | `ANALYZE_USERS_FLOOR` / `_RATIO` / `MAX_ANALYZE_USERS_HARD_CAP` | 定员上限：保底 / 按发送者比例 / 封顶 | `300` / `0.05` / `1000` |
 | `LLM_DEEP_TOP_K` | AI 深掘人数（兴趣分 top K） | `20` |
+| `LLM_TRUST_ENV_PROXY` | LLM 客户端是否继承 shell 里的代理（**默认不继承**；代理写入 `all_proxy=socks://` 时可致 LLM 调用全部秒失败） | `False` |
 | `--port`（命令行） / `PROFILER_PORT`（环境变量） | Web 服务端口（**命令行优先**；Windows 上建议用 `--port`） | `8000` |
 
 > ⚠️ 调低 `REQUEST_DELAY` 会显著提高触发 B站风控的概率，不建议；其余取值影响的是耗时与覆盖度，可按需调整。
@@ -327,7 +328,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（178 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（184 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -384,7 +385,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：178 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：184 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -402,7 +403,7 @@ python run.py <BV号>                     # 完整流水线
 
 | 脚本 | 项数 | 覆盖 |
 |---|---|---|
-| `tests/offline/regress_core.py` | 14 | 历史弹幕断点续采（中断后必须补齐、失败日挂账、不误写 done）、线程池收尾、`post()` 重试请求体、限速预算熔断、画像渲染容错等 |
+| `tests/offline/regress_core.py` | 13 | 历史弹幕断点续采（中断后必须补齐、失败日挂账、不误写 done）、线程池收尾、`post()` 重试请求体、限速预算熔断、画像渲染容错等 |
 | `tests/offline/regress_comment_path.py` | 10 | wbi/legacy 翻页与降级、请求异常保留已采、真重复页检测、缺 rpid 脏行、刷新计数 |
 | `tests/offline/regress_judge_danmaku.py` | 4 | 问题弹幕判定必须被采纳并归到正确发送者（防"解析了却没采纳"） |
 | `tests/offline/regress_judge_comment.py` | 3 | 问题评论判定必须回映到正确 rpid |
@@ -414,6 +415,7 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_multipart_pages.py` | 14 | 历史弹幕按分P 采集与检查点隔离（分P 1 键名不变）、画像样本「P{n} mm:ss」与排序、旧画像渲染期回填、弹幕浏览器首次出现按 (分P, 时间) |
 | `tests/offline/regress_port_config.py` | 5 | 端口解析优先级（`--port` > `PROFILER_PORT` > 8000）、非法/越界回退、两个入口的 `--help` 都暴露 `--port`（Windows 换端口可用性
 | `tests/offline/regress_env_proxy.py` | 6 | 环境代理（http_proxy/https_proxy/all_proxy）不得劫持**本机**调用：本机假控制器 + 代理指向死端口，验证 `clash_ctl` 与自动打开报告页的探测仍能打通（Python 的 `no_proxy` 不认 `127.*`） |
+| `tests/offline/regress_llm_proxy.py` | 6 | LLM 客户端不继承环境代理：裸 SDK 在 `all_proxy=socks://` 下必失败（前提校验），`llm_client.make_client` 必须照常调通（判定批次 thinking 参数路径一并验证） |
 | `tests/offline/regress_web_stop.py` | 8 | `--stop` 兜底（pidfile 缺失/失效时按监听端口反查 ss/lsof/netstat）与 pidfile 归属守卫（老实例退出不再误删新实例记录）、身份校验不误杀无关进程 |
 | `tests/offline/regress_long_image.py` | 12 | 分享长图：payload 装配与截断、渲染尺寸/像素护栏、路由确实接线、跟随「隐藏信息」开关遮蔽（该用例曾抓出 `_apply_danmaku_fp` 返回值误用导致画像整段消失）） |
 
