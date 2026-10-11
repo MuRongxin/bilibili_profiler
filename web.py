@@ -3363,9 +3363,22 @@ def _write_pid(port: int):
         json.dump(record, f, ensure_ascii=False)
 
 
-def _clear_pid(port: int):
+def _clear_pid(port: int, force: bool = False):
+    """删除该端口的 pidfile。
+
+    默认**只删属于本进程的那条记录**：老实例退出时的 atexit / SIGTERM 处理器会无条件
+    删除文件，若此时新实例已写入自己的记录，就会把新实例的 pidfile 误删——端口被占
+    却再也停不掉。force=True 供 --stop 清理"已确认失效/已停止"的记录。"""
+    path = _pid_file(port)
+    if not force:
+        try:
+            with open(path, encoding="utf-8") as f:
+                if int(json.load(f).get("pid", -1)) != os.getpid():
+                    return
+        except (OSError, ValueError, TypeError):
+            return
     try:
-        os.remove(_pid_file(port))
+        os.remove(path)
     except OSError:
         pass
 
@@ -3398,27 +3411,95 @@ def _pid_is_webpy(pid: int, started: str | None = None, recorded_cwd: str = "") 
     return os.path.realpath(script) == os.path.realpath(__file__)
 
 
+def _parse_listener_pids(text: str, port: int = 0) -> list[int]:
+    """从 ss / lsof / netstat 输出解析"监听进程 PID"（纯函数，便于离线测试）。
+
+    - ss -ltnp:      ... users:(("python",pid=123,fd=3))
+    - lsof -ti:      每行一个 PID
+    - netstat -ano:  TCP  127.0.0.1:8000  0.0.0.0:0  LISTENING  123（按端口过滤，
+                     否则会把别的端口的监听进程也算进来）"""
+    pids: list[int] = []
+
+    def _add(p: int):
+        if p not in pids:
+            pids.append(p)
+
+    for m in re.finditer(r"pid=(\d+)", text or ""):
+        _add(int(m.group(1)))
+    if pids:
+        return pids
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.isdigit():
+            _add(int(s))
+            continue
+        if re.search(r"LISTENING", s, re.IGNORECASE) and (not port or (":%d" % port) in s):
+            m = re.search(r"(\d+)\s*$", s)
+            if m:
+                _add(int(m.group(1)))
+    return pids
+
+
+def _listening_pids(port: int) -> list[int]:
+    """监听该端口的进程 PID（pidfile 缺失/失效时的兜底）。
+
+    依次尝试 ss（iproute2）→ lsof → netstat；都不可用返回 []。返回的 PID **必须**再用
+    _pid_is_webpy 验明是本项目 web.py 才允许 kill——不做"谁占端口杀谁"。"""
+    if sys.platform.startswith("win"):
+        cmds = [["netstat", "-ano", "-p", "TCP"]]
+    else:
+        cmds = [["ss", "-ltnpH", "sport = :%d" % port], ["ss", "-ltnp", "sport = :%d" % port],
+                ["lsof", "-ti", "tcp:%d" % port, "-sTCP:LISTEN"], ["netstat", "-ltnp"]]
+    for cmd in cmds:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0 and (proc.stdout or "").strip():
+            pids = _parse_listener_pids(proc.stdout, port)
+            if pids:
+                return pids
+    return []
+
+
 def _stop_server(port: int):
     """python web.py --stop：停止该端口的后台 web 服务并释放端口。
 
-    读 pidfile → 校验进程确为本项目 web.py（否则只清残留 pidfile）→ SIGTERM
-    优雅停止，1 秒内未退出则 SIGKILL 兜底；最后清理 pidfile。"""
+    先读 pidfile 并校验进程确为本项目 web.py（防 PID 复用误杀）；**pidfile 缺失、
+    内容失效或指向的进程已不在时，兜底按「谁在监听该端口」反查**，仍须验明是本项目
+    web.py 才动手——「端口被占用却停不掉」由此收敛（老实例退出误删 pidfile 是已知成因）。
+    停止策略：SIGTERM 优雅退出，1 秒内未退出则 SIGKILL 兜底；最后清理 pidfile。"""
     pid_path = _pid_file(port)
+    pid = None
+    started = None
+    recorded_cwd = ""
     try:
         with open(pid_path, encoding="utf-8") as f:
             record = json.load(f)
-            pid = int(record["pid"])
-            started = record["started"]
-            recorded_cwd = record.get("cwd", "")
-            if (not started or record["port"] != port
-                    or record["script"] != os.path.realpath(__file__)):
-                raise ValueError("服务身份不匹配")
+        pid = int(record["pid"])
+        started = record["started"]
+        recorded_cwd = record.get("cwd", "")
+        if (not started or record["port"] != port
+                or record["script"] != os.path.realpath(__file__)):
+            raise ValueError("服务身份不匹配")
     except (OSError, ValueError, KeyError, TypeError):
-        print(f"[Web] 未发现 {port} 端口的服务记录（{pid_path} 不存在），服务可能未在运行")
-        return
-    if not _pid_is_webpy(pid, started, recorded_cwd):
+        pid = None
+    if pid is not None and not _pid_is_webpy(pid, started, recorded_cwd):
         print(f"[Web] 记录中的进程 {pid} 已不存在或不是本项目的 web.py，清理残留 pidfile")
-        _clear_pid(port)
+        _clear_pid(port, force=True)
+        pid = None
+    if pid is None:
+        # 兜底：pidfile 缺失/被误删/记录过期时按监听端口反查（仍须是本项目的 web.py）。
+        # recorded_cwd 传本项目根目录：进程以相对路径启动时靠它解析脚本参数
+        _here = os.path.dirname(os.path.abspath(__file__))
+        for cand in _listening_pids(port):
+            if _pid_is_webpy(cand, None, _here):
+                print(f"[Web] pidfile 无有效记录，按监听端口反查到本项目的 web.py (pid={cand})")
+                pid = cand
+                break
+    if pid is None:
+        print(f"[Web] 未发现 {port} 端口的本项目 web.py（{pid_path} 无有效记录，"
+              f"当前也没有本项目的 web.py 在监听该端口）")
         return
     try:
         os.kill(pid, signal.SIGTERM)
@@ -3436,7 +3517,7 @@ def _stop_server(port: int):
         except (AttributeError, OSError):
             pass    # Windows 无 SIGKILL（os.kill 的 SIGTERM 即 TerminateProcess）
         time.sleep(0.1)
-    _clear_pid(port)
+    _clear_pid(port, force=True)   # 记录属于被停掉的进程，需强制清理
     print(f"[Web] 已停止 {port} 端口的 web 服务 (pid={pid})，端口已释放")
 
 

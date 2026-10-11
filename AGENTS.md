@@ -29,7 +29,7 @@ python login.py        # 扫码登录主号（全自动轮询：终端字符码+
 python login.py alt1   # 扫码登录小号 alt1（存 data/cookies/alt1.json，run.py 阶段5自动发现轮转分摊采集）
 python quick_test.py [BV号] [--top N]  # 快速分析：只分析刷屏得分最高的前 N 个发送者
 python web.py --port 9000            # 交互式 Web 报告（默认 127.0.0.1:8000；--port 优先于 PROFILER_PORT，Windows 上必须用参数写法）
-python web.py --stop --port 9000     # 停止该端口的后台 web 服务并释放端口（pidfile: data/web_{端口}.pid，防 PID 复用误杀；不带 --port 默认 8000）
+python web.py --stop --port 9000     # 停止该端口的后台 web 服务并释放端口（pidfile: data/web_{端口}.pid；pidfile 缺失/失效时按监听端口反查 ss/lsof/netstat，仍须验明是本项目 web.py 才动手；不带 --port 默认 8000）
 ```
 
 注意：`run.py` 分析完毕会自动启动 web.py 并打开报告页；`quick_test.py` 将采样画像独立导出至 `data/quick_reports/`（HTML/JSON/CSV）并打开采样 HTML（`config.py` 中 `WEB_AUTOSTART=False` 关闭；批量模式不自动启动）。
@@ -83,7 +83,7 @@ src/
 项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
 ```bash
-# 1) 离线回归（164 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+# 1) 离线回归（172 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 多分P 口径（密度轴/历史采集/样本标注）
 python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
 
