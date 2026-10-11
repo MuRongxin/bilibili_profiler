@@ -20,6 +20,7 @@ import sys
 import os
 import json
 import glob
+import io
 import re
 import argparse
 import atexit
@@ -1169,6 +1170,21 @@ def _variant_title(e: dict) -> str:
     return "\n".join(lines) or e.get("content", "")
 
 
+def _repeat_events_data(bvid: str) -> tuple[list, dict]:
+    """群体复读事件取数：返回 (events, 全池分布)。无弹幕时返回 ([], {})。
+
+    概览页区块与分享长图共用——两处口径必须一致，否则图上与页上数字对不上。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT content, mid_hash, time, timestamp, page FROM danmaku WHERE bvid = ?",
+            (bvid,)).fetchall()
+    if not rows:
+        return [], {}
+    # sqlite3.Row 无 .get，转 dict 再喂给检测函数
+    dict_rows = [dict(r) for r in rows]
+    return detect_repeat_events(dict_rows), pool_distribution_from_rows(dict_rows)
+
+
 def _repeat_events_block(bvid: str) -> str:
     """概览页「群体复读事件」区块：全视频维度的接龙/+1 队列刷屏检测
     （spam_detector.detect_repeat_events：同一内容在 60s 窗口内被 ≥5 个不同发送者
@@ -1178,16 +1194,9 @@ def _repeat_events_block(bvid: str) -> str:
     可点跳转核验）+ **发送时间**（真实时间短窗集中刷屏）。底部附全池分布自检行
     （pool_distribution_from_rows：发送者数、弹幕数与重复率的 P50/P95），供阈值校准。
     无弹幕数据返回 ""（不渲染区块）。"""
-    with closing(get_db()) as conn:
-        rows = conn.execute(
-            "SELECT content, mid_hash, time, timestamp, page FROM danmaku WHERE bvid = ?",
-            (bvid,)).fetchall()
-    if not rows:
+    events, dist = _repeat_events_data(bvid)
+    if not events and not dist:
         return ""
-    # sqlite3.Row 无 .get，转 dict 再喂给检测函数
-    dict_rows = [dict(r) for r in rows]
-    events = detect_repeat_events(dict_rows)
-    dist = pool_distribution_from_rows(dict_rows)
     if events:
         trs = "".join(
             f'<tr><td title="{esc(_variant_title(e))}">{esc(_truncate(e["content"], 30))}'
@@ -2567,6 +2576,8 @@ def video_page(bvid: str):
                     导出含真实 UID，不受「隐藏信息」开关影响（屏蔽必须用真实 UID）。</p>
                 </div>
             </details>
+            <a class="filter-btn" href="/api/video/{esc(bvid)}/longimage" target="_blank" rel="noopener"
+               title="把本视频的精华内容渲染成一张竖版长图（数据总览/问题弹幕榜/争执焦点/问题评论榜/群体复读/用户画像），可直接保存转发；跟随「隐藏信息」开关遮蔽昵称">🖼 导出长图</a>
             <span id="reportJobStatus"></span>
         </div>
         {coverage_note}
@@ -3045,6 +3056,69 @@ def api_blocklist_cross():
     payload = json.dumps(result["entries"], ensure_ascii=False, indent=2)
     resp = Response(payload, mimetype="application/json")
     resp.headers["Content-Disposition"] = 'attachment; filename="blocklist_cross.json"'
+    return resp
+
+
+@app.route("/api/video/<bvid>/longimage")
+@_db_guard
+def api_longimage(bvid: str):
+    """分享长图导出：把概览里最值得传播的内容渲染成一张竖版 PNG（Pillow 服务端出图）。
+
+    与网页报告同口径：**同一批取数函数**（_load_profiles / _attack_focus /
+    _problem_comment_board / _repeat_events_data / _danmaku_panel_stats）+ 误报扣除，
+    保证图上的数字与榜单跟页面上一致。
+
+    隐藏信息（mask Cookie）跟随网页开关：_load_profiles/_attack_focus/
+    _problem_comment_board 内部已按 _mask_on() 遮蔽昵称，故开启后导出的长图也是
+    遮蔽版（分享出去不泄露昵称）；关闭则与页面一致显示真实昵称。
+    单次渲染约 1 秒（两遍绘制），不落盘、不缓存：数据更新后立刻反映到下一次导出。"""
+    row = _load_video_row(bvid)
+    if row is None:
+        abort(404)
+    try:
+        video_info = json.loads(row["video_info_json"]) if row["video_info_json"] else {}
+    except Exception:
+        video_info = {}
+    profiles = _load_profiles(bvid)
+    if not profiles:
+        return jsonify({"error": "该视频暂无画像数据（或尚未解析出任何 UID），无法出图"}), 404
+    fp = load_false_positives(bvid)
+    fp_dm = {t for k, t in fp if k == "dm"}
+    fp_cmt = {t for k, t in fp if k == "cmt"}
+    # 注意：_apply_danmaku_fp 是**就地**扣除误报弹幕，返回的是"被扣除的误报内容列表"
+    # （供榜单底部撤销入口），不能拿返回值当 profiles——否则画像/榜单会整段消失
+    _apply_danmaku_fp(profiles, fp_dm)
+    profiles = sort_profiles_by_risk(profiles)
+    stats = generate_summary_stats(profiles)
+    chart = generate_chart_data(profiles)
+    # 问题弹幕类别分布与弹幕浏览器面板同源（cat_counts 只在 _danmaku_panel_stats 里算）
+    panel = _danmaku_panel_stats(bvid) or {}
+    chart["cat_counts"] = panel.get("categories", {})
+    # 问题弹幕榜单排序与 generate_cringe_board 同口径（最高严重度 → 命中条数）
+    cringe_entries = [p for p in profiles if (p.get("cringe") or {}).get("count", 0) >= 1]
+    cringe_entries.sort(key=lambda p: ((p.get("cringe") or {}).get("max_severity", 0),
+                                       (p.get("cringe") or {}).get("count", 0)), reverse=True)
+    attack = _attack_focus(bvid, fp_cmt)
+    problem_comments, _marked = _problem_comment_board(bvid, fp_cmt)
+    repeat_events, _dist = _repeat_events_data(bvid)
+    low_conf = _low_conf_tab_html(bvid)[1]
+    payload = build_payload(bvid, video_info, profiles, stats, chart, cringe_entries,
+                            attack, problem_comments, repeat_events, low_conf)
+    try:
+        img = render_long_image(payload)
+    except Exception as e:
+        # 出图失败不影响报告页：给前端一个可读错误，具体原因留在服务端日志
+        print(f"[Web] 分享长图渲染失败（{bvid}）: {e}")
+        return jsonify({"error": f"长图渲染失败: {e}"}), 500
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    data = buf.getvalue()
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "", bvid) or "video"
+    resp = Response(data, mimetype="image/png")
+    # inline：浏览器直接显示长图（右键/长按保存），不强制下载
+    resp.headers["Content-Disposition"] = f'inline; filename="longimage_{safe_name}.png"'
+    resp.headers["Cache-Control"] = "no-store"
+    print(f"[Web] 分享长图已生成（{bvid}）: {img.width}x{img.height}, {len(data) // 1024} KB")
     return resp
 
 
