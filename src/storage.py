@@ -131,6 +131,8 @@ def init_db():
         cursor.execute('''CREATE TABLE IF NOT EXISTS uid_verify_cache (
             uid INTEGER PRIMARY KEY, status TEXT NOT NULL, info_json TEXT NOT NULL,
             verified_at REAL NOT NULL)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS uid_space_cache (
+            uid INTEGER PRIMARY KEY, sample_json TEXT NOT NULL)''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS uid_candidate_cache (
             mid_hash TEXT NOT NULL, max_uid INTEGER NOT NULL, version TEXT NOT NULL,
             candidates_json TEXT NOT NULL, PRIMARY KEY(mid_hash, max_uid, version))''')
@@ -269,6 +271,11 @@ def init_db():
         cursor.execute('''CREATE TABLE IF NOT EXISTS video_profiles (
             bvid TEXT NOT NULL, uid INTEGER NOT NULL, profile_json TEXT NOT NULL,
             revision INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(bvid, uid))''')
+        # 目标分析独立存档；匹配条件和画像均不写入常规报告的 senders/video_profiles。
+        cursor.execute('''CREATE TABLE IF NOT EXISTS target_analyses (
+            id TEXT PRIMARY KEY, bvid TEXT NOT NULL, selector_json TEXT NOT NULL,
+            result_json TEXT NOT NULL, summary_json TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS target_analyses_video ON target_analyses(bvid, updated_at)")
         # 单视频旧画像可直接迁移；多视频旧画像无法确定归属，读取时用本视频证据重建。
         cursor.execute('''INSERT OR IGNORE INTO video_profiles(bvid, uid, profile_json)
             SELECT MIN(s.bvid), u.uid, u.profile_json FROM users u JOIN senders s ON s.uid=u.uid
@@ -277,7 +284,7 @@ def init_db():
         # 数据修订号也覆盖同条数更新，避免热度、UID、头像和深掘变更命中旧页面。
         cursor.execute('''CREATE TABLE IF NOT EXISTS data_revision (
             scope TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0)''')
-        for table in ("videos", "senders", "users", "video_profiles", "comments", "danmaku", "false_positive", "face_cache"):
+        for table in ("videos", "senders", "users", "video_profiles", "target_analyses", "comments", "danmaku", "false_positive", "face_cache"):
             for operation in ("INSERT", "UPDATE", "DELETE"):
                 ref = "OLD" if operation == "DELETE" else "NEW"
                 scope = f"{ref}.bvid" if table not in ("users", "face_cache") else "'*'"
@@ -292,6 +299,86 @@ def init_db():
         cursor.execute("DROP TABLE IF EXISTS progress")
         conn.commit()
     print("[Storage] 数据库初始化完成")
+
+
+def save_target_analysis(target_id: str, bvid: str, selector: dict, result: dict) -> None:
+    """原子保存目标分析快照；列表只读摘要，不加载全部命中弹幕。"""
+    summary = {"title": result.get("video_info", {}).get("title", bvid),
+               "status": result.get("status", "running"), **result.get("stats", {})}
+    with closing(get_db()) as conn:
+        conn.execute('''INSERT INTO target_analyses VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET selector_json=excluded.selector_json,
+            result_json=excluded.result_json, summary_json=excluded.summary_json,
+            updated_at=excluded.updated_at''',
+            (target_id, bvid, json.dumps(selector, ensure_ascii=False),
+             json.dumps(result, ensure_ascii=False, default=str), json.dumps(summary, ensure_ascii=False),
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+
+
+def load_target_analysis(target_id: str) -> dict | None:
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT * FROM target_analyses WHERE id=?", (target_id,)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "bvid": row["bvid"], "selector": json.loads(row["selector_json"]),
+            "result": json.loads(row["result_json"]), "updated_at": row["updated_at"]}
+
+
+def load_uid_space_cache(uids: list[int]) -> dict[int, dict]:
+    """独立的公开空间样本缓存，不作为 UID 明文证据或完整画像。"""
+    result = {}
+    values = sorted(candidates_of(uids))
+    with closing(get_db()) as conn:
+        for start in range(0, len(values), 500):
+            chunk = values[start:start + 500]
+            rows = conn.execute(f"SELECT uid, sample_json FROM uid_space_cache WHERE uid IN ({','.join('?' for _ in chunk)})",
+                                chunk).fetchall()
+            for row in rows:
+                try:
+                    sample = json.loads(row["sample_json"])
+                    if isinstance(sample, dict) and sample.get("uid") == row["uid"]:
+                        result[row["uid"]] = sample
+                except (ValueError, TypeError):
+                    continue
+    return result
+
+
+def save_uid_space_cache(uid: int, sample: dict):
+    """只保存辅助核验样本；不改 users、senders 或可靠 UID 映射。"""
+    if sample.get("uid") != uid:
+        raise ValueError("空间样本 UID 不符")
+    with closing(get_db()) as conn:
+        conn.execute("INSERT OR REPLACE INTO uid_space_cache VALUES (?, ?)",
+                     (uid, json.dumps(sample, ensure_ascii=False)))
+        conn.commit()
+
+
+def list_target_analyses(bvid: str | None = None, limit: int = 50) -> list[dict]:
+    with closing(get_db()) as conn:
+        rows = conn.execute('''SELECT id, bvid, selector_json, summary_json, updated_at
+            FROM target_analyses WHERE (? IS NULL OR bvid=?) ORDER BY updated_at DESC, id LIMIT ?''',
+            (bvid, bvid, max(1, limit))).fetchall()
+    return [{"id": r["id"], "bvid": r["bvid"], "selector": json.loads(r["selector_json"]),
+             "summary": json.loads(r["summary_json"]), "updated_at": r["updated_at"]} for r in rows]
+
+
+# videos 中也保存目标分析共用的元信息与弹幕缓存，不能据此声称已有常规报告。
+# 兼容既有目标快照：常规发送者/画像/评论记录或完成标记才代表另有常规分析。
+NORMAL_REPORT_PREDICATE = """(
+    NOT EXISTS (SELECT 1 FROM target_analyses t WHERE t.bvid=v.bvid)
+    OR EXISTS (SELECT 1 FROM senders s WHERE s.bvid=v.bvid)
+    OR EXISTS (SELECT 1 FROM video_profiles p WHERE p.bvid=v.bvid)
+    OR EXISTS (SELECT 1 FROM comments c WHERE c.bvid=v.bvid)
+    OR EXISTS (SELECT 1 FROM phase_state ps WHERE ps.bvid=v.bvid
+               AND ps.phase='report' AND ps.key='ready' AND ps.value='1')
+)"""
+
+
+def has_normal_report(bvid: str) -> bool:
+    with closing(get_db()) as conn:
+        return conn.execute(f"SELECT 1 FROM videos v WHERE v.bvid=? AND {NORMAL_REPORT_PREDICATE}",
+                            (bvid,)).fetchone() is not None
 
 
 def get_phase_state(bvid: str, phase: str, key: str) -> str | None:
@@ -626,14 +713,25 @@ def load_danmaku(bvid: str) -> list[dict]:
              "pool": r["pool"], "dmid": r["dmid"], "page": r["page"]} for r in rows]
 
 
-def load_comments(bvid: str) -> list[dict]:
+def load_comments(bvid: str, uids: list[int] | None = None) -> list[dict]:
     """从库读回某视频的全部评论（断点续采用：跳过阶段3网络重采）。
     返回与采集侧同形的 dict 列表（problem 列带出 LLM 标注；location 旧行可能为空）。"""
     with closing(get_db()) as conn:
-        rows = conn.execute(
+        query = (
             "SELECT uid, uname, rpid, content, ctime, like, is_sub, reply_count, "
             "root_rpid, parent_rpid, problem, problem_severity, location "
-            "FROM comments WHERE bvid = ?", (bvid,)).fetchall()
+            "FROM comments WHERE bvid = ?")
+        if uids is None:
+            rows = conn.execute(query, (bvid,)).fetchall()
+        else:
+            # 目标模式只加载已关联发送者的正文；按 SQLite 实际变量上限分块。
+            wanted = sorted(set(uids))
+            chunk_size = max(1, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) - 1)
+            rows = []
+            for offset in range(0, len(wanted), chunk_size):
+                chunk = wanted[offset:offset + chunk_size]
+                rows.extend(conn.execute(query + f" AND uid IN ({','.join('?' for _ in chunk)})",
+                                         (bvid, *chunk)).fetchall())
     return [{"uid": r["uid"], "uname": r["uname"], "rpid": r["rpid"],
              "content": r["content"], "ctime": r["ctime"], "like": r["like"],
              "is_sub": bool(r["is_sub"]), "reply_count": r["reply_count"],
@@ -798,9 +896,22 @@ def delete_video_data(bvid: str) -> dict:
         uids = {r["uid"] for r in rows if r["uid"] is not None}
         mid_hashes = {r["mid_hash"] for r in rows}
 
+        # 目标分析的低置信度候选不在普通 senders 中，删除时也清除其空间样本。
+        space_uids = set(uids)
+        for row in cursor.execute("SELECT result_json FROM target_analyses WHERE bvid=?", (bvid,)).fetchall():
+            try:
+                snapshot = json.loads(row["result_json"])
+                for sender in snapshot.get("senders", []):
+                    space_uids |= candidates_of(sender.get("uid"))
+                    space_uids |= candidates_of(sender.get("candidates", []))
+                    space_uids |= candidates_of(sender.get("resolution", {}).get("candidates", []))
+            except (ValueError, TypeError, AttributeError):
+                continue
+
         counts = {}
         counts["senders"] = cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,)).rowcount
         counts["video_profiles"] = cursor.execute("DELETE FROM video_profiles WHERE bvid = ?", (bvid,)).rowcount
+        counts["target_analyses"] = cursor.execute("DELETE FROM target_analyses WHERE bvid = ?", (bvid,)).rowcount
         counts["danmaku"] = cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,)).rowcount
         counts["comments"] = cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,)).rowcount
         counts["false_positive"] = cursor.execute(
@@ -830,6 +941,9 @@ def delete_video_data(bvid: str) -> dict:
         counts["users"] = 0
         for uid in uids:
             counts["users"] += cursor.execute("DELETE FROM users WHERE uid = ?", (uid,)).rowcount
+        counts["uid_space_cache"] = 0
+        for uid in space_uids:
+            counts["uid_space_cache"] += cursor.execute("DELETE FROM uid_space_cache WHERE uid=?", (uid,)).rowcount
         conn.commit()
     return counts
 

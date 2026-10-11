@@ -41,7 +41,7 @@ if sys.version_info < (3, 12):
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from flask import Flask, Response, abort, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, request, send_from_directory, redirect
 
 from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTORY_MAX_DAYS,
                      MAX_FOOTPRINT_VIDEOS, MAX_FOOTPRINT_DANMAKU_SAMPLES,
@@ -63,6 +63,11 @@ from storage import (load_senders, load_global_uid_map,
                      delete_video_data, toggle_false_positive, load_false_positives,
                      load_faces, load_face_cached_uids, save_face,
                      load_llm_cache, save_llm_cache)
+from storage import (load_target_analysis, list_target_analyses, load_uid_space_cache,
+                     has_normal_report, NORMAL_REPORT_PREDICATE)
+from target_report import render_target_report, render_target_list_page, page_number, render_space_assessment
+from candidate_space import (candidate_uids, cached_assessments, sample_is_fresh,
+                             fetch_space_sample, assess_space, sender_contents)
 from main import run_analysis
 from uid_resolver import (resolve_sender, METHOD_CRC32_CRACK, build_evidence_maps,
                           resolution_is_current, resolution_record, VerificationBudget)
@@ -2111,14 +2116,15 @@ def index():
     数据库锁定（分析任务写入期）由 _db_guard 降级为 503 友好页。"""
     with closing(get_db()) as conn:
         # 刷屏高/中统计以库内原始值为准：kind=spam 的发送者级人工误报只在报告页展示层降级
-        rows = conn.execute('''
+        # 只有目标采样的元信息不生成普通视频报告入口，独立目标入口仍保留。
+        rows = conn.execute(f'''
             SELECT v.bvid, v.title, v.created_at, v.duration, v.view_count,
                    (SELECT COUNT(*) FROM danmaku d WHERE d.bvid = v.bvid) AS dm_count,
                    (SELECT COUNT(DISTINCT s.uid) FROM senders s
                     WHERE s.bvid = v.bvid AND s.uid IS NOT NULL) AS profile_count,
                    (SELECT COUNT(*) FROM senders s WHERE s.bvid = v.bvid AND s.spam_level = '高') AS spam_high,
                    (SELECT COUNT(*) FROM senders s WHERE s.bvid = v.bvid AND s.spam_level = '中') AS spam_mid
-            FROM videos v ORDER BY v.created_at DESC
+            FROM videos v WHERE {NORMAL_REPORT_PREDICATE} ORDER BY v.created_at DESC
         ''').fetchall()
     items = "".join(f'''<tr data-title="{esc(((r["title"] or "") + " " + r["bvid"]).lower())}"
         data-time="{esc(r["created_at"])}" data-dm="{r["dm_count"]}" data-profiles="{r["profile_count"]}">
@@ -2213,7 +2219,8 @@ def index():
 <div class="container">
     <div class="header"><h1>🎬 B站弹幕用户画像分析</h1><div class="meta">已分析视频列表</div></div>
     <div class="idx-controls">
-        <input id="idxSearch" class="search-input" placeholder="搜索标题 / BV号...">
+        <input id="idxSearch" class="search-input" placeholder="搜索标题 / BV号..." aria-label="搜索视频标题或BV号">
+        <a class="pager-btn target-entry" href="/targets">目标弹幕分析</a>
     </div>
     <table class="video-table">
         <thead><tr><th>标题</th><th>BV号</th><th>时长</th><th>播放量</th>
@@ -2232,6 +2239,13 @@ def index():
 <script src="/static/index.js"></script>
 </body>
 </html>'''
+
+
+@app.route("/targets")
+@_db_guard
+def target_list_page():
+    """独立目标报告列表，从首页搜索框右侧进入。"""
+    return render_target_list_page(list_target_analyses(limit=getattr(_config, "TARGET_REPORT_LIST_LIMIT", 50)))
 
 
 def _low_conf_tab_html(bvid: str) -> tuple[str, int]:
@@ -2298,6 +2312,8 @@ def video_page(bvid: str):
     _attach_other_videos 逐用户查询；job（手动分析/重新生成）完成或删除时主动失效，
     且每次请求比对数据指纹，外部进程（run.py）落库导致的变化也能检出。
     数据库锁定（分析任务写入期）由 _db_guard 降级为 503 友好页。"""
+    if not has_normal_report(bvid) and list_target_analyses(bvid, limit=1):
+        return redirect("/targets")
     page_fp = _page_fingerprint(bvid)
     mask = _mask_on()   # 隐藏信息开关：开/关两版页面分开缓存，防串味
     with _PAGE_CACHE_LOCK:
@@ -2843,9 +2859,10 @@ def api_delete_video(bvid: str):
     removed_files = 0
     for ext in ("csv", "json"):
         # bvid 来自路由参数：glob.escape 防通配符注入匹配到他视频文件
-        for f in glob.glob(os.path.join(REPORT_DIR, f"report_{glob.escape(bvid)}_*.{ext}")):
-            os.remove(f)
-            removed_files += 1
+        for prefix in ("report", "target"):
+            for f in glob.glob(os.path.join(REPORT_DIR, f"{prefix}_{glob.escape(bvid)}_*.{ext}")):
+                os.remove(f)
+                removed_files += 1
     return jsonify({"ok": True, "removed_files": removed_files, **counts})
 
 
@@ -3304,10 +3321,100 @@ def api_danmaku(bvid: str):
                     "multi_page": len(_load_page_meta(bvid)) > 1})
 
 
+@app.route("/target/<target_id>")
+@_db_guard
+def target_page(target_id: str):
+    """读取已保存的目标分析；渲染时不重新匹配或发起采集。"""
+    record = load_target_analysis(target_id)
+    if record is None:
+        abort(404)
+    return render_target_report(record, request.args, _mask_on(), _mask_name, _mask_uid,
+                                load_false_positives(record["bvid"]), cached_assessments(record),
+                                has_normal_report(record["bvid"]))
+
+
+_CANDIDATE_SPACE_LOCK = threading.Lock()
+
+
+@app.route("/api/target/<target_id>/candidate-space", methods=["POST"])
+@_db_guard
+def api_target_candidate_space(target_id: str):
+    """仅核验报告中低置信度碰撞候选；按需限速采样，不改身份或画像。"""
+    record = load_target_analysis(target_id)
+    if record is None:
+        return jsonify({"error": "未知目标分析"}), 404
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "请提供候选 UID 与 mid_hash"}), 400
+    raw_uid = body.get("uid")
+    if isinstance(raw_uid, bool) or not isinstance(raw_uid, (int, str)) or not re.fullmatch(r"[1-9][0-9]{0,18}", str(raw_uid)):
+        return jsonify({"error": "候选 UID 格式错误"}), 400
+    uid = int(raw_uid)
+    sender = next((s for s in record["result"].get("senders", []) if s["mid_hash"] == body.get("mid_hash")), None)
+    if sender is None or uid not in candidate_uids(sender) or sender.get("confidence") in ("高", "中"):
+        return jsonify({"error": "该 UID 不是本条记录可核验的低置信度候选"}), 400
+    sample = load_uid_space_cache([uid]).get(uid)
+    if not sample or not sample_is_fresh(sample):
+        if not _CANDIDATE_SPACE_LOCK.acquire(blocking=False):
+            return jsonify({"error": "已有空间核验在运行，请稍后重试"}), 409
+        job_id = None
+        try:
+            job_id, error = _try_register_job("candidate-space", record["bvid"], total=1)
+            if job_id is None:
+                return jsonify({"error": error}), 409
+            # 只用主号客户端；不为单个候选启动代理核心或小号池。
+            sample = fetch_space_sample(uid, _get_client())
+        except CookieInvalidError as exc:
+            return jsonify({"error": str(exc)}), 503
+        finally:
+            if job_id:
+                with JOBS_LOCK:
+                    JOBS[job_id]["finished"] = True
+            _CANDIDATE_SPACE_LOCK.release()
+    assessment = assess_space(sample, record["bvid"], record["result"].get("video_info", {}),
+                              sender_contents(record, sender))
+    return jsonify({"html": render_space_assessment(assessment, _mask_on(), _mask_name, _mask_uid)})
+
+
+@app.route("/api/target/<target_id>/danmaku")
+@_db_guard
+def api_target_danmaku(target_id: str):
+    record = load_target_analysis(target_id)
+    if record is None:
+        return jsonify({"error": "未知目标分析"}), 404
+    result = record["result"]
+    mid_hash = request.args.get("mid_hash", "")
+    matches = result.get("matches", [])
+    if mid_hash:
+        matches = [dm for dm in matches if dm["mid_hash"] == mid_hash]
+    matches = sorted(matches, key=lambda dm: (int(dm.get("page", 1) or 1), float(dm.get("time", 0) or 0)))
+    size = max(1, getattr(_config, "TARGET_MATCH_PAGE_SIZE", 100))
+    page, pages = page_number(request.args.get("page"), len(matches), size)
+    senders = {s["mid_hash"]: s for s in result.get("senders", [])}
+    multi_page = len(result.get("video_info", {}).get("pages", [])) > 1
+    rows = []
+    for dm in matches[(page - 1) * size:page * size]:
+        sender = senders.get(dm["mid_hash"], {})
+        uid = sender.get("uid")
+        name = sender.get("name") or ""
+        if _mask_on():
+            uid, name = _mask_uid(uid), _mask_name(name)
+        p, sec = max(1, int(dm.get("page", 1) or 1)), max(0, int(float(dm.get("time", 0) or 0)))
+        label = f"{sec // 60:02d}:{sec % 60:02d}"
+        if multi_page or p != 1:
+            label = f"P{p} {label}"
+        rows.append({"content": dm["content"], "mid_hash": dm["mid_hash"], "page": p, "time": dm.get("time", 0),
+                     "time_label": label, "confidence": sender.get("confidence", "无"), "method": sender.get("method", ""),
+                     "sender_label": f"{name} UID:{uid}" if uid else f"未解析 · {dm['mid_hash']}",
+                     "video_url": f"https://www.bilibili.com/video/{record['bvid']}?p={p}&t={sec}"})
+    return jsonify({"rows": rows, "page": page, "pages": pages, "page_size": size, "total": len(matches)})
+
+
 @app.route("/download/<path:filename>")
 def download(filename: str):
-    """CSV/JSON 导出文件下载（仅允许 report_ 前缀文件，防目录外文件被下载）"""
-    if not filename.startswith("report_") or "/" in filename or ".." in filename:
+    """仅下载报告导出文件，禁止路径穿越。"""
+    allowed = filename.startswith("report_") or (filename.startswith("target_") and filename.endswith((".csv", ".json")))
+    if not allowed or "/" in filename or "\\" in filename or ".." in filename:
         abort(404)
     return send_from_directory(REPORT_DIR, filename, as_attachment=True)
 
@@ -3315,6 +3422,9 @@ def download(filename: str):
 @app.errorhandler(404)
 def not_found(e):
     """未知 bvid / 未知路径 → 中文 404 页面（带站点样式与返回首页按钮，spec 6）"""
+    message = ('目标报告不存在或链接已失效，请从<a href="/targets">「目标弹幕分析」列表</a>打开。'
+               if request.path.startswith("/target/") else
+               '视频不存在或尚未分析，请先运行 <code>python run.py &lt;BV号&gt;</code>')
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -3329,7 +3439,7 @@ def not_found(e):
 <div class="container">
     <div class="header"><h1>404</h1><div class="meta">页面或视频不存在</div></div>
     <div class="nf-card">
-        <p>视频不存在或尚未分析，请先运行 <code>python run.py &lt;BV号&gt;</code></p>
+        <p>{message}</p>
         <p><a class="filter-btn" href="/">返回首页</a></p>
     </div>
 </div>

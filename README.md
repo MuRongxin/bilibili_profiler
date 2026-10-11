@@ -92,6 +92,33 @@ python run.py BV1vu4y1b7Y9 --skip-deep
 python run.py --batch videos.txt
 ```
 
+指定第二个参数可分析命中弹幕的发送者：
+
+```bash
+python run.py BV1vu4y1b7Y9 "目标弹幕"
+python run.py BV1vu4y1b7Y9 "^目标.*|另一种说法"
+python run.py BV1vu4y1b7Y9 "带括号(或句号.)的弹幕" --literal
+python run.py BV1vu4y1b7Y9 "目标" --regex --max-users 50 --skip-deep
+python run.py BV1vu4y1b7Y9 "目标弹幕" --target-history  # 额外补采历史弹幕
+python run.py BV1vu4y1b7Y9 "目标弹幕" --target-pool     # 命中后启用多账号和代理池
+```
+
+第二个参数含 `\ . ^ $ * + ? { } [ ] ( ) |` 时自动识别为正则，使用搜索匹配；其余文本按完整弹幕匹配，保留空白、区分大小写。`--literal` 强制原文完整匹配，`--regex` 强制正则搜索。表达式须加引号；无效正则在登录前报错，复杂正则匹配超过 `TARGET_REGEX_TIMEOUT`（默认 30 秒）会终止匹配进程，可简化表达式后重跑。
+
+目标模式默认只登录主号，按分P更新当前弹幕池并复用已有弹幕缓存，不先启动 mihomo、验证全部小号或补采历史。需要扩大历史搜索范围时加 `--target-history`；需要多账号/代理池时加 `--target-pool`，只在命中后建池。
+
+目标模式按命中条数、发送者在该视频的已采弹幕数选人，默认最多 `TARGET_MAX_USERS=1000` 个发送者，`--max-users` 可覆盖。先用本地明文证据和 CRC32 候选解析命中者，缺少证据时按需补元信息；评论搜索**默认无页数上限，找到全部待搜索目标即停**。先翻主评论及接口自带回复预览，仍有目标未找到时才搜索隐藏的楼中楼；不会调用常规全量评论采集、问题评论 LLM 判定或整批保存无关作者正文。只保留目标作者的评论原文、时间、点赞与回复属性，原文和独立游标逐页保存，中断后可续采；身份已确认但没有评论正文时也会搜索。可见评论翻完、风控或接口异常时停止并保留当前结果；发送弹幕者可能没有评论，不能保证每人都能找到。已有目标评论可直接复用。
+
+低置信度及未解析者保留原文，不自动采集画像；碰撞候选评论标注身份待核验。画像参考该发送者在本视频的已采弹幕、已找到评论及其个人行为资料；此模式跳过全视频的问题弹幕/评论 LLM 判定，可用 `--skip-deep` 跳过 AI 深掘、`--skip-collect` 仅复用已采用户资料。目标筛选暂不支持 `--batch`。
+
+没有评论等明文验证时，可在「筛选概览 → 解析证据 → 空间辅助核验」点击「核验候选空间」。按需检查公开名片、投稿/动态/关注的首页样本（各最多 20 条，最多四个空间接口调用，重试和限速仍由客户端控制），展示同视频分享、关注该 UP 主、出现相同长发言等线索及原文链接，也提供公开内容样本供比较主题和措辞。通用短句、投稿标题、转发的他人原文不会作为候选本人的措辞证据。此结果只说明关联，不改变 CRC32 的低置信度，不确认身份、不提供虚构百分比；资料不可见或未发现关联均不能排除候选。样本独立缓存（完整 6 小时，不完整 60 秒），不污染完整画像或可靠 UID 映射；默认分析、打开报告都不会自动采集候选空间。
+
+报告独立存档，地址为 `http://127.0.0.1:8000/target/<分析编号>`，分析完成自动打开，也可从首页的「目标弹幕分析」进入。报告包含「筛选概览 / 用户画像 / 命中弹幕 / 目标评论」四页；命中原文支持分页、按发送者查看和带分P的时间跳转，「目标评论」展示搜索途中找到的评论原文，不代表该作者的全部评论。CSV 包括未解析与人数上限外的发送者及已确认作者的评论原文，JSON 保留完整命中、评论、筛选和解析证据，文件前缀为 `target_{BV号}_{分析编号}_`。相同条件重跑更新同一份报告，不同条件各自保留，常规视频画像不被目标画像覆盖。目标模式的 `--force` 重新核验入选发送者、重采其资料，保留共享弹幕/评论采集检查点与已找到的评论；常规模式的 `--force` 也保留独立目标快照，明确删除视频时才一并删除。
+
+匹配范围是当前弹幕池与已有缓存；仅加 `--target-history` 才进行历史网络补采。范围受接口可见性、历史窗口和规模上限影响；报告显示搜索状态与各分P采集覆盖范围，零命中也会保存报告。
+
+目标报告集中在独立列表页 `http://127.0.0.1:8000/targets`，入口在首页搜索框右侧的「目标弹幕分析」按钮，报告中可点「返回目标列表」。仅做目标分析的视频不进入首页普通视频列表，也不提供空的「视频报告」链接。曾做过常规分析的视频保留两个报告入口；旧目标快照自动适用这一规则，无须重跑采集。
+
 首次运行会提示扫码登录，请使用B站APP扫描终端显示的二维码。
 
 `python quick_test.py <BV号> --top N` 会把本轮采样画像导出到 `data/quick_reports/`（HTML、JSON、CSV），自动打开独立采样 HTML；采样弹幕、评论和画像不写入全量采集表或检查点。`WEB_AUTOSTART=False` 可关闭自动打开。
@@ -99,6 +126,8 @@ python run.py --batch videos.txt
 用户基础资料按 UID 共享，视频画像按 `(bvid, uid)` 隔离。启动时自动升级旧库；旧的单视频画像直接迁移，多视频共享画像从各视频弹幕、评论和判定缓存重建。归属不明的旧 AI 文本不再展示，可用 `--skip-collect` 重跑生成。问题评论判定只更新成功批次，失败及截断部分保留旧标注。
 
 升级后请重启已有 Web 服务，使其使用新表和新缓存规则；新的 PID 文件包含脚本路径与启动标识，旧纯数字 PID 文件无法安全核验，需手动关闭旧服务。
+
+目标模式自动打开前会检查目标报告接口；旧服务只有视频接口时会明确提示重启，不再直接打开 404 页面。已保存的目标报告无需重新分析，依次运行 `python web.py --stop --port 8000` 和 `python web.py --port 8000` 后访问原链接即可；其他端口替换为实际端口。
 
 可选小号池（多号并行提速 + 风控时轮换兜底）：
 ``` bash
@@ -118,6 +147,8 @@ python login.py alt3
 - 外部核心已有独立 `listeners` 时，可用 `CLASH_ACCOUNT_ROUTES` JSON 指定每个账号的 `proxy_url` 和 `group`（必须各自独立，并覆盖所有账号）。例如：`{"主号":{"proxy_url":"http://127.0.0.1:17890","group":"profiler-main"},"alt1":{"proxy_url":"http://127.0.0.1:17891","group":"profiler-alt1"}}`。账号名须与登录文件对应；外部配置由用户维护，程序不重写其配置。
 - 默认通过 `https://api.ipify.org` 探测实际出口，首次尽量去重、每 1800 秒复查；`PROXY_IP_CHECK_URL` 可替换为自己的纯文本 IP 接口，置空禁用。探测走统一客户端限速，失败不判死节点；未知出口保守共享限速。通用 IP 探测不能证明目标站按同一路径出站，外部独立入口应显式绑定所属选择组。
 - 启动日志显示账号数、代理绑定数与实测不同 IP 数；`pool.proxy_status()` 提供请求成功/风控/代理故障/业务异常计数和最近 200 次调用耗时 P95，不含订阅或控制器凭证。主池与分片共享降级、重探状态，故障只影响对应入口。统计与调度在本进程内生效。
+- 内置核心按实际时间等待控制器和订阅就绪，默认 `PROXY_CORE_STARTUP_TIMEOUT=60` 秒（不含核心下载和退出清理），每 `PROXY_CORE_STARTUP_LOG_INTERVAL=10` 秒显示等待状态。失败时只输出 DNS、TLS、HTTP 拒绝、订阅格式或监听端口等错误类别，核心原文不打印、不落日志文件。
+- 订阅请求默认使用 `SUB_USER_AGENT=clash.meta` 标识，可通过环境变量覆盖；HTTP 400 或格式错误时核对机场面板导出的 Clash/mihomo 订阅链接和客户端要求。
 
 批量模式（`python run.py --batch videos.txt`）逐个视频分析，**不会自动启动 web 服务**（避免逐视频弹浏览器）；跑完自行 `python web.py` 即可在首页看到全部视频。中途 Ctrl+C 只会跳过后续视频，已完成的仍保存在库里。
 
@@ -280,7 +311,11 @@ Cookie 里带 `_refresh_token` 时会自动续期；若没有它（或刷新失�
 换端口：`python web.py --port 9000`（Windows 的 cmd/PowerShell 不支持 `PROFILER_PORT=9000 python web.py` 这种 bash 写法，请用 `--port`；环境变量仍可用，写法见「快速开始」）；停掉占用端口的旧实例：`python web.py --stop --port 9000`（不带 `--port` 则针对 8000；它按 pidfile 校验确实是本项目的 web.py 才动手，不会误杀别的进程）。
 
 **启动时卡在「小号池」那一行不动（几分钟没输出）？**
-先看终端里有没有代理环境变量（`env | grep -i proxy`）。代理客户端常会写入 `http_proxy/https_proxy/all_proxy`，而 Python 的 `no_proxy` **只做后缀匹配**——写 `127.*` 并不生效，本机回环调用会被送进代理并收到 502。本工具已对本机调用强制绕过环境代理（`clash_ctl` 的控制器请求、自动打开报告页的探测），若你用的是旧版本，可临时用 `env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY python run.py <BV号>` 跳过；也可设 `WEB_AUTOSTART=False`、`CLASH_ENABLED=0` 减少无关环节。
+账号校验后会初始化代理出口。若出现 `[ProxyCore] 核心就绪超时`，先看每 10 秒的等待状态：本机控制器未连通时检查核心启动/监听；控制器可达但没有节点时检查订阅拉取和格式；末尾的脱敏诊断可进一步区分 DNS、TLS 或订阅服务器拒绝访问。内置核心启动默认按实际时间等待 60 秒，超时后尝试外部入口或直连；`0 个代理绑定` 表示本轮没有使用项目配置的 HTTP 代理。
+
+普通环境代理已经在 B站客户端和本机控制器会话中禁用，但系统 **TUN/增强模式**通过路由接管流量，仍可能影响订阅、DNS 和节点连接；可暂时关闭 TUN 后重跑同一命令做对照。内置核心的 `DIRECT` 订阅拉取也无法绕过系统 TUN。若订阅只有通过现有代理才能访问，可显式使用已加载该订阅的外部核心（`CLASH_ENABLED=1`，填写控制器和 HTTP 入口），共享入口不轮换系统选择组。`CLASH_ENABLED=0` 只关闭显式外部配置；只要 `SUB_URLS` 非空，仍会尝试内置核心。核心输出可能含凭证，不要直接复制未经脱敏的原始日志或订阅链接。
+
+已遇到系统 TUN 开启时订阅返回 HTTP 400、关闭后内置核心正常就绪的情况。使用内置多账号 IP 池时，建议保持 TUN 关闭；普通系统 HTTP 代理通常可以保留。如需长期同时使用 TUN，应在系统代理侧配置针对内置核心的绕过规则，再核验每个账号的实际出口；程序不自动修改系统路由。
 
 **为什么这么慢 / 一直在冷却？**
 B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风险接口 2–4 秒），热门视频必然是小时级。可以：① `--max-users 50` 限制分析人数；② 配小号池（`python login.py alt1`）与 IP 池（`SUB_URLS`）提升吞吐；③ 中途 Ctrl+C，重跑会从检查点续采、不重复已采数据。
@@ -348,7 +383,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（270 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查。代理改动可额外运行 `python tests/offline/regress_proxy_pool.py --mihomo`，用已有核心和本机临时 HTTPS 服务验证真实路由，不访问外网。
+- 现有离线检查手段：**`python tests/run_all.py`**（400 项离线回归，无需外网与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查。代理改动可额外运行 `python tests/offline/regress_proxy_pool.py --mihomo`，用已有核心和本机临时 HTTPS 服务验证真实路由，不访问外网。
 
 ## 免责声明
 
@@ -405,7 +440,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：270 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：400 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -424,7 +459,8 @@ python run.py <BV号>                     # 完整流水线
 | 脚本 | 项数 | 覆盖 |
 |---|---|---|
 | `tests/offline/regress_uid_evidence.py` | 44 | 多候选与来源迁移、旧破解隔离、三态验证与预算、候选/名片/解析缓存、收割边界与原子检查点、定向补采、手动复核及遮蔽 |
-| `tests/offline/regress_proxy_pool.py` | 36 | 账号端口/选择组隔离、真实 IP 去重、共享出口限速/冷却、原子选节点、死名单、故障归因、连接池清理、共享降级/恢复、热加载暂停、请求重试预算；`--mihomo` 可额外验证 5 项真实核心本机路由/HTTPS 隧道/热加载/凭证清理 |
+| `tests/offline/regress_proxy_pool.py` | 37 | 账号端口/选择组隔离、真实 IP 去重、共享出口限速/冷却、原子选节点、死名单、故障归因、连接池清理、共享降级/恢复、热加载暂停、请求重试预算；`--mihomo` 可额外验证 5 项真实核心本机路由/HTTPS 隧道/热加载/凭证清理 |
+| `tests/offline/regress_proxy_startup.py` | 15 | 启动实际超时预算、控制器/订阅状态、延迟恢复、认证拒绝与提前退出、错误类别脱敏、核心输出持续排空、订阅客户端标识和配置转义 |
 | `tests/offline/regress_core.py` | 13 | 历史弹幕断点续采（中断后必须补齐、失败日挂账、不误写 done）、线程池收尾、`post()` 重试请求体、限速预算熔断、画像渲染容错等 |
 | `tests/offline/regress_comment_path.py` | 10 | wbi/legacy 翻页与降级、请求异常保留已采、真重复页检测、缺 rpid 脏行、刷新计数 |
 | `tests/offline/regress_judge_danmaku.py` | 4 | 问题弹幕判定必须被采纳并归到正确发送者（防"解析了却没采纳"） |
@@ -438,8 +474,12 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_port_config.py` | 5 | 端口解析优先级（`--port` > `PROFILER_PORT` > 8000）、非法/越界回退、两个入口的 `--help` 都暴露 `--port`（Windows 换端口可用性
 | `tests/offline/regress_env_proxy.py` | 6 | 环境代理（http_proxy/https_proxy/all_proxy）不得劫持**本机**调用：本机假控制器 + 代理指向死端口，验证 `clash_ctl` 与自动打开报告页的探测仍能打通（Python 的 `no_proxy` 不认 `127.*`） |
 | `tests/offline/regress_cli_switches.py` | 5 | `--skip-deep`：与 `LLM_DEEP_ENABLED` 取与的真值表、参数确实透传到 `run_analysis`/`run_batch`、`--help` 可见（防"加了参数没接线"） |
+| `tests/offline/regress_target_analysis.py` | 36 | 自动正则/原文匹配、超时保护、直接选人、独立存档/画像隔离、UID 续采与降级、多分P跳转、遮蔽、分页、CSV/JSON、CLI 接线、刷屏全池分布、误报纠偏、目标评论原文 |
+| `tests/offline/regress_target_lookup.py` | 26 | 当前弹幕池与缓存、多分P失败降级、找到即停、无默认页数上限、隐藏回复、目标正文持久化、独立续页、风控边界、按需启动账号和代理池 |
+| `tests/offline/regress_candidate_space.py` | 38 | 候选空间限速采样、空/不可见/风控区分、弱关联与措辞边界、独立缓存、原解析不变、接口校验及遮蔽、首页目标与普通报告入口隔离 |
 | `tests/offline/regress_llm_proxy.py` | 6 | LLM 客户端不继承环境代理：裸 SDK 在 `all_proxy=socks://` 下必失败（前提校验），`llm_client.make_client` 必须照常调通（判定批次 thinking 参数路径一并验证） |
 | `tests/offline/regress_web_stop.py` | 8 | `--stop` 兜底（pidfile 缺失/失效时按监听端口反查 ss/lsof/netstat）与 pidfile 归属守卫（老实例退出不再误删新实例记录）、身份校验不误杀无关进程 |
+| `tests/offline/regress_web_autostart.py` | 14 | 目标报告接口就绪、旧版服务与缺失存档识别、阻止自动打开 404、端口占用/超时/启动异常降级、父进程日志句柄关闭 |
 | `tests/offline/regress_long_image.py` | 13 | 分享长图：payload 装配与截断、渲染尺寸/像素护栏、路由确实接线、跟随「隐藏信息」开关遮蔽（该用例曾抓出 `_apply_danmaku_fp` 返回值误用导致画像整段消失）） |
 
 `tests/run_all.py` 会自动挑选带依赖的解释器（当前解释器 → 仓库 `.venv`），从任意目录运行均可，失败时退出码非 0，可直接接 CI。

@@ -9,6 +9,7 @@ B站弹幕发送者用户画像分析系统 — 主控流程
 import sys
 import os
 import argparse
+import re
 import threading
 import time
 from datetime import datetime
@@ -663,7 +664,7 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
 
 def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict,
                   comment_location_map: dict | None = None, uid_comments: dict | None = None,
-                  video_info: dict | None = None):
+                  video_info: dict | None = None, persist: bool = True):
     """阶段6: 画像分析
 
     comment_location_map（uid→评论IP属地）与 uid_comments（uid→本视频评论）在此处
@@ -717,7 +718,8 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
             profiles.append(profile)
 
             # 保存到数据库
-            save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0), user_data, profile, bvid=(video_info or {}).get("bvid"))
+            if persist:
+                save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0), user_data, profile, bvid=(video_info or {}).get("bvid"))
         except Exception as e:
             print(f"  [Phase 6] 警告: UID:{uid} 画像分析失败，已跳过: {e}")
 
@@ -725,7 +727,7 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
     return profiles
 
 
-def phase_ai_analysis(video_info: dict, profiles: list[dict]):
+def phase_ai_analysis(video_info: dict, profiles: list[dict], persist: bool = True):
     """阶段7: LLM 重点深掘（兴趣分 top K 单人单调用，结果直接注入 profile；
     全员粗筛已砍——命中人数扩大后粗筛是 token 大头，普通用户由规则标签勾画轮廓）"""
     if not LLM_API_KEY:
@@ -748,7 +750,8 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]):
                 # 深掘结果必须落库：web 报告读的是所属视频的 video_profiles，
                 # 阶段6已在深掘前落库，这里注入后不回写的话报告页永远看不到
                 try:
-                    update_user_profile(uid, p, bvid=video_info.get("bvid"))
+                    if persist:
+                        update_user_profile(uid, p, bvid=video_info.get("bvid"))
                 except Exception as e:
                     print(f"[Phase 7] 警告: UID:{uid} 深掘结果落库失败（{e}），重跑可补")
         print(f"[Phase 7] 完成: {len(deep)} 人生成深度画像")
@@ -957,6 +960,8 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         why = "--skip-deep" if skip_deep else "config.py 中 LLM_DEEP_ENABLED=False"
         print(f"\n[Phase 7] 跳过 LLM 深掘（{why}）；其余报告内容不受影响")
 
+    # 空视频或零画像也可能已完成常规分析；与目标模式共享的元信息明确区分。
+    set_phase_state(bvid, "report", "ready", "1")
     # 静态单文件 HTML 报告已被交互式 Web 报告（web.py）完全替换，不再生成 .html
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     export_base = os.path.join(REPORT_DIR, f"report_{bvid}_{ts}")
@@ -1064,15 +1069,21 @@ def run_batch(batch_file: str, force: bool = False, max_users: int | None = None
 def main():
     parser = argparse.ArgumentParser(description="B站弹幕发送者用户画像分析")
     parser.add_argument("bvid", nargs="?", help="视频BV号，如 BV1vu4y1b7Y9")
+    parser.add_argument("target", nargs="?", help="目标弹幕；含正则元字符时自动使用正则搜索，否则完整匹配")
+    matching = parser.add_mutually_exclusive_group()
+    matching.add_argument("--literal", action="store_true", help="把第二个参数当作原文完整匹配（含标点时可用）")
+    matching.add_argument("--regex", action="store_true", help="强制把第二个参数当作正则搜索")
+    parser.add_argument("--target-history", action="store_true", help="目标模式额外补采历史弹幕；默认仅当前池和已有缓存")
+    parser.add_argument("--target-pool", action="store_true", help="目标模式在命中后启用多账号/IP池；默认仅用主号限速客户端")
     parser.add_argument("--force", action="store_true",
-                        help="清除该视频的缓存并强制重采全部用户（忽略断点续采）")
+                        help="常规模式清除该视频缓存重采；目标模式重新解析/采集入选者，保留共享采集检查点")
     parser.add_argument("--max-users", type=int, default=None,
-                        help="手动硬上限覆盖阈值制动态定员 (默认按兴趣阈值定员，兜底上限 MAX_ANALYZE_USERS_HARD_CAP)")
+                        help="覆盖分析人数上限；常规模式按兴趣阈值选人，目标模式按命中条数选人（默认最多1000）")
     parser.add_argument("--batch", metavar="FILE",
                         help="批量模式：从文件逐行读取BV号（忽略空行与 # 注释行）")
     parser.add_argument("--skip-collect", action="store_true",
                         help="跳过阶段5用户采集的网络请求：只用库内已采数据（未采用户本轮不出画像），"
-                             "适合不想再打接口时刷新报告；与 --force 同用会因缓存被清而无画像可用")
+                             "常规模式与 --force 同用会因缓存被清而无画像可用；目标模式保留已采资料")
     parser.add_argument("--skip-deep", action="store_true",
                         help="跳过阶段7 LLM 重点深掘（只少 ai_deep 文字画像，判定/画像/报告照常；"
                              "深掘有缓存，之后重跑只补没算过的人）")
@@ -1080,6 +1091,20 @@ def main():
                         help="Web 报告端口（默认 8000；等价于设置 PROFILER_PORT，"
                              "但 Windows 的 cmd/PowerShell 上参数写法才不会踩坑）")
     args = parser.parse_args()
+
+    if args.target is not None and args.batch:
+        parser.error("目标弹幕分析暂不支持 --batch")
+    if (args.literal or args.regex) and args.target is None:
+        parser.error("--literal / --regex 需要提供目标弹幕")
+    if (args.target_history or args.target_pool) and args.target is None:
+        parser.error("--target-history / --target-pool 需要提供目标弹幕")
+    selector = None
+    if args.target is not None:
+        from target_filter import make_selector
+        try:
+            selector = make_selector(args.target, "literal" if args.literal else "regex" if args.regex else "auto")
+        except ValueError as e:
+            parser.error(str(e))
 
     if args.batch:
         try:
@@ -1095,13 +1120,19 @@ def main():
         sys.exit(1)
 
     bvid = args.bvid.strip()
-    if not bvid.startswith("BV"):
-        print("错误: BV号格式不正确，应以 BV 开头")
+    if not re.fullmatch(r"BV[A-Za-z0-9]+", bvid):
+        print("错误: BV号格式不正确，应以 BV 开头且只包含字母和数字")
         sys.exit(1)
 
     try:
-        run_analysis(bvid, force=args.force, max_users=args.max_users,
-                     skip_collect=args.skip_collect, port=args.port, skip_deep=args.skip_deep)
+        if selector is not None:
+            from target_analysis import run_target_analysis
+            run_target_analysis(bvid, selector, force=args.force, max_users=args.max_users,
+                                skip_collect=args.skip_collect, port=args.port, skip_deep=args.skip_deep,
+                                target_history=args.target_history, target_pool=args.target_pool)
+        else:
+            run_analysis(bvid, force=args.force, max_users=args.max_users,
+                         skip_collect=args.skip_collect, port=args.port, skip_deep=args.skip_deep)
     except RiskControlError as e:
         print(f"[Main] 风控兜底耗尽（{e}），本视频分析终止")
         raise SystemExit(1)
