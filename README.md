@@ -258,6 +258,9 @@ Cookie 里带 `_refresh_token` 时会自动续期；若没有它（或刷新失�
 **报告页打不开 / 提示端口被占用？**
 换端口：`python web.py --port 9000`（Windows 的 cmd/PowerShell 不支持 `PROFILER_PORT=9000 python web.py` 这种 bash 写法，请用 `--port`；环境变量仍可用，写法见「快速开始」）；停掉占用端口的旧实例：`python web.py --stop --port 9000`（不带 `--port` 则针对 8000；它按 pidfile 校验确实是本项目的 web.py 才动手，不会误杀别的进程）。
 
+**启动时卡在「小号池」那一行不动（几分钟没输出）？**
+先看终端里有没有代理环境变量（`env | grep -i proxy`）。代理客户端常会写入 `http_proxy/https_proxy/all_proxy`，而 Python 的 `no_proxy` **只做后缀匹配**——写 `127.*` 并不生效，本机回环调用会被送进代理并收到 502。本工具已对本机调用强制绕过环境代理（`clash_ctl` 的控制器请求、自动打开报告页的探测），若你用的是旧版本，可临时用 `env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY python run.py <BV号>` 跳过；也可设 `WEB_AUTOSTART=False`、`CLASH_ENABLED=0` 减少无关环节。
+
 **为什么这么慢 / 一直在冷却？**
 B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风险接口 2–4 秒），热门视频必然是小时级。可以：① `--max-users 50` 限制分析人数；② 配小号池（`python login.py alt1`）与 IP 池（`SUB_URLS`）提升吞吐；③ 中途 Ctrl+C，重跑会从检查点续采、不重复已采数据。
 
@@ -324,7 +327,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（172 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（178 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -381,7 +384,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：172 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：178 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -410,6 +413,7 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_density_multip.py` | 9 | 多分P 密度轴按各分P 内部时间分别建桶、默认选弹幕最多的P、单分P 口径不变、缺元信息降级 |
 | `tests/offline/regress_multipart_pages.py` | 14 | 历史弹幕按分P 采集与检查点隔离（分P 1 键名不变）、画像样本「P{n} mm:ss」与排序、旧画像渲染期回填、弹幕浏览器首次出现按 (分P, 时间) |
 | `tests/offline/regress_port_config.py` | 5 | 端口解析优先级（`--port` > `PROFILER_PORT` > 8000）、非法/越界回退、两个入口的 `--help` 都暴露 `--port`（Windows 换端口可用性
+| `tests/offline/regress_env_proxy.py` | 6 | 环境代理（http_proxy/https_proxy/all_proxy）不得劫持**本机**调用：本机假控制器 + 代理指向死端口，验证 `clash_ctl` 与自动打开报告页的探测仍能打通（Python 的 `no_proxy` 不认 `127.*`） |
 | `tests/offline/regress_web_stop.py` | 8 | `--stop` 兜底（pidfile 缺失/失效时按监听端口反查 ss/lsof/netstat）与 pidfile 归属守卫（老实例退出不再误删新实例记录）、身份校验不误杀无关进程 |
 | `tests/offline/regress_long_image.py` | 12 | 分享长图：payload 装配与截断、渲染尺寸/像素护栏、路由确实接线、跟随「隐藏信息」开关遮蔽（该用例曾抓出 `_apply_danmaku_fp` 返回值误用导致画像整段消失）） |
 
