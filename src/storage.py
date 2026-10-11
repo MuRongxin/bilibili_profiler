@@ -192,7 +192,6 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_bvid ON comments(bvid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_uid ON comments(uid)")
         # 复合索引：问题评论榜/问题作者直引按 (bvid, problem) 过滤用
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_bvid_problem ON comments(bvid, problem)")
 
         # 旧库迁移：comments 表补 reply_count / root_rpid / parent_rpid / problem /
         # uname / location 列（高回复评论功能 + 回复树 + LLM 问题标注 + IP属地）
@@ -204,8 +203,10 @@ def init_db():
             ("problem", "ALTER TABLE comments ADD COLUMN problem TEXT NOT NULL DEFAULT ''"),
             ("uname", "ALTER TABLE comments ADD COLUMN uname TEXT NOT NULL DEFAULT ''"),
             ("location", "ALTER TABLE comments ADD COLUMN location TEXT NOT NULL DEFAULT ''"),
+            ("problem_severity", "ALTER TABLE comments ADD COLUMN problem_severity INTEGER NOT NULL DEFAULT 0"),
         ):
             _migrate_col(cursor, col, comment_cols, ddl)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_bvid_problem ON comments(bvid, problem)")
 
         # 误报标记表（P2-a）：人工标注 LLM 误判的问题弹幕/评论。
         # kind: dm=问题弹幕（target=弹幕内容，判定按内容去重故同内容同源同罪）
@@ -243,6 +244,27 @@ def init_db():
             )
         ''')
 
+        # 基础采集按 UID 共享；弹幕、评论和 AI 证据必须按视频隔离。
+        cursor.execute('''CREATE TABLE IF NOT EXISTS video_profiles (
+            bvid TEXT NOT NULL, uid INTEGER NOT NULL, profile_json TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(bvid, uid))''')
+        # 单视频旧画像可直接迁移；多视频旧画像无法确定归属，读取时用本视频证据重建。
+        cursor.execute('''INSERT OR IGNORE INTO video_profiles(bvid, uid, profile_json)
+            SELECT MIN(s.bvid), u.uid, u.profile_json FROM users u JOIN senders s ON s.uid=u.uid
+            WHERE u.profile_json NOT IN ('', '{}') GROUP BY u.uid HAVING COUNT(DISTINCT s.bvid)=1
+            AND NOT EXISTS(SELECT 1 FROM video_profiles p WHERE p.uid=u.uid)''')
+        # 数据修订号也覆盖同条数更新，避免热度、UID、头像和深掘变更命中旧页面。
+        cursor.execute('''CREATE TABLE IF NOT EXISTS data_revision (
+            scope TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0)''')
+        for table in ("videos", "senders", "users", "video_profiles", "comments", "danmaku", "false_positive", "face_cache"):
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                ref = "OLD" if operation == "DELETE" else "NEW"
+                scope = f"{ref}.bvid" if table not in ("users", "face_cache") else "'*'"
+                cursor.execute(f'''CREATE TRIGGER IF NOT EXISTS revision_{table}_{operation}
+                    AFTER {operation} ON {table} BEGIN
+                    INSERT INTO data_revision(scope, revision) VALUES({scope}, 1)
+                    ON CONFLICT(scope) DO UPDATE SET revision=revision+1;
+                    END''')
         conn.commit()
 
         # 清理旧版本的 progress 表（断点续采已改为纯 senders/users 缓存机制）
@@ -364,27 +386,117 @@ def load_senders(bvid: str) -> list[dict]:
 
 # ========== 用户数据 ==========
 
-def save_user_data(uid: int, name: str, level: int, user_data: dict, profile: dict):
-    """保存用户深度数据和画像"""
+def _put_video_profile(conn, bvid: str, uid: int, profile: dict):
+    profile = dict(profile, _bvid=bvid)
+    conn.execute('''INSERT INTO video_profiles(bvid, uid, profile_json) VALUES(?, ?, ?)
+        ON CONFLICT(bvid, uid) DO UPDATE SET profile_json=excluded.profile_json,
+        revision=video_profiles.revision+1''', (bvid, uid, json.dumps(profile, ensure_ascii=False)))
+
+
+def save_user_data(uid: int, name: str, level: int, user_data: dict, profile: dict,
+                   bvid: str | None = None):
+    """共享基础采集数据，画像按视频保存；空画像不覆盖既有画像。"""
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO users (uid, name, level, data_json, profile_json, collected_at)
+            INSERT INTO users (uid, name, level, data_json, profile_json, collected_at)
             VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(uid) DO UPDATE SET name=excluded.name, level=excluded.level,
+                data_json=excluded.data_json, collected_at=excluded.collected_at,
+                profile_json=CASE WHEN excluded.profile_json='{}' THEN users.profile_json
+                    ELSE excluded.profile_json END
         ''', (uid, name, level,
               json.dumps(user_data, ensure_ascii=False),
               json.dumps(profile, ensure_ascii=False),
               datetime.now().isoformat()))
+        if profile:
+            # 兼容旧调用：只有单视频引用才能推断归属，绝不向多个视频复制证据。
+            if not bvid:
+                refs = conn.execute("SELECT DISTINCT bvid FROM senders WHERE uid=?", (uid,)).fetchall()
+                bvid = refs[0][0] if len(refs) == 1 else None
+            if bvid:
+                _put_video_profile(conn, bvid, uid, profile)
         conn.commit()
 
 
-def update_user_profile(uid: int, profile: dict):
-    """只更新 users.profile_json（阶段7 LLM 深掘结果注入后回写用；
-    不重写 data_json/collected_at——深掘在阶段6落库之后运行）"""
+def update_user_profile(uid: int, profile: dict, bvid: str | None = None):
+    """回写指定视频画像并递增修订号；基础采集时间保持不变。"""
     with closing(get_db()) as conn:
+        if not bvid:
+            refs = conn.execute("SELECT DISTINCT bvid FROM senders WHERE uid=?", (uid,)).fetchall()
+            bvid = refs[0][0] if len(refs) == 1 else None
+        if not bvid:
+            raise ValueError("更新画像必须指定所属视频")
+        _put_video_profile(conn, bvid, uid, profile)
         conn.execute("UPDATE users SET profile_json = ? WHERE uid = ?",
                      (json.dumps(profile, ensure_ascii=False), uid))
         conn.commit()
+
+
+def load_video_profile(bvid: str, uid: int) -> dict | None:
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT profile_json FROM video_profiles WHERE bvid=? AND uid=?",
+                           (bvid, uid)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def ensure_video_profiles(bvid: str):
+    """为旧库缺少归属的画像重建本视频证据，不复用归属不明的 AI 结果。"""
+    from profile_analyzer import analyze_profile
+    with closing(get_db()) as conn:
+        missing = conn.execute('''SELECT s.*, u.data_json, u.name AS collected_name,
+            u.level AS collected_level FROM senders s
+            JOIN users u ON u.uid=s.uid LEFT JOIN video_profiles p ON p.bvid=s.bvid AND p.uid=s.uid
+            WHERE s.bvid=? AND p.uid IS NULL GROUP BY s.uid''', (bvid,)).fetchall()
+    if not missing:
+        return
+    dms = load_danmaku(bvid)
+    comments = load_comments(bvid)
+    video = load_video_info(bvid) or {}
+    dm_by_hash, comments_by_uid = {}, {}
+    for d in dms:
+        dm_by_hash.setdefault(d["mid_hash"], []).append(d)
+    for c in comments:
+        comments_by_uid.setdefault(c["uid"], []).append(c)
+    # 完整判定缓存有视频前缀，可恢复该视频证据；整轮只读一次，无网络调用。
+    cringe_by_hash = {}
+    with closing(get_db()) as conn:
+        cached = conn.execute("SELECT result_json FROM llm_cache WHERE cache_key LIKE ? ESCAPE '\\' "
+            "AND cache_key NOT LIKE '%@batch:%' ORDER BY created_at DESC",
+            (f"cringe:{_like_escape(bvid)}:%",)).fetchall()
+    for cr in cached:
+        try:
+            for h, val in json.loads(cr[0]).items():
+                if isinstance(val, dict):
+                    cringe_by_hash.setdefault(h, val)
+        except (ValueError, AttributeError, TypeError):
+            continue
+    for row in missing:
+        raw = json.loads(row["data_json"])
+        raw.update(uid=row["uid"])
+        raw.setdefault("name", row["collected_name"] or "未知")
+        raw.setdefault("level", row["collected_level"] or 0)
+        raw.pop("ip_location", None)
+        mine = comments_by_uid.get(row["uid"], [])
+        if mine:
+            raw["ip_location"] = next((c["location"] for c in mine if c.get("location")), "")
+        dm = dm_by_hash.get(row["mid_hash"], [])
+        contents = [d["content"] for d in dm] or json.loads(row["contents_json"] or "[]")
+        p = analyze_profile(raw, {"count": row["danmaku_count"], "contents": contents,
+            "video_times": [d["time"] for d in dm], "video_pages": [d.get("page", 1) for d in dm],
+            "multi_page": len(video.get("pages") or []) > 1},
+            {"spam_level": row["spam_level"], "spam_score": row["spam_score"]})
+        p["comments"] = sorted(mine, key=lambda c: -c["like"])[:10]
+        p["cringe"] = cringe_by_hash.get(row["mid_hash"], {})
+        p["collision_risk"] = row["method"] == "CRC32破解"
+        problem = [c for c in mine if c["problem"]]
+        if problem:
+            p["comment_problem"] = {"hits": len(problem),
+                "max_severity": max(c.get("problem_severity") or 1 for c in problem),
+                "categories": list(dict.fromkeys(c["problem"] for c in problem))}
+        with closing(get_db()) as conn:
+            _put_video_profile(conn, bvid, row["uid"], p)
+            conn.commit()
 
 
 def load_user_data(uid: int) -> tuple[dict, dict] | None:
@@ -414,12 +526,13 @@ def append_danmaku(bvid: str, danmaku_list: list[dict], seen_dmids: set) -> int:
     跳过，dmid=0 无法判重直接插入（历史快照 dmid 恒非 0，实时池个别为 0）。
     seen_dmids 由调用方持有并在调用间复用；返回实际插入条数。"""
     rows = []
+    new_dmids = set()
     for dm in danmaku_list:
         dmid = dm.get("dmid", 0)
-        if dmid and dmid in seen_dmids:
+        if dmid and (dmid in seen_dmids or dmid in new_dmids):
             continue
         if dmid:
-            seen_dmids.add(dmid)
+            new_dmids.add(dmid)
         rows.append((bvid, dm["mid_hash"], dm["content"], dm["time"], dm["timestamp"],
                      dm.get("mode", 1), dm.get("color", ""), dm.get("pool", 0), dmid,
                      dm.get("page", 1)))
@@ -430,10 +543,11 @@ def append_danmaku(bvid: str, danmaku_list: list[dict], seen_dmids: set) -> int:
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows)
             conn.commit()
+    seen_dmids.update(new_dmids)
     return len(rows)
 
 
-def save_comments(bvid: str, comments: list[dict]):
+def save_comments(bvid: str, comments: list[dict], checkpoint: dict | None = None):
     """阶段3评论采集后批量落库（跨视频足迹数据源）。
 
     UNIQUE(bvid, rpid, uid) + INSERT OR IGNORE 幂等去重：同一次分析重复落库、
@@ -455,7 +569,7 @@ def save_comments(bvid: str, comments: list[dict]):
     if dropped:
         _dropped_comment_count += dropped
         print(f"[Storage] 评论落库：跳过 {dropped} 条 uid/content 为空的评论（累计 {_dropped_comment_count} 条）")
-    if not rows:
+    if not rows and not checkpoint:
         return
     with closing(get_db()) as conn:
         conn.executemany(
@@ -467,6 +581,10 @@ def save_comments(bvid: str, comments: list[dict]):
             "location = CASE WHEN excluded.location != '' THEN excluded.location ELSE comments.location END, "
             "like = excluded.like, reply_count = excluded.reply_count",
             rows)
+        if checkpoint:
+            conn.executemany("INSERT INTO phase_state(bvid, phase, key, value) VALUES(?, 'comment', ?, ?) "
+                "ON CONFLICT(bvid, phase, key) DO UPDATE SET value=excluded.value",
+                [(bvid, key, str(value)) for key, value in checkpoint.items()])
         conn.commit()
 
 
@@ -488,13 +606,14 @@ def load_comments(bvid: str) -> list[dict]:
     with closing(get_db()) as conn:
         rows = conn.execute(
             "SELECT uid, uname, rpid, content, ctime, like, is_sub, reply_count, "
-            "root_rpid, parent_rpid, problem, location "
+            "root_rpid, parent_rpid, problem, problem_severity, location "
             "FROM comments WHERE bvid = ?", (bvid,)).fetchall()
     return [{"uid": r["uid"], "uname": r["uname"], "rpid": r["rpid"],
              "content": r["content"], "ctime": r["ctime"], "like": r["like"],
              "is_sub": bool(r["is_sub"]), "reply_count": r["reply_count"],
              "root_rpid": r["root_rpid"], "parent_rpid": r["parent_rpid"],
-             "problem": r["problem"], "location": r["location"]} for r in rows]
+             "problem": r["problem"], "problem_severity": r["problem_severity"],
+             "location": r["location"]} for r in rows]
 
 
 def load_comment_uids(bvid: str) -> set[int]:
@@ -505,17 +624,25 @@ def load_comment_uids(bvid: str) -> set[int]:
             "SELECT uid FROM comments WHERE bvid = ?", (bvid,))}
 
 
-def update_comment_problems(bvid: str, verdicts: dict):
-    """回写 LLM 问题评论判定：verdicts = {rpid: 类别}；先清该 bvid 旧标注再逐条 UPDATE。
+def update_comment_problems(bvid: str, verdicts: dict, judged_rpids=None):
+    """回写类别和严重度，只替换成功判定范围；失败和截断范围保留旧标注。
 
     幂等可重跑；rpid 在库中不存在（评论被删/未落库）时 UPDATE 命中 0 行，静默跳过。
     """
+    if judged_rpids is None:
+        judged_rpids = getattr(verdicts, "judged_rpids", None)
     with closing(get_db()) as conn:
         cursor = conn.cursor()
-        cursor.execute("UPDATE comments SET problem = '' WHERE bvid = ?", (bvid,))
-        for rpid, category in verdicts.items():
-            cursor.execute("UPDATE comments SET problem = ? WHERE bvid = ? AND rpid = ?",
-                           (category, bvid, rpid))
+        if judged_rpids is None:
+            cursor.execute("UPDATE comments SET problem = '', problem_severity=0 WHERE bvid = ?", (bvid,))
+        else:
+            cursor.executemany("UPDATE comments SET problem='', problem_severity=0 WHERE bvid=? AND rpid=?",
+                               [(bvid, rpid) for rpid in judged_rpids])
+        for rpid, verdict in verdicts.items():
+            category = verdict["category"] if isinstance(verdict, dict) else verdict
+            severity = verdict.get("severity", 1) if isinstance(verdict, dict) else 1
+            cursor.execute("UPDATE comments SET problem = ?, problem_severity=? WHERE bvid = ? AND rpid = ?",
+                           (category, severity, bvid, rpid))
         conn.commit()
 
 
@@ -615,6 +742,7 @@ def clear_video_cache(bvid: str):
         cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM phase_state WHERE bvid = ?", (bvid,))
+        cursor.execute("DELETE FROM video_profiles WHERE bvid = ?", (bvid,))
         # 该视频的问题弹幕/问题评论判定缓存一并清除（key 前缀 cringe:/cmt: + {bvid}:）；
         # 深掘缓存 key 为 deep:{uid}:...，按用户跨视频复用，不清
         cursor.execute("DELETE FROM llm_cache WHERE cache_key LIKE ? ESCAPE '\\'", (f"cringe:{_like_escape(bvid)}:%",))
@@ -645,6 +773,7 @@ def delete_video_data(bvid: str) -> dict:
 
         counts = {}
         counts["senders"] = cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,)).rowcount
+        counts["video_profiles"] = cursor.execute("DELETE FROM video_profiles WHERE bvid = ?", (bvid,)).rowcount
         counts["danmaku"] = cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,)).rowcount
         counts["comments"] = cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,)).rowcount
         counts["false_positive"] = cursor.execute(

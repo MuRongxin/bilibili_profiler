@@ -55,9 +55,10 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      DENSITY_PEAK_MAX, DENSITY_PEAK_MIN_COUNT, DENSITY_PEAK_SAMPLE)
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
-from storage import get_db, init_db
+import config as _config
+from storage import get_db, init_db, load_video_profile, ensure_video_profiles, load_comments, load_user_data
 from storage import (load_senders, load_global_uid_map, save_global_uid,
-                     save_sender, save_user_data, has_user_data, load_video_info,
+                     save_sender, save_user_data, load_video_info,
                      delete_video_data, toggle_false_positive, load_false_positives,
                      load_faces, load_face_cached_uids, save_face,
                      load_llm_cache, save_llm_cache)
@@ -74,6 +75,7 @@ from up_analyzer import _tokenize
 from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats,
                     generate_chart_data, generate_cringe_board, sort_profiles_by_risk,
                     up_wordcloud_data, PROBLEM_CATEGORY_COLORS, _category_chips)
+from long_image import build_payload, render_long_image
 
 app = Flask(__name__)
 PAGE_SIZE = 100  # 弹幕 API 默认/回退每页条数（可选 50/100/200，spec 3）
@@ -172,30 +174,10 @@ def _invalidate_page_cache(bvid: str):
 
 
 def _page_fingerprint(bvid: str) -> tuple:
-    """报告页数据指纹：覆盖 senders/users/comments/danmaku/false_positive/face_cache/videos
-    七张表的量与最新写入时间。全部走 bvid 索引的 COUNT/MAX/SUM 聚合，本地 SQLite 毫秒级。
-    外部进程（run.py 分析、--force 重跑）落库后指纹即变，下次访问自动重渲染，
-    不依赖进程内主动失效（_invalidate_page_cache 仍保留作为即时手段）。"""
+    """用数据库修订号检测外部写入，涵盖画像、UID、热度及同条数更新。"""
     with closing(get_db()) as conn:
-        s_cnt, s_uid_cnt = conn.execute(
-            "SELECT COUNT(*), COUNT(uid) FROM senders WHERE bvid = ?", (bvid,)).fetchone()
-        u_cnt, u_max = conn.execute(
-            "SELECT COUNT(*), MAX(u.collected_at) FROM senders s "
-            "JOIN users u ON u.uid = s.uid WHERE s.bvid = ?", (bvid,)).fetchone()
-        c_cnt, c_prob, c_heat = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(problem)), 0), "
-            "COALESCE(SUM(\"like\" + reply_count), 0) FROM comments WHERE bvid = ?",
-            (bvid,)).fetchone()
-        d_cnt = conn.execute(
-            "SELECT COUNT(*) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
-        f_cnt = conn.execute(
-            "SELECT COUNT(*) FROM false_positive WHERE bvid = ?", (bvid,)).fetchone()[0]
-        face_cnt = conn.execute("SELECT COUNT(*) FROM face_cache").fetchone()[0]
-        # videos 表（标题/元信息更新）也纳入指纹：外部进程重写该行时报告页需重渲染
-        v_cnt, v_max = conn.execute("SELECT COUNT(*), MAX(rowid) FROM videos").fetchone()
-    # c_heat（点赞+回复数合计）覆盖 refresh_comments 的热度回写：热度变化也触发重渲染
-    return (s_cnt, s_uid_cnt, u_cnt, u_max, c_cnt, c_prob, c_heat, d_cnt, f_cnt, face_cnt,
-            v_cnt, v_max)
+        return tuple(conn.execute("SELECT scope, revision FROM data_revision WHERE scope IN (?, '*') "
+                                  "ORDER BY scope", (bvid,)).fetchall())
 
 
 # ========== 手动勾选分析 job（spec B；状态存内存 dict，服务重启即失效——spec 已接受） ==========
@@ -340,8 +322,8 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
         try:
             row = cached.get(mid_hash)
             uid = row["uid"] if row else None
-            # 已分析过（senders 有 uid 且 users 有数据）→ 直接跳过计入 results（spec 3.3）
-            if uid is not None and has_user_data(uid):
+            # 只有本视频已有画像才跳过；其它视频的基础资料可复用但不能代替本视频画像。
+            if uid is not None and load_video_profile(bvid, uid):
                 add_result(uid)
                 update(done=i)
                 continue
@@ -370,20 +352,29 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
                 collision_risk = row["method"] == METHOD_CRC32_CRACK
 
             # 2. 强制采集（无视置信度，含"低"/碰撞）
-            user_data = collect_user_data(uid, pool)
+            cached_user = load_user_data(uid)
+            user_data = cached_user[0] if cached_user else collect_user_data(uid, pool)
             if "error" in user_data:
                 add_error(f"UID:{uid} 采集失败 {user_data['error']}", mid_hash)
                 update(done=i)
                 continue
+            user_data = dict(user_data)
+            user_data.pop("ip_location", None)
+            mine_comments = [c for c in load_comments(bvid) if c["uid"] == uid]
+            location = next((c["location"] for c in mine_comments if c.get("location")), "")
+            if location:
+                user_data["ip_location"] = location
 
             # 3. 规则画像：刷屏统计从 danmaku 表现算（web 端无内存态 spam_results）
             spam = batch_detect_spam({mid_hash: stats}).get(mid_hash, {})
             profile = analyze_profile(user_data,
                                       {"count": stats["count"], "contents": stats["contents"],
-                                       "video_times": stats["video_times"]},
+                                       "video_times": stats["video_times"],
+                                       "video_pages": stats["video_pages"], "multi_page": stats["multi_page"]},
                                       spam)
             profile["collision_risk"] = collision_risk
-            profile["comments"] = []   # web 端无评论数据（spec 7 不做评论采集）
+            profile["comments"] = sorted(mine_comments,
+                                         key=lambda c: -c["like"])[:10]
             profile["cringe"] = {}     # 手动分析不重跑问题弹幕 LLM 检测
 
             # 4. LLM 深掘（top_k=1 单人单调用，llm_cache 命中零 token；失败只影响深掘）
@@ -396,7 +387,7 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
                     print(f"[Job {job_id}] 警告: UID:{uid} LLM 深掘失败（{e}），仅跳过深掘")
 
             save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0),
-                           user_data, profile)
+                           user_data, profile, bvid=bvid)
             add_result(uid)
             update(done=i)
             print(f"[Job {job_id}] [{i}/{len(mid_hashes)}] {mid_hash} → UID:{uid} 完成")
@@ -441,17 +432,19 @@ def _load_video_row(bvid: str):
 
 
 def _load_profiles(bvid: str) -> list[dict]:
-    """该视频已解析发送者的画像（senders JOIN users；同 uid 多 mid_hash 按 uid 去重）。
+    """该视频已解析发送者的画像（video_profiles 按 bvid+uid 隔离，同 UID 去重）。
 
     附带注入渲染期键（不落库）：resolve_method/resolve_confidence 来自 senders 表
     （卡片解析徽标 tooltip），collected_at 来自 users 表（基础信息采集时间），
     _mid_hash 来自 senders 表（刷屏判定误报按钮的 target），
     school 在旧缓存画像缺省时从 data_json 回退提取（毕业院校徽标）。
     GROUP BY u.uid 下 method/confidence/mid_hash 取该 uid 任一行（同 uid 多 mid_hash 极少见，可接受）。"""
+    ensure_video_profiles(bvid)
     with closing(get_db()) as conn:
         rows = conn.execute('''
-            SELECT u.profile_json, u.data_json, s.method, s.confidence, u.collected_at, s.mid_hash
+            SELECT p.profile_json, u.data_json, s.method, s.confidence, u.collected_at, s.mid_hash
             FROM senders s JOIN users u ON u.uid = s.uid
+            JOIN video_profiles p ON p.bvid=s.bvid AND p.uid=s.uid
             WHERE s.bvid = ? AND s.uid IS NOT NULL
             GROUP BY u.uid
         ''', (bvid,)).fetchall()
@@ -489,6 +482,19 @@ def _load_profiles(bvid: str) -> list[dict]:
             except Exception:
                 pass
         profiles.append(p)
+    fp_cmt = {t for k, t in load_false_positives(bvid) if k == "cmt"}
+    problem_by_uid = {}
+    for c in load_comments(bvid):
+        if c["problem"] and str(c["rpid"]) not in fp_cmt:
+            problem_by_uid.setdefault(c["uid"], []).append(c)
+    for p in profiles:
+        kept = problem_by_uid.get(p.get("uid"), [])
+        p["comment_problem"] = {"hits": len(kept),
+            "max_severity": max((c.get("problem_severity") or 1 for c in kept), default=0),
+            "categories": list(dict.fromkeys(c["problem"] for c in kept))}
+        for c in p.get("comments") or []:
+            if str(c.get("rpid")) in fp_cmt:
+                c["problem"] = ""
     # 样本分P 标注回填（渲染期，不落库）：多分P 视频才需要，见 _fill_sample_pages
     if len(_load_page_meta(bvid)) > 1:
         _fill_sample_pages(bvid, profiles)
@@ -589,19 +595,21 @@ def _attach_other_videos(bvid: str, profiles: list[dict]):
 
 def _sender_meta(bvid: str) -> dict:
     """发送者联查（spec 5）：mid_hash → {uid, name, spam_level, categories}。
-    uid/name/spam_level 来自 senders LEFT JOIN users；categories 从 users.profile_json
+    uid/name/spam_level 来自 senders LEFT JOIN users；categories 从 video_profiles.profile_json
     的 cringe 字段 Python 侧解析（非 SQL），并按内容扣除已标记误报的弹幕
     （与 video_page 的 _apply_danmaku_fp 同口径——UI 文案承诺「标记后不计入聚合」）；
     spam_level 命中刷屏误报（kind=spam，发送者粒度）时降级为 "低"（弹幕浏览器面板同口径）。
     senders 无行的 mid_hash 不在此表 → 未分析。
     连接用 closing 保证异常路径也关闭（参照 storage.py 模式）。"""
+    ensure_video_profiles(bvid)
     fp = load_false_positives(bvid)
     fp_dm = {t for k, t in fp if k == "dm"}
     fp_spam = {t for k, t in fp if k == "spam"}
     with closing(get_db()) as conn:
         rows = conn.execute('''
-        SELECT s.mid_hash, s.uid, s.spam_level, u.name, u.profile_json
+        SELECT s.mid_hash, s.uid, s.spam_level, u.name, p.profile_json
         FROM senders s LEFT JOIN users u ON u.uid = s.uid
+            LEFT JOIN video_profiles p ON p.bvid=s.bvid AND p.uid=s.uid
         WHERE s.bvid = ?
     ''', (bvid,)).fetchall()
     meta = {}
@@ -689,6 +697,7 @@ def _build_blocklist(bvid: str, crit: set, max_uids: int,
     Returns: {"entries": [条目], "matched": 命中总数, "skipped_unresolved": int,
               "skipped_lowconf": int}
     """
+    ensure_video_profiles(bvid)
     fp = load_false_positives(bvid)
     fp_dm = {t for k, t in fp if k == "dm"}
     fp_spam = {t for k, t in fp if k == "spam"}
@@ -714,15 +723,16 @@ def _build_blocklist(bvid: str, crit: set, max_uids: int,
         # 1) senders 行：spam 维度 + 画像 cringe/评论直引严重度 + 置信度
         rows = conn.execute('''
             SELECT s.mid_hash, s.uid, s.confidence, s.spam_level, s.spam_score,
-                   s.danmaku_count, u.profile_json
+                   s.danmaku_count, p.profile_json
             FROM senders s LEFT JOIN users u ON u.uid = s.uid
+        LEFT JOIN video_profiles p ON p.bvid=s.bvid AND p.uid=s.uid
             WHERE s.bvid = ?
         ''', (bvid,)).fetchall()
 
         # 2) 问题评论作者（评论区明文 UID，无画像也计入；cmt 误报按 rpid 扣除）
         cmt_counts: dict[int, int] = {}
         if "cmt" in crit:
-            sql = ("SELECT uid, COUNT(*) AS n FROM comments "
+            sql = ("SELECT uid, COUNT(*) AS n, MAX(problem_severity) AS sev FROM comments "
                    "WHERE bvid = ? AND problem != ''")
             params: list = [bvid]
             if fp_cmt:
@@ -730,7 +740,9 @@ def _build_blocklist(bvid: str, crit: set, max_uids: int,
                 sql += " AND CAST(rpid AS TEXT) NOT IN (%s)" % ",".join("?" * len(marks))
                 params += marks
             sql += " GROUP BY uid"
-            cmt_counts = {r["uid"]: r["n"] for r in conn.execute(sql, params).fetchall()}
+            cmt_rows = conn.execute(sql, params).fetchall()
+            cmt_counts = {r["uid"]: r["n"] for r in cmt_rows}
+            cmt_severity = {r["uid"]: r["sev"] or 1 for r in cmt_rows}
 
     for r in rows:
         uid = r["uid"]
@@ -767,22 +779,13 @@ def _build_blocklist(bvid: str, crit: set, max_uids: int,
             _upsert(uid, score=r["spam_score"] or 0.0, count=dm_count,
                     note=f"刷屏{r['spam_level']}风险{r['spam_score'] or 0:.1f}分",
                     lowconf=lowconf)
-        # 评论直引作者：画像里带真实严重度（无画像的作者走下方 cmt_counts 兜底，严重度按 1）
-        if "cmt" in crit and r["profile_json"]:
-            try:
-                cp = json.loads(r["profile_json"]).get("comment_problem") or {}
-                if cp.get("hits"):
-                    _upsert(uid, sev=cp.get("max_severity") or 1, count=dm_count,
-                            note=f"问题评论{cp['hits']}条", plain=True)
-            except Exception:
-                pass
         if not cringe_hit and not spam_hit and uid not in cmt_counts:
             # 与屏蔽无关的发送者也登记 count：同 uid 命中评论维度时弹幕数参与排序
             info.setdefault(uid, {"sev": 0, "score": 0.0, "count": dm_count,
                                   "notes": [], "lowconf": lowconf, "plain": False})
 
     for uid, n in cmt_counts.items():
-        _upsert(uid, sev=1, note=f"问题评论{n}条", plain=True)
+        _upsert(uid, sev=cmt_severity[uid], note=f"问题评论{n}条", plain=True)
 
     # 筛选命中者：至少有一条 note（= 至少命中一项导出标准）
     matched_uids = [uid for uid, ent in info.items() if ent["notes"]]
@@ -1660,6 +1663,7 @@ def _cross_video_overlaps() -> list[dict]:
         rows = conn.execute('''
             SELECT s.uid, u.name, COUNT(DISTINCT s.bvid) AS vcnt, SUM(s.danmaku_count) AS total_dm
             FROM senders s LEFT JOIN users u ON u.uid = s.uid
+        LEFT JOIN video_profiles p ON p.bvid=s.bvid AND p.uid=s.uid
             WHERE s.uid IS NOT NULL
             GROUP BY s.uid HAVING vcnt >= ?
             ORDER BY vcnt DESC, total_dm DESC LIMIT ?
@@ -2915,7 +2919,9 @@ def api_up_wordcloud(uid: int):
     cached = load_llm_cache(key)
     if cached:
         try:
-            return jsonify(json.loads(cached))
+            data = json.loads(cached)
+            if data.get("words") or (data.get("empty_until") or 0) > time.time():
+                return jsonify(data)
         except Exception:
             pass                                        # 缓存损坏按未命中重采
     with _UP_WC_LOCK:
@@ -2941,6 +2947,8 @@ def api_up_wordcloud(uid: int):
         info = fetch_up_wordcloud(uid, client)
         words = sorted((info.get("word_freq") or {}).items(), key=lambda x: x[1], reverse=True)[:80]
         data = {"words": [[w, c] for w, c in words], "name": info.get("name", "")}
+        if not words:
+            data["empty_until"] = time.time() + getattr(_config, "UP_WORDCLOUD_EMPTY_TTL", 300)
         save_llm_cache(key, json.dumps(data, ensure_ascii=False))
         return jsonify(data)
     except CookieInvalidError as e:
@@ -3249,10 +3257,36 @@ def _pid_file(port: int) -> str:
     return os.path.join(DATA_DIR, f"web_{port}.pid")
 
 
+def _process_identity(pid: int) -> tuple[list[str], str, str] | None:
+    """返回命令参数、启动标识、工作目录；无法验证时保守拒绝停止。"""
+    if pid <= 0:
+        return None
+    try:
+        if sys.platform.startswith("win"):
+            import shlex
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                f"Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" | "
+                "Select-Object CommandLine,CreationDate | ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=15)
+            data = json.loads(out.stdout)
+            argv = [a.strip('"') for a in shlex.split(data["CommandLine"], posix=False)]
+            return argv, str(data["CreationDate"]), ""
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = [a for a in f.read().decode(errors="replace").split("\0") if a]
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            started = f.read().rsplit(")", 1)[1].split()[19]
+        return argv, started, os.readlink(f"/proc/{pid}/cwd")
+    except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
+        return None
+
+
 def _write_pid(port: int):
     os.makedirs(DATA_DIR, exist_ok=True)
+    identity = _process_identity(os.getpid())
+    record = {"pid": os.getpid(), "port": port, "script": os.path.realpath(__file__),
+              "started": identity[1] if identity else None, "cwd": os.getcwd()}
     with open(_pid_file(port), "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
+        json.dump(record, f, ensure_ascii=False)
 
 
 def _clear_pid(port: int):
@@ -3262,33 +3296,32 @@ def _clear_pid(port: int):
         pass
 
 
-def _pid_is_webpy(pid: int) -> bool:
-    """进程存活且命令行为本项目 web.py：防止 PID 复用导致 --stop 误杀无关进程。
-
-    POSIX 读 /proc/<pid>/cmdline；Windows 无 /proc，改用 PowerShell CIM 查命令行
-    （wmic 已在新版 Windows 移除，不依赖它）。查询失败一律保守返回 False——
-    宁可不杀也不误杀无关进程。"""
-    if sys.platform.startswith("win"):
-        try:
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"],
-                capture_output=True, text=True, timeout=15)
-            # 命令行按空白切分后须有以 web.py 结尾的参数（引号剥离）：子串匹配会
-            # 把 `vim web.py`/`less web.py` 等无关进程一并误杀；含空格路径切分
-            # 破碎时判 False（保守方向：不杀，只是要求手动处理）
-            return any(tok.strip('"').endswith("web.py")
-                       for tok in (out.stdout or "").split())
-        except (OSError, subprocess.SubprocessError):
-            return False
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            argv = f.read().decode(errors="ignore").split("\0")
-        # argv[0] 是解释器（python），脚本参数须以 web.py 结尾（./web.py、
-        # 绝对路径均覆盖）；整串子串匹配会把 `vim web.py` 之类误杀
-        return any(a.endswith("web.py") for a in argv)
-    except OSError:
+def _pid_is_webpy(pid: int, started: str | None = None, recorded_cwd: str = "") -> bool:
+    identity = _process_identity(pid)
+    if identity is None:
         return False
+    argv, actual_started, cwd = identity
+    if started is not None and actual_started != started:
+        return False
+    if not argv or not re.fullmatch(r"(?:pythonw?|pypy)(?:[0-9.]+)?(?:\.exe)?",
+                                    os.path.basename(argv[0]), re.IGNORECASE):
+        return False
+    # 只接受解释器的脚本参数，不接受编辑器参数、-c 字符串或另一个目录的 web.py。
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        arg = argv[i]
+        if arg in ("-c", "-m"):
+            return False
+        i += 2 if arg in ("-X", "-W") else 1
+    if i >= len(argv):
+        return False
+    script = argv[i]
+    if not os.path.isabs(script):
+        cwd = cwd or (recorded_cwd if started is not None else "")
+        if not cwd:
+            return False
+        script = os.path.join(cwd, script)
+    return os.path.realpath(script) == os.path.realpath(__file__)
 
 
 def _stop_server(port: int):
@@ -3299,11 +3332,17 @@ def _stop_server(port: int):
     pid_path = _pid_file(port)
     try:
         with open(pid_path, encoding="utf-8") as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
+            record = json.load(f)
+            pid = int(record["pid"])
+            started = record["started"]
+            recorded_cwd = record.get("cwd", "")
+            if (not started or record["port"] != port
+                    or record["script"] != os.path.realpath(__file__)):
+                raise ValueError("服务身份不匹配")
+    except (OSError, ValueError, KeyError, TypeError):
         print(f"[Web] 未发现 {port} 端口的服务记录（{pid_path} 不存在），服务可能未在运行")
         return
-    if not _pid_is_webpy(pid):
+    if not _pid_is_webpy(pid, started, recorded_cwd):
         print(f"[Web] 记录中的进程 {pid} 已不存在或不是本项目的 web.py，清理残留 pidfile")
         _clear_pid(port)
         return
@@ -3314,10 +3353,10 @@ def _stop_server(port: int):
         print(f"[Web] 向进程 {pid} 发送停止信号失败（{e}），pidfile 保留，可稍后重试")
         return
     for _ in range(10):
-        if not _pid_is_webpy(pid):
+        if not _pid_is_webpy(pid, started, recorded_cwd):
             break
         time.sleep(0.1)
-    if _pid_is_webpy(pid):
+    if _pid_is_webpy(pid, started, recorded_cwd):
         try:
             os.kill(pid, signal.SIGKILL)
         except (AttributeError, OSError):

@@ -128,7 +128,7 @@ BV2 = "BVblk000002"
 storage.save_video_info(BV2, {"bvid": BV2, "title": "t2", "cid": 2})
 storage.save_sender(BV2, "g101", 101, "高", "评论区验证", 7, ["骂人"], "低", 0.0)
 storage.save_user_data(101, "u101", 3, {}, _profile(
-    101, cringe=_cringe(_item("骂人", "人身攻击", 2))))
+    101, cringe=_cringe(_item("骂人", "人身攻击", 2))), bvid=BV2)
 storage.save_sender(BV2, "g109", 109, "高", "评论区验证", 25, ["冲"] * 25, "高", 8.0)
 rc = webmod._build_cross_blocklist({"cringe", "spam"}, 2, 200)
 cross_uids = [int(e["filter"]) for e in rc["entries"]]
