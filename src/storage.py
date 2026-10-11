@@ -13,21 +13,11 @@ from contextlib import closing
 from datetime import datetime
 
 from config import DB_PATH
+from uid_evidence import PLAINTEXT_SOURCES, crc32_uid, candidates_of
 
 # uid/content 为空的评论被 save_comments 静默丢弃时的累计计数（debug 统计用）
 _dropped_comment_count = 0
 
-# 全局映射来源覆盖优先级：明文来源（评论区验证/充电名单/互动弹幕/视频信息）
-# 可靠度高于 CRC32 破解；冲突时仅当新来源优先级 >= 旧来源才覆盖 uid/source。
-# 未列出的来源（如旧版遗留值）按最低档处理，保证明文凭据永不被未知来源冲掉
-_GLOBAL_UID_SOURCE_PRIORITY = {
-    "评论区验证": 2,
-    "充电名单": 2,
-    "互动弹幕": 2,
-    "视频信息": 2,
-    "评论收割": 2,     # harvest_comment_uids 翻评论区收集的明文 UID，证据等级同评论
-    "CRC32破解": 1,
-}
 
 
 def _like_escape(s: str) -> str:
@@ -103,6 +93,9 @@ def init_db():
         # uid 索引：跨视频重叠面板/低置信度页/global 沉淀判重按 uid 查 senders
         # （无索引则每次全表扫；clear_video_cache 的逐 uid 判重是 O(uids×N)）
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_senders_uid ON senders(uid)")
+        sender_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(senders)")}
+        _migrate_col(cursor, "resolution_json", sender_cols,
+                     "ALTER TABLE senders ADD COLUMN resolution_json TEXT NOT NULL DEFAULT '{}'")
 
         # 用户深度数据表
         cursor.execute('''
@@ -129,6 +122,22 @@ def init_db():
                 hit_count INTEGER NOT NULL DEFAULT 1
             )
         ''')
+        # 旧单值表保留作审计；新证据按 UID、来源、视频保存，不覆盖碰撞候选。
+        cursor.execute('''CREATE TABLE IF NOT EXISTS uid_evidence (
+            mid_hash TEXT NOT NULL, uid INTEGER NOT NULL, source TEXT NOT NULL,
+            bvid TEXT NOT NULL DEFAULT '', first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(mid_hash, uid, source, bvid))''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_uid_evidence_video ON uid_evidence(bvid)")
+        cursor.execute('''CREATE TABLE IF NOT EXISTS uid_verify_cache (
+            uid INTEGER PRIMARY KEY, status TEXT NOT NULL, info_json TEXT NOT NULL,
+            verified_at REAL NOT NULL)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS uid_candidate_cache (
+            mid_hash TEXT NOT NULL, max_uid INTEGER NOT NULL, version TEXT NOT NULL,
+            candidates_json TEXT NOT NULL, PRIMARY KEY(mid_hash, max_uid, version))''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS uid_harvest_seen (
+            bvid TEXT NOT NULL, rpid INTEGER NOT NULL, PRIMARY KEY(bvid, rpid))''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS uid_schema_state (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
 
         # LLM 结果缓存表（问题弹幕判定 + 重点深掘，跨运行复用省 token）
         cursor.execute('''
@@ -207,6 +216,18 @@ def init_db():
         ):
             _migrate_col(cursor, col, comment_cols, ddl)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_comments_bvid_problem ON comments(bvid, problem)")
+        if not cursor.execute("SELECT 1 FROM uid_schema_state WHERE key='evidence_v1'").fetchone():
+            conn.create_function("uid_crc32", 1, crc32_uid)
+            now = datetime.now().isoformat()
+            sources = sorted(PLAINTEXT_SOURCES)
+            cursor.execute(f'''INSERT OR IGNORE INTO uid_evidence
+                SELECT LOWER(mid_hash), uid, source, '', first_seen, last_seen, hit_count
+                FROM global_uid_map WHERE source IN ({','.join('?' for _ in sources)})
+                AND uid > 0 AND LOWER(mid_hash)=uid_crc32(uid)''', sources)
+            cursor.execute('''INSERT OR IGNORE INTO uid_evidence
+                SELECT DISTINCT uid_crc32(uid), uid, '评论区验证', bvid, ?, ?, 1
+                FROM comments WHERE uid > 0''', (now, now))
+            cursor.execute("INSERT OR IGNORE INTO uid_schema_state VALUES('evidence_v1', '1')")
 
         # 误报标记表（P2-a）：人工标注 LLM 误判的问题弹幕/评论。
         # kind: dm=问题弹幕（target=弹幕内容，判定按内容去重故同内容同源同罪）
@@ -335,20 +356,22 @@ def load_video_info(bvid: str) -> dict | None:
 
 def save_sender(bvid: str, mid_hash: str, uid: int | None, confidence: str,
                 method: str, danmaku_count: int, contents: list[str],
-                spam_level: str, spam_score: float):
+                spam_level: str, spam_score: float, resolution: dict | None = None):
     """保存发送者解析结果"""
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO senders
-            (bvid, mid_hash, uid, confidence, method, danmaku_count, contents_json, spam_level, spam_score)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (bvid, mid_hash, uid, confidence, method, danmaku_count, contents_json, spam_level, spam_score, resolution_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(bvid, mid_hash) DO UPDATE SET
                 uid=excluded.uid, confidence=excluded.confidence, method=excluded.method,
                 danmaku_count=excluded.danmaku_count, contents_json=excluded.contents_json,
-                spam_level=excluded.spam_level, spam_score=excluded.spam_score
+                spam_level=excluded.spam_level, spam_score=excluded.spam_score,
+                resolution_json=excluded.resolution_json
         ''', (bvid, mid_hash, uid, confidence, method, danmaku_count,
-              json.dumps(contents, ensure_ascii=False), spam_level, spam_score))
+              json.dumps(contents, ensure_ascii=False), spam_level, spam_score,
+              json.dumps(resolution or {}, ensure_ascii=False)))
         conn.commit()
 
 
@@ -368,7 +391,7 @@ def load_senders(bvid: str) -> list[dict]:
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT mid_hash, uid, confidence, method, danmaku_count, contents_json, spam_level, spam_score
+            SELECT mid_hash, uid, confidence, method, danmaku_count, contents_json, spam_level, spam_score, resolution_json
             FROM senders WHERE bvid = ?
         ''', (bvid,))
         rows = cursor.fetchall()
@@ -381,6 +404,7 @@ def load_senders(bvid: str) -> list[dict]:
         "contents": json.loads(r["contents_json"]),
         "spam_level": r["spam_level"],
         "spam_score": r["spam_score"],
+        "resolution": json.loads(r["resolution_json"] or "{}"),
     } for r in rows]
 
 
@@ -488,7 +512,7 @@ def ensure_video_profiles(bvid: str):
             {"spam_level": row["spam_level"], "spam_score": row["spam_score"]})
         p["comments"] = sorted(mine, key=lambda c: -c["like"])[:10]
         p["cringe"] = cringe_by_hash.get(row["mid_hash"], {})
-        p["collision_risk"] = row["method"] == "CRC32破解"
+        p["collision_risk"] = json.loads(row["resolution_json"] or "{}").get("collision_risk", row["method"] == "CRC32破解")
         problem = [c for c in mine if c["problem"]]
         if problem:
             p["comment_problem"] = {"hits": len(problem),
@@ -581,6 +605,8 @@ def save_comments(bvid: str, comments: list[dict], checkpoint: dict | None = Non
             "location = CASE WHEN excluded.location != '' THEN excluded.location ELSE comments.location END, "
             "like = excluded.like, reply_count = excluded.reply_count",
             rows)
+        for uid in {int(row[1]) for row in rows if int(row[1]) > 0}:
+            _put_uid_evidence(conn, crc32_uid(uid), uid, "评论区验证", bvid)
         if checkpoint:
             conn.executemany("INSERT INTO phase_state(bvid, phase, key, value) VALUES(?, 'comment', ?, ?) "
                 "ON CONFLICT(bvid, phase, key) DO UPDATE SET value=excluded.value",
@@ -742,6 +768,7 @@ def clear_video_cache(bvid: str):
         cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM phase_state WHERE bvid = ?", (bvid,))
+        cursor.execute("DELETE FROM uid_harvest_seen WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM video_profiles WHERE bvid = ?", (bvid,))
         # 该视频的问题弹幕/问题评论判定缓存一并清除（key 前缀 cringe:/cmt: + {bvid}:）；
         # 深掘缓存 key 为 deep:{uid}:...，按用户跨视频复用，不清
@@ -792,10 +819,14 @@ def delete_video_data(bvid: str) -> dict:
             counts["deep_cache"] += cursor.execute(
                 "DELETE FROM llm_cache WHERE cache_key LIKE ? ESCAPE '\\'",
                 (f"deep:{uid}:%",)).rowcount
+        counts["uid_evidence"] = cursor.execute("DELETE FROM uid_evidence WHERE bvid=?", (bvid,)).rowcount
+        cursor.execute("DELETE FROM uid_harvest_seen WHERE bvid=?", (bvid,))
         counts["global_uid_map"] = 0
         for mh in mid_hashes:
             counts["global_uid_map"] += cursor.execute(
                 "DELETE FROM global_uid_map WHERE mid_hash = ?", (mh,)).rowcount
+            counts["uid_evidence"] += cursor.execute(
+                "DELETE FROM uid_evidence WHERE mid_hash=? AND bvid=''", (mh,)).rowcount
         counts["users"] = 0
         for uid in uids:
             counts["users"] += cursor.execute("DELETE FROM users WHERE uid = ?", (uid,)).rowcount
@@ -805,57 +836,124 @@ def delete_video_data(bvid: str) -> dict:
 
 # ========== 全局 mid_hash→UID 映射库（跨视频复用） ==========
 
-def save_global_uid(mid_hash: str, uid: int, source: str):
-    """
-    upsert 全局映射：新条目 hit_count=1；重复命中 hit_count+1 并刷新 last_seen
-    source: 评论区验证 / CRC32破解 / 充电名单 / 互动弹幕 / 视频信息
-
-    冲突覆盖按来源优先级（见 _GLOBAL_UID_SOURCE_PRIORITY）：明文来源 > CRC32破解，
-    仅当新来源优先级 >= 旧来源才覆盖 uid/source，防止破解结果被低置信来源反复冲掉。
-    覆盖条件带进 UPDATE 的 WHERE（CASE source→优先级）："读旧 source → UPDATE"
-    两步之间可能被并发写插入，无条件 UPDATE 是最后提交者获胜——低优先级来源
-    可能覆盖掉高优先级结果；带条件后条件不满足自动退化为只累计命中。
-    """
+def _put_uid_evidence(conn, mid_hash: str, uid: int, source: str, bvid: str = ""):
+    """只记录校验相符的明文 UID；同一 hash 的其他候选绝不覆盖。"""
+    if source not in PLAINTEXT_SOURCES or uid <= 0 or crc32_uid(uid) != mid_hash:
+        return
     now = datetime.now().isoformat()
+    conn.execute("INSERT INTO uid_evidence VALUES(?, ?, ?, ?, ?, ?, 1) "
+        "ON CONFLICT(mid_hash, uid, source, bvid) DO UPDATE SET "
+        "last_seen=excluded.last_seen, hit_count=uid_evidence.hit_count+1",
+        (mid_hash, uid, source, bvid, now, now))
+
+
+def save_global_uid(mid_hash: str, uid: int, source: str, bvid: str = ""):
+    """保存候选来源与视频；纯 CRC32 破解及未知来源不进入明文证据库。"""
     with closing(get_db()) as conn:
-        cursor = conn.cursor()
-        new_pri = _GLOBAL_UID_SOURCE_PRIORITY.get(source, 0)
-        # INSERT OR IGNORE 先行占位：先查后插在并发写（web job × run.py）下会撞主键
-        # 抛 IntegrityError，占位后该行必存在，后续只需按来源优先级决定是否覆盖
-        cursor.execute(
-            "INSERT OR IGNORE INTO global_uid_map (mid_hash, uid, source, first_seen, last_seen, hit_count)"
-            " VALUES (?, ?, ?, ?, ?, 0)", (mid_hash, uid, source, now, now))
-        row = cursor.execute("SELECT source FROM global_uid_map WHERE mid_hash = ?", (mid_hash,)).fetchone()
-        old_pri = _GLOBAL_UID_SOURCE_PRIORITY.get(row["source"], 0)
-        if new_pri >= old_pri:
-            # 优先级比较进 SQL（与 _GLOBAL_UID_SOURCE_PRIORITY 对齐生成 CASE）：
-            # 等锁期间/读后写前被并发更高优先级来源抢先覆盖时 rowcount=0，
-            # 自动落到下方"只累计命中"分支
-            pri_case = "CASE source " + " ".join(
-                f"WHEN '{s}' THEN {p}" for s, p in _GLOBAL_UID_SOURCE_PRIORITY.items()) + " ELSE 0 END"
-            cur = cursor.execute(f'''
-                UPDATE global_uid_map SET uid=?, source=?, last_seen=?, hit_count=hit_count+1
-                WHERE mid_hash=? AND ? >= {pri_case}
-            ''', (uid, source, now, mid_hash, new_pri))
-            if cur.rowcount > 0:
-                conn.commit()
-                return
-        # 低优先级来源不覆盖 uid/source，只累计命中并刷新 last_seen
-        cursor.execute('''
-            UPDATE global_uid_map SET last_seen=?, hit_count=hit_count+1
-            WHERE mid_hash=?
-        ''', (now, mid_hash))
+        _put_uid_evidence(conn, mid_hash, uid, source, bvid)
+        conn.commit()
+
+
+def save_uid_evidence_maps(bvid: str, sources: list[tuple[str, dict]]):
+    """一批明文来源原子入库，避免逐候选新建连接。"""
+    with closing(get_db()) as conn:
+        for source, mapping in sources:
+            for h, value in mapping.items():
+                for uid in candidates_of(value):
+                    _put_uid_evidence(conn, h, uid, source, bvid)
         conn.commit()
 
 
 def load_global_uid_map() -> dict:
-    """读取全局映射库：{mid_hash: {"uid": int, "source": str, "hit_count": int}}"""
+    """返回多候选证据；旧 CRC32 破解记录仅留在旧表审计，不参与解析。"""
     with closing(get_db()) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT mid_hash, uid, source, hit_count FROM global_uid_map")
-        rows = cursor.fetchall()
-    return {r["mid_hash"]: {"uid": r["uid"], "source": r["source"], "hit_count": r["hit_count"]}
-            for r in rows}
+        rows = conn.execute("SELECT * FROM uid_evidence ORDER BY mid_hash, uid, source, bvid").fetchall()
+    result = {}
+    for row in rows:
+        h, uid = row["mid_hash"], row["uid"]
+        if row["source"] not in PLAINTEXT_SOURCES or uid <= 0 or crc32_uid(uid) != h:
+            continue
+        entry = result.setdefault(h, {"uids": [], "evidence": [], "hit_count": 0})
+        if uid not in entry["uids"]:
+            entry["uids"].append(uid)
+        entry["evidence"].append({"uid": uid, "source": row["source"], "bvid": row["bvid"]})
+        entry["hit_count"] += row["hit_count"]
+    for entry in result.values():
+        entry["uid"] = entry["uids"][0] if len(entry["uids"]) == 1 else None
+        entry["source"] = entry["evidence"][0]["source"] if entry["uid"] else "明文冲突"
+    return result
+
+
+def load_uid_verify_cache(uids: list[int], exists_ttl: float, missing_ttl: float) -> dict:
+    """存在性仅缓存有效结论；过期、未知和损坏记录均重新验证。"""
+    result, now = {}, time.time()
+    with closing(get_db()) as conn:
+        for start in range(0, len(uids), 500):
+            chunk = uids[start:start + 500]
+            rows = conn.execute(f"SELECT * FROM uid_verify_cache WHERE uid IN ({','.join('?' for _ in chunk)})",
+                                chunk).fetchall()
+            for row in rows:
+                ttl = exists_ttl if row["status"] == "exists" else missing_ttl
+                if row["status"] not in ("exists", "not_exists") or not 0 <= now - row["verified_at"] < ttl:
+                    continue
+                try:
+                    info = json.loads(row["info_json"])
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(info, dict) and (row["status"] != "exists" or info.get("uid") == row["uid"]):
+                    result[row["uid"]] = (row["status"], info)
+    return result
+
+
+def save_uid_verify_cache(uid: int, status: str, info: dict):
+    if status not in ("exists", "not_exists"):
+        return
+    with closing(get_db()) as conn:
+        conn.execute("INSERT INTO uid_verify_cache VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(uid) DO UPDATE SET status=excluded.status, info_json=excluded.info_json, "
+            "verified_at=excluded.verified_at", (uid, status, json.dumps(info, ensure_ascii=False), time.time()))
+        conn.commit()
+
+
+def load_uid_candidates(mid_hash: str, max_uid: int, version: str) -> list[int] | None:
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT candidates_json FROM uid_candidate_cache "
+                           "WHERE mid_hash=? AND max_uid=? AND version=?", (mid_hash, max_uid, version)).fetchone()
+    if not row:
+        return None
+    try:
+        values = json.loads(row[0])
+        if isinstance(values, list) and all(isinstance(u, int) and 0 < u <= max_uid and crc32_uid(u) == mid_hash for u in values):
+            return sorted(set(values))
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def save_uid_candidates(mid_hash: str, max_uid: int, version: str, candidates: list[int]):
+    with closing(get_db()) as conn:
+        conn.execute("INSERT OR REPLACE INTO uid_candidate_cache VALUES(?, ?, ?, ?)",
+                     (mid_hash, max_uid, version, json.dumps(candidates)))
+        conn.commit()
+
+
+def load_uid_harvest_seen(bvid: str) -> set[int]:
+    with closing(get_db()) as conn:
+        rows = conn.execute("SELECT rpid FROM uid_harvest_seen WHERE bvid=? UNION "
+                            "SELECT rpid FROM comments WHERE bvid=? AND rpid>0", (bvid, bvid)).fetchall()
+    return {r[0] for r in rows}
+
+
+def save_uid_harvest_page(bvid: str, uids: set[int], rpids: set[int], checkpoint: dict, phase: str = "uid_harvest"):
+    """UID 证据、该视频已见评论及游标一页原子提交，防止续采跳页。"""
+    with closing(get_db()) as conn:
+        for uid in uids:
+            _put_uid_evidence(conn, crc32_uid(uid), uid, "评论收割", bvid)
+        conn.executemany("INSERT OR IGNORE INTO uid_harvest_seen VALUES(?, ?)", [(bvid, r) for r in rpids])
+        conn.executemany("INSERT INTO phase_state VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(bvid, phase, key) DO UPDATE SET value=excluded.value",
+            [(bvid, phase, k, str(v)) for k, v in checkpoint.items()])
+        conn.commit()
 
 
 # ========== LLM 结果缓存（省 token：重跑同视频/同证据包零调用） ==========

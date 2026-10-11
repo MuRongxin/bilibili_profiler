@@ -131,7 +131,15 @@ PROXY_METRICS_WINDOW = 200         # 出口调用耗时 P95 的滑动样本数
 MAX_RISK_ROUNDS = 3
 
 # ========== 破解配置 ==========
-MITM_MAX_UID = 10_000_000_000   # MITM 反查覆盖上限：全部 ≤10 位 UID（16位随机长UID不可解）
+MITM_MAX_UID = 10_000_000_000   # MITM 覆盖 ≤10 位 UID；长 UID 可明文正向匹配，hash 无法唯一恢复身份
+UID_VERIFY_EXISTS_TTL = 7 * 86400  # 存在名片缓存 7 天
+UID_VERIFY_MISSING_TTL = 3600     # 明确 -404 缓存 1 小时，风控/网络/空名片不缓存
+UID_VERIFY_FALLBACK_BUDGET = 50   # 一轮解析的单点补验请求上限，批量缺席也需单点确认
+UID_RESOLUTION_CACHE_TTL = 86400  # 解析结论一天复核；版本/证据变化立即失效
+UID_HARVEST_REFRESH_MAX_PAGES = 10  # 已完成 UID 收割后的刷新请求上限，按本视频评论 ID 停止
+UID_REPLY_TOTAL_PAGES = 10        # 每轮面向未关联兴趣 hash 的楼中楼 UID 补采总请求预算，0=关闭
+UID_REPLY_MAX_ROOTS = 5           # 优先补采回复数最高且未完整采集的主楼数
+UID_REPLY_NO_HIT_PAGES = 3        # 同一主楼连续无新增目标命中的页数达到此值，转下一个主楼
 
 # ========== 采集配置 ==========
 MAX_COMMENT_PAGES = 100      # 评论最大翻页数（约20条/页，上限~2000条主评论）
