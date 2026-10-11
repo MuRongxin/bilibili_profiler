@@ -36,6 +36,20 @@ def case(name):
     return register
 
 
+def _assert_secret_mode(path: Path) -> None:
+    """含凭证配置的权限断言：POSIX 必须 0o600，Windows 只校验"未被设为只读"。
+
+    Windows 的 os.chmod 只能表达只读位（S_IWRITE），0o600 根本落不了地——实测
+    os.open(..., 0o600)+os.chmod(..., 0o600) 后 st_mode 仍是 0o666。原断言写死
+    0o600，导致 windows-latest 上必挂（ubuntu 正常），CI 因此变红。
+    """
+    mode = path.stat().st_mode & 0o777
+    if os.name == "nt":
+        assert mode & 0o200, "Windows 上含凭证配置不应被设为只读（实际 %o）" % mode
+    else:
+        assert mode == 0o600, "含凭证配置应为 0o600，实际 %o" % mode
+
+
 def response(value, code=200):
     r = requests.Response()
     r.status_code = code
@@ -147,13 +161,33 @@ def _():
         Path(core._runtime_dir).mkdir()
         path = Path(core._runtime_dir) / "config.yaml"
         core._write_config(str(path))
-        old = path.read_text()
+        old = path.read_text(encoding="utf-8")
         core._proc = Mock()
         core._proc.poll.return_value = None
         with patch.object(cc.ClashCtl, "current_node", return_value="香港A"), patch.object(cc.ClashCtl, "switch_node", return_value=True), patch.object(cc.ClashCtl, "reload_config", return_value=False):
             assert not core.ensure_accounts(["主号", "alt1"])
-        assert set(core.account_routes()) == {"主号"} and path.read_text() == old
-        assert path.stat().st_mode & 0o777 == 0o600 and not Path(str(path) + ".tmp").exists()
+        assert set(core.account_routes()) == {"主号"} and path.read_text(encoding="utf-8") == old
+        _assert_secret_mode(path)
+        assert not Path(str(path) + ".tmp").exists()
+
+
+@case("凭证权限断言：POSIX 严格 0600，Windows 只要求可写（两分支自检）")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "cfg.yaml"
+        p.write_text("凭证: x", encoding="utf-8")     # Linux 下默认 0o644
+        with patch.object(os, "name", "nt"):          # 模拟 windows runner 的语义
+            _assert_secret_mode(p)                    # 不得因拿不到 0o600 而判失败
+        if os.name != "nt":                           # 真实 POSIX：分支必须严格
+            os.chmod(p, 0o600)
+            _assert_secret_mode(p)
+            os.chmod(p, 0o644)
+            raised = False
+            try:
+                _assert_secret_mode(p)
+            except AssertionError:
+                raised = True
+            assert raised, "POSIX 上权限过宽必须报错"
 
 
 @case("停核心清理本实例 provider 凭证，同时保留其他实例目录")
@@ -162,7 +196,7 @@ def _():
         core = pc.ProxyCore(["http://127.0.0.1/sub"])
         own = Path(core._runtime_dir)
         own.mkdir()
-        (own / "节点缓存.yaml").write_text("测试凭证")
+        (own / "节点缓存.yaml").write_text("测试凭证", encoding="utf-8")
         peer = Path(tmp) / "其他核心"
         peer.mkdir()
         core.stop()
