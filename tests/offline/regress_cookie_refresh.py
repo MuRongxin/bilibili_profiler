@@ -216,12 +216,15 @@ def worker(tag):
         order.append("+" + tag)
         time.sleep(0.15)
         order.append("-" + tag)
-t1 = threading.Thread(target=worker, args=("A",))
-t2 = threading.Thread(target=worker, args=("B",))
+# daemon + join 超时：万一某平台的锁实现有问题，用例要"失败"而不是把 CI 挂死
+t1 = threading.Thread(target=worker, args=("A",), daemon=True)
+t2 = threading.Thread(target=worker, args=("B",), daemon=True)
 t1.start(); time.sleep(0.02); t2.start()
-t1.join(); t2.join()
-check("刷新锁真实互斥（临界区不交叠）",
-      order in (["+A", "-A", "+B", "-B"], ["+B", "-B", "+A", "-A"]), "(%s)" % order)
+t1.join(10); t2.join(10)
+finished = not t1.is_alive() and not t2.is_alive()
+check("刷新锁真实互斥（临界区不交叠，10 秒内完成）",
+      finished and order in (["+A", "-A", "+B", "-B"], ["+B", "-B", "+A", "-A"]),
+      "(完成=%s, %s)" % (finished, order))
 
 print("")
 print("==== 登录态续期与回写: %d 项通过, %d 项失败 ====" % (ok, fail))
