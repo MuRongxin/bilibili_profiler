@@ -41,6 +41,11 @@ class ComboPool:
         return self.run(lambda c: c.get_raw(url, params=params, **kw), desc=url[-40:])
 
     @property
+    def accounts(self):
+        """[(账号名, client), ...]：供收尾逻辑（登录态回写）枚举全部账号"""
+        return list(self._accounts)
+
+    @property
     def current(self):
         with self._lock:
             return self._accounts[self._idx]

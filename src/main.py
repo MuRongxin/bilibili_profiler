@@ -25,7 +25,7 @@ from storage import clear_video_cache, update_sender_spam, load_global_uid_map, 
 from storage import save_comments, update_comment_problems
 from storage import load_danmaku, load_comments, append_danmaku
 from storage import get_phase_state, set_phase_state
-from auth import get_auth_client, LoginRequiredError
+from auth import get_auth_client, LoginRequiredError, account_cookie_path, save_cookie_if_current
 from combo_pool import build_pool
 from api_client import RiskControlError
 from danmaku import (collect_danmaku_data, group_by_sender, fetch_command_dms,
@@ -794,6 +794,28 @@ class PhaseTimer:
         print(f"[计时] 总耗时: {self._fmt(total)}")
 
 
+def _persist_sessions(pool) -> None:
+    """把池内各账号当前的登录态回写磁盘（失败只警告，绝不影响分析结果）。
+
+    B站会在活跃会话中续期 SESSDATA，但那只体现在内存 session 里；不回写的话文件里
+    永远是登录那一刻的登录态，服务端一到期就彻底作废。save_cookie_if_current 会先比对
+    磁盘上的 refresh_token，避免覆盖其它进程（web.py）刚刷新出的新登录态。"""
+    try:
+        accounts = pool.accounts
+    except AttributeError:
+        return
+    saved = 0
+    for name, client in accounts:
+        try:
+            path = None if name == "主号" else account_cookie_path(name)
+            if save_cookie_if_current(client, path):
+                saved += 1
+        except Exception as e:
+            print(f"[Auth] 账号 {name} 登录态回写失败（忽略）: {e}")
+    if saved:
+        print(f"[Auth] 已回写 {saved} 个账号的登录态（含服务端续期）")
+
+
 def _deep_enabled(skip_deep: bool = False) -> bool:
     """阶段7（LLM 重点深掘）是否执行：全局开关与单次 --skip-deep 必须同时为真。
 
@@ -968,6 +990,10 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
 
     # 空视频或零画像也可能已完成常规分析；与目标模式共享的元信息明确区分。
     set_phase_state(bvid, "report", "ready", "1")
+    # 阶段8: 会话回写。B站在会话中下发的续期 Set-Cookie 只存在内存 session 里，
+    # 进程退出即丢；收尾时把仍有效的登录态落盘，让下次运行直接复用（含服务端续期）。
+    _persist_sessions(pool)
+
     # 静态单文件 HTML 报告已被交互式 Web 报告（web.py）完全替换，不再生成 .html
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     export_base = os.path.join(REPORT_DIR, f"report_{bvid}_{ts}")

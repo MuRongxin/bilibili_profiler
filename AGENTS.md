@@ -53,7 +53,7 @@ src/
 ├── proxy_core.py        # 内置 mihomo：每账号独立 mixed listener/选择组，新增账号热加载（先暂停在途请求、恢复旧选择、失效连接后放行）；端口稳定复用，版本/SHA256 校验、PDEATHSIG；每实例私有运行目录，stop 清配置与 provider 凭证缓存
 ├── proxy_pool.py        # 稳定账号出口：主池/分片共享降级与恢复状态，连接故障按请求开始节点归因，切节点后清连接池；实测公网 IP 去重、相同或未知出口共享限速/冷却；请求结果计数与滑动 P95，调度在本进程内生效
 ├── combo_pool.py        # 账号组合池：风控保留原节点并冷却，串行阶段可换账号，代理连接故障才切节点；单次请求独立重试预算；显式外部配置→有订阅时内置隔离核心→外部自动探测→直连，外部共享入口不修改全局选择组
-├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新、小号池发现（data/cookies/*.json → load_extra_clients，失效自动尝试刷新）
+├── auth.py              # 扫码登录、Cookie 保存/加载/校验、小号池发现（data/cookies/*.json → load_extra_clients）；到期前主动续期（_refreshed_at 记账 + COOKIE_REFRESH_INTERVAL_DAYS 节流）、刷新三态（OK/RETRY/DEAD：网络失败保留旧态、token 失效才判重扫）、运行结束回写登录态（save_cookie_if_current 先比对磁盘令牌，避免覆盖其它进程刚刷出的新态）；本地伪字段 _refresh_token/_refreshed_at 读取时必须弹出，绝不进 session
 ├── danmaku.py           # 实时弹幕 XML 解析，按 mid_hash 聚合发送者
 ├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析+0x0A 特征校验防错误页误判；失败日记账 failed_dates 优先补采、截断写 truncated、done=1 后重跑滚动补采最近 3 天；每日快照为独立请求无游标链，组合池多号分片时按账号并发采多天，落库/检查点推进在主线程串行；多分P 视频按分P 各采一份（page 参数落库标记 + 检查点键 :pN 隔离，分P 1 沿用原键名故既有报告不重采））
 ├── comment.py           # 评论区采集（wbi/main 游标 + 子评论补采 + IP属地），建立 UID→CRC32 映射；页内各主楼的子评论补采互相独立，组合池多号分片时按账号并发补采（主评论游标翻页为链式依赖无法分片，楼中楼补采才是时间大头）；done=1 视频重跑时 refresh_comments 按时间序（mode=2）增量刷新新评论（撞整页已见即停，旧评论顺带刷新热度）；harvest_comment_uids 纯 UID 收割（翻评论区只取 uid 建 CRC32 映射、不落评论内容；正文未被截断且评论表非空时直接跳过，正文截断时接续其热度序游标续翻不重扫已采页；累计上限 UID_HARVEST_MAX_PAGES=500 页，断点续翻，done 后重跑转刷新模式，沉淀全局库）
@@ -81,6 +81,7 @@ src/
 - **不删除数据**：刷屏检测只标记 `spam_level`，不删除任何弹幕。
 - **本机回环调用必须绕开环境代理**：代理客户端会把 `http_proxy/https_proxy/all_proxy` 写进 shell，而 Python 的 `no_proxy` 只做后缀匹配（用户写 `127.*` 不生效），裸 `requests.get("http://127.0.0.1:...`) 会被送进代理收到 502。对本地控制器/本地服务的调用必须用 `trust_env=False` 的 Session 或 `ProxyHandler({})` 的 opener（参考 `clash_ctl._SESSION`、`web_autostart._LOCAL_OPENER`，回归见 `tests/offline/regress_env_proxy.py`）；对 GitHub/订阅等**远程**下载保留环境代理（那是用户需要的加速手段）。
 - **LLM 客户端同样不继承环境代理**：openai SDK 底层 httpx 默认 `trust_env=True`，而代理客户端常写入 `all_proxy=socks://...`——httpx 未装 socks 支持时直接抛 `ValueError: Unknown scheme for proxy URL`，表现为「所有 LLM 调用 0.0 秒秒失败」（api_client 因为已 trust_env=False 反而正常，现象很迷惑）。所有客户端一律经 `llm_client.make_client(...)` 构造，开关 `config.LLM_TRUST_ENV_PROXY`（默认 False），回归见 `tests/offline/regress_llm_proxy.py`。
+- **Cookie 刷新公钥（REFRESH_PUBKEY）不能手改**：它是被 PEM 解析的 base64，行内多一个/少一个字符就会让 `RSA.import_key` 抛 `Incorrect padding`，表现为「自动刷新静默全线失效、且没有任何报错提示」——c41020b 曾在插入 LoginRequiredError 时误改最后一行（216→218 字符），导致此后所有账号都无法自动续期。`tests/offline/regress_cookie_refresh.py` 首项锁定了「公钥可解析 + correspondPath 可生成」。
 - 采集规模由 `config.py` 中的 `MAX_*` 常量控制（评论 100 页、子评论补采 25 页/条、动态定员上限 ANALYZE_USERS_FLOOR=300 / ANALYZE_USERS_RATIO=0.05 / MAX_ANALYZE_USERS_HARD_CAP=1000（保底/按比例上浮/绝对封顶）、深掘 LLM_DEEP_TOP_K=20、问题弹幕/问题评论判定并发上限 LLM_CONCURRENCY=16（实际路数=min(批次数,上限)，429 限速自动退避重试）、问题弹幕批大小 CRINGE_BATCH_SIZE=200、问题评论批次/上限 COMMENT_CRINGE_BATCH_SIZE=100 / COMMENT_CRINGE_MAX_ITEMS=2000、问题评论作者直引阈值 COMMENT_AUTHOR_MIN_SEVERITY=2 / COMMENT_AUTHOR_MIN_HITS=2、评论 UID 收割上限 UID_HARVEST_MAX_PAGES=500、问题评论榜 COMMENT_HEAT_REPLY_WEIGHT=10 / PROBLEM_COMMENT_TOP_N=30、争执焦点 ATTACK_FOCUS_TOP_N=5 / ATTACK_FOCUS_MAX_N=20（保底/封顶，按攻击边数浮动）、密度时间轴桶数 DENSITY_BUCKETS=60、跨视频面板 CROSS_VIDEO_MIN_VIDEOS=2 / CROSS_VIDEO_MAX_USERS=50、LLM 深掘超时 LLM_DEEP_TIMEOUT=120、LLM 判定整轮重试熔断 LLM_RETRY_BUDGET_SECONDS=1800 / 瞬态重试 LLM_TRANSIENT_RETRIES=2、历史弹幕滚动补采 HISTORY_RECENT_REFRESH_DAYS=3 / 分P历史采集 HISTORY_MULTIPAGE_ENABLED / HISTORY_MULTIPAGE_MAX_PAGES=4、代理恢复重探 PROXY_RETRY_AFTER=600、单账号池冷却 SINGLE_ACCOUNT_RISK_COOLDOWN=120、WBI 密钥负缓存 WBI_KEY_FAIL_TTL=60、buvid3/bili_ticket 重试 CRED_FAIL_TTL=300、回复树深度 REPLY_TREE_MAX_DEPTH=50、web job 淘汰 WEB_JOB_MAX_KEPT=100 、手动分析上限 ANALYZE_MAX_TARGETS=200、刷屏检测 SPAM_BURST_*/SPAM_VARIANT_*/SPAM_COMBO_BONUS/SPAM_RELATIVE_*/REPEAT_EVENT_* 窗口阈值与组合/相对离群/复读事件参数等），调优时改这里而不是散落在代码里的数字。
 - 输出文件：`data/reports/report_{BV号}_{时间}.csv/.json`（CSV/JSON 导出，web.py 报告页提供下载链接）、`data/profiler.db`（数据库）、`data/cookie.json`（登录态）。
 
@@ -89,7 +90,7 @@ src/
 项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
 ```bash
-# 1) 离线回归（479 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+# 1) 离线回归（497 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 多分P 口径（密度轴/历史采集/样本标注）
 python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
 python tests/offline/regress_proxy_pool.py --mihomo  # 可选 5 项真实核心本机测试（已有 mihomo/openssl，不下载、不访问外网）

@@ -26,6 +26,14 @@ COOKIE_PATH = os.path.join(DATA_DIR, "cookie.json")
 COOKIES_DIR = os.path.join(DATA_DIR, "cookies")
 REPORT_DIR = os.path.join(DATA_DIR, "reports")
 
+# ========== 登录态续期 ==========
+# 客户端看不到 SESSDATA 的服务端到期时间，只能按"上次成功刷新的时间"记账提前续期：
+# 刷新会旋转 refresh_token（一次性），过频会踩风控，故默认 7 天一次。
+COOKIE_PROACTIVE_REFRESH = os.environ.get("COOKIE_PROACTIVE_REFRESH", "1") not in ("0", "false", "False")
+                                   # 启动时到期前主动续期（关闭则只在验证失败后才尝试刷新）
+COOKIE_REFRESH_INTERVAL_DAYS = int(os.environ.get("COOKIE_REFRESH_INTERVAL_DAYS", "7"))
+                                   # 距上次成功刷新超过该天数就续期一次；无 refresh_token 时自动跳过
+
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
 
