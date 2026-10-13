@@ -990,6 +990,26 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
 
     # 空视频或零画像也可能已完成常规分析；与目标模式共享的元信息明确区分。
     set_phase_state(bvid, "report", "ready", "1")
+    # 阶段9: 歧义候选终审复核——报告里不能出现"点进去 404"的账号。只处理纯 CRC 破解、
+    # 多候选且无明文可交叉验证的组：复核曾判 404 的候选，出现翻案（现在又不是 404）说明
+    # 上次结论不可信，等待后继续复核，直到一轮内没有翻案；明确 -404 累计确认后标 final。
+    try:
+        from candidate_cards import recheck_ambiguous_candidates
+
+        def _save_recheck(h, info):
+            save_sender(bvid, h, info.get("uid"), info.get("confidence", "无"), info.get("method", ""),
+                        info.get("danmaku_count", 0), info.get("contents", []),
+                        info.get("spam_level", "低"), info.get("spam_score", 0.0),
+                        resolution=info.get("resolution"))
+
+        _stats = recheck_ambiguous_candidates(resolved, client, on_progress=_save_recheck)
+        if _stats["targets"]:
+            print(f"[Phase 9] 歧义候选终审复核: 目标 {_stats['targets']} 人，复核 {_stats['checked']} 次，"
+                  f"翻案 {_stats['flipped']}，终审排除 {_stats['finalized']}，待下轮 {_stats['pending']}"
+                  + ("（风控暂停，冷却后下次运行继续）" if _stats["stopped"] else ""))
+    except Exception as e:
+        print(f"[Phase 9] 复核异常（忽略，不影响报告）: {e}")
+
     # 阶段8: 会话回写。B站在会话中下发的续期 Set-Cookie 只存在内存 session 里，
     # 进程退出即丢；收尾时把仍有效的登录态落盘，让下次运行直接复用（含服务端续期）。
     _persist_sessions(pool)

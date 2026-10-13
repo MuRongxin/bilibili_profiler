@@ -65,7 +65,8 @@ from storage import (load_senders, load_global_uid_map,
                      load_llm_cache, save_llm_cache)
 from storage import (load_target_analysis, list_target_analyses, load_uid_space_cache,
                      has_normal_report, NORMAL_REPORT_PREDICATE, load_danmaku,
-                     load_danmaku_problems, load_uid_verify_cache, load_uid_candidates, load_uid_verify_times)
+                     load_danmaku_problems, load_uid_verify_verdicts,
+                     load_uid_candidates, load_uid_verify_times)
 from target_report import render_target_report, render_target_list_page, page_number, render_space_assessment
 from candidate_space import candidate_uids, cached_assessments
 from crc_candidates import is_pure_crc, build_crc_groups, render_crc_groups, render_crc_group
@@ -81,7 +82,7 @@ from spam_detector import batch_detect_spam, detect_repeat_events, pool_distribu
 from cringe_detector import detect_density_peaks, load_cached_danmaku_problems
 from llm_analyzer import LLMAnalyzer
 from up_analyzer import _tokenize
-from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats,
+from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats, uid_linkable,
                     generate_chart_data, generate_cringe_board, sort_profiles_by_risk,
                     up_wordcloud_data, PROBLEM_CATEGORY_COLORS, _category_chips)
 from long_image import build_payload, render_long_image
@@ -459,6 +460,7 @@ def _load_profiles(bvid: str) -> list[dict]:
         p["resolve_method"] = r["method"] or ""
         p["resolve_confidence"] = r["confidence"] or ""
         resolution = json.loads(r["resolution_json"] or "{}")
+        p["_resolution"] = resolution      # 供 report.uid_linkable 判定该 UID 能否给跳转
         p["collision_risk"] = resolution.get("collision_risk", r["method"] == METHOD_CRC32_CRACK)
         p["resolve_reason"] = resolution.get("reason", "")
         p["collected_at"] = r["collected_at"] or ""
@@ -2267,9 +2269,14 @@ def _low_conf_tab_html(bvid: str) -> tuple[str, int]:
     for r in rows:
         uid = r["uid"]
         uid_disp = _mask_uid(uid) if mask else str(uid)
-        uid_html = (f'<a href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">UID:{esc(uid_disp)}</a>'
-                    if uid is not None else '<span>尚未确定 UID</span>')
-        record = json.loads(r["resolution_json"] or "{}")
+        record = json.loads(r["resolution_json"] or "{}")   # 先解析，链接判定要用它
+        # 只有能确认账号存在的 UID 才给跳转——报告里不得出现点进去 404 的账号
+        if uid is None:
+            uid_html = '<span>尚未确定 UID</span>'
+        elif uid_linkable({"uid": uid, "resolve_method": r["method"], "_resolution": record}):
+            uid_html = f'<a href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">UID:{esc(uid_disp)}</a>'
+        else:
+            uid_html = f'<span title="存在性未确认或核验已过期，不提供跳转">UID:{esc(uid_disp)}</span>'
         candidate_html = "、".join(esc(_mask_uid(u) if mask else str(u)) for u in record.get("candidates", []))
         reason_html = f'<div class="chart-hint">{esc(record.get("reason", ""))}'
         if candidate_html:
@@ -2326,8 +2333,10 @@ def _crc_candidate_data(bvid: str, target_record: dict | None = None,
             groups.setdefault(dm["mid_hash"], {"contents": []})["contents"].append(dm["content"])
         problems = load_cached_danmaku_problems(rows, groups, bvid)
     uids = sorted({u for s in senders if is_pure_crc(s) for u in candidate_uids(s)})
-    verifications = load_uid_verify_cache(uids, getattr(_config, "UID_VERIFY_EXISTS_TTL", 604800),
-                                        getattr(_config, "UID_VERIFY_MISSING_TTL", 3600))
+    # 展示用"全部结论"（含已过期）：过期只标待复核，绝不把"已确认不存在"当成未知，
+    # 否则它会被重新渲染成可点击名片 → 点进去 404。
+    verifications = load_uid_verify_verdicts(uids, getattr(_config, "UID_VERIFY_EXISTS_TTL", 604800),
+                                             getattr(_config, "UID_VERIFY_MISSING_TTL", 3600))
     groups = build_crc_groups(senders, rows, problems, load_false_positives(bvid), verifications,
                               target_record["result"].get("matches", []) if target_record else None,
                               load_uid_verify_times(uids), include_resolved=include_resolved)

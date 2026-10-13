@@ -5,8 +5,9 @@ import time
 import config
 from candidate_space import candidate_uids, fetch_space_sample, sample_is_fresh
 from crc_candidates import is_pure_crc
-from storage import (load_uid_candidates, load_uid_verify_cache, save_uid_verify_cache,
-                     refresh_sender_resolution, get_db, load_uid_space_cache, load_uid_verify_times)
+from storage import (load_uid_candidates, load_uid_verify_cache, load_uid_verify_verdicts,
+                     save_uid_verify_cache, refresh_sender_resolution, get_db,
+                     load_uid_space_cache, load_uid_verify_times)
 from uid_resolver import (_verify_single, _finalize, resolution_record,
                           UID_VERIFY_EXISTS_TTL, UID_VERIFY_MISSING_TTL, crack_crc32)
 
@@ -109,6 +110,135 @@ def prepare_candidate_reports(resolved: dict, client, on_progress=None, cache_on
     if stopped:
         print("[候选报告] 已触发风控，剩余项保留缺失标记；报告页面不会后台补采")
 
+
+
+def recheck_ambiguous_candidates(resolved: dict, client, on_progress=None) -> dict:
+    """阶段9 终审复核：收敛歧义候选的存在性，保证报告里不出现点进去 404 的账号。
+
+    只处理"纯 CRC 破解、候选 ≥2、无明文证据可交叉验证"的组：
+      1) 复核组内"曾判定不存在"或"尚未定论"的候选；
+      2) 一轮里若出现"之前 404、本轮又不是 404"的账号，说明此前那次 404 不可信
+         （疑似风控伪装），按 UID_RECHECK_INTERVAL 等待后连同"本轮仍未知"的继续复核；
+      3) 一轮内没有任何翻案 ⇒ 收敛；仍为明确 -404 的候选累计确认达
+         UID_RECHECK_CONFIRMATIONS 次后写 final（彻底判定不存在）。
+
+    必须有终止条件（否则风控持续时会无限打接口）：单轮预算 + 最大轮数 + 风控熔断；
+    未收敛的写 resolution["recheck_pending"]（含 next_check_at），冷却后下次运行继续。
+    返回统计字典：{targets, checked, flipped, finalized, pending, stopped}。"""
+    stats = {"targets": 0, "checked": 0, "flipped": 0, "finalized": 0, "pending": 0, "stopped": False}
+    if not getattr(config, "UID_RECHECK_ENABLED", True):
+        return stats
+    rounds = max(1, int(getattr(config, "UID_RECHECK_MAX_ROUNDS", 3)))
+    interval = max(0, int(getattr(config, "UID_RECHECK_INTERVAL", 90)))
+    budget = max(1, int(getattr(config, "UID_RECHECK_BUDGET", 50)))
+    cooldown = max(60, int(getattr(config, "UID_RECHECK_COOLDOWN", 1800)))
+    need = max(1, int(getattr(config, "UID_RECHECK_CONFIRMATIONS", 2)))
+    final_ttl = max(3600, int(getattr(config, "UID_RECHECK_FINAL_TTL", 30 * 86400)))
+
+    now = time.time()
+    senders = {h: info for h, info in resolved.items()
+               if is_pure_crc(info) and len(candidate_uids(info)) > 1}
+    if not senders:
+        return stats
+    targets: dict = {}
+    for h, info in senders.items():
+        record = info.get("resolution") or {}
+        recorded = record.get("candidate_status") or {}
+        recorded = recorded if isinstance(recorded, dict) else {}
+        waiting = record.get("recheck_pending") or {}
+        waiting = waiting if isinstance(waiting, dict) else {}
+        for uid in candidate_uids(info):
+            status = recorded.get(str(uid), "unknown")
+            if status == "exists":
+                continue            # 已确认存在：可点击名片有据，无需复核
+            entry = waiting.get(str(uid))
+            if isinstance(entry, dict) and float(entry.get("next_check_at") or 0) > now:
+                continue            # 冷却中：上次已复核过，别每轮都打
+            targets.setdefault(uid, []).append(h)
+    stats["targets"] = len(targets)
+    if not targets:
+        return stats
+
+    verdicts = load_uid_verify_verdicts(sorted(targets), UID_VERIFY_EXISTS_TTL, UID_VERIFY_MISSING_TTL)
+    confirmed, queue = {}, []
+    for uid in sorted(targets):
+        verdict = verdicts.get(uid)
+        if verdict and verdict["status"] == "not_exists" and verdict.get("final") \
+                and now - float(verdict["verified_at"] or 0) < final_ttl:
+            continue                # 已终审排除且未到复核周期
+        queue.append(uid)
+        info = (verdict or {}).get("info") or {}
+        confirmed[uid] = int(info.get("miss_count") or 0)
+    if not queue:
+        return stats
+
+    results: dict = {}
+    finalized: set = set()
+    stopped = False
+    for round_no in range(1, rounds + 1):
+        batch, queue = queue[:budget], queue[budget:]
+        flips, unknowns, unstable = [], [], []
+        for uid in batch:
+            status, info, risk = _verify_single(uid, client)
+            stats["checked"] += 1
+            if risk:
+                stopped = True      # 风控：立刻停，剩余留到下轮/下次运行
+                queue.insert(0, uid)
+                break
+            if status == "exists":
+                flips.append(uid)
+                confirmed[uid] = 0  # 翻案：此前 404 不可信，确认次数清零
+                save_uid_verify_cache(uid, "exists", info)
+            elif status == "not_exists":
+                confirmed[uid] = confirmed.get(uid, 0) + 1
+                final = confirmed[uid] >= need
+                save_uid_verify_cache(uid, "not_exists",
+                                      {"miss_count": confirmed[uid], "final": final})
+                if final:
+                    if uid not in finalized:
+                        finalized.add(uid)
+                        stats["finalized"] += 1
+                else:
+                    unstable.append(uid)   # 还差确认次数，下一轮再确认一次
+            else:
+                unknowns.append(uid)
+            results[uid] = status
+        if flips:
+            stats["flipped"] += len(flips)
+        # 下一轮：翻案的（结论已被推翻，必须重查）+ 没查成的 + 还差确认次数的
+        retry = flips + unknowns + unstable + queue
+        queue = retry
+        if stopped or not retry:
+            break
+        if round_no < rounds:
+            time.sleep(interval)
+
+    stats["pending"] = len(queue)
+    stats["stopped"] = stopped
+    deadline = now + cooldown
+    for h, info in senders.items():
+        uids = candidate_uids(info)
+        touched = [u for u in uids if u in results]
+        waiting_now = [u for u in uids if u in queue]
+        if not touched and not waiting_now:
+            continue
+        record = info.setdefault("resolution", {})
+        status_map = record.setdefault("candidate_status", {})
+        times_map = record.setdefault("candidate_checked_at", {})
+        for uid in touched:
+            status_map[str(uid)] = results[uid]
+            times_map[str(uid)] = time.time()
+        pending_map = record.setdefault("recheck_pending", {})
+        for uid in waiting_now:
+            pending_map[str(uid)] = {"next_check_at": deadline, "reason": "存在性复核未收敛"}
+        for uid in uids:
+            if str(uid) not in pending_map:
+                continue
+            if uid not in waiting_now:
+                pending_map.pop(str(uid), None)   # 本轮已收敛，清掉旧的冷却标记
+        if on_progress:
+            on_progress(h, info)
+    return stats
 
 def reconcile_crc_sender(bvid: str, mid_hash: str, target_id: str | None = None) -> dict | None:
     """最新快照仍为纯破解时，唯一存在且其他全部明确缺失才分配 UID。"""

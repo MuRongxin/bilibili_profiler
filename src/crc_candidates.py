@@ -19,6 +19,36 @@ def is_pure_crc(sender: dict) -> bool:
                    for e in resolution.get("evidence") or [])
 
 
+def _as_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_verdict(raw, exists_ttl: float, missing_ttl: float, now: float) -> tuple:
+    """把核验来源统一成 (status, info, verified_at, fresh, final)。
+
+    兼容两种形状：新结论 dict（load_uid_verify_verdicts，带 verified_at/fresh/final）
+    与旧二元组 (status, info)（旧调用方与旧用例）。"""
+    if isinstance(raw, dict):
+        status = raw.get("status", "unknown")
+        info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+        at = _as_float(raw.get("verified_at"))
+        if "fresh" in raw:
+            fresh = bool(raw.get("fresh"))
+        else:
+            ttl = exists_ttl if status == "exists" else missing_ttl
+            fresh = 0 <= now - at < ttl
+        return status, info, at, fresh, bool(raw.get("final"))
+    if isinstance(raw, (tuple, list)) and raw:
+        status = raw[0]
+        info = raw[1] if len(raw) > 1 and isinstance(raw[1], dict) else {}
+        # 旧 loader 已按 TTL 过滤，拿到的即为新鲜结论
+        return status, info, 0.0, status != "unknown", bool(info.get("final"))
+    return "unknown", {}, 0.0, False, False
+
+
 def build_crc_groups(senders: list[dict], danmaku: list[dict], problems: dict,
                      false_positives: set, verifications: dict | None = None,
                      target_matches: list[dict] | None = None, verification_times: dict | None = None,
@@ -57,41 +87,61 @@ def build_crc_groups(senders: list[dict], danmaku: list[dict], problems: dict,
         recorded = resolution.get("candidate_status") or {}
         if not isinstance(recorded, dict):
             recorded = {}
+        checked = resolution.get("candidate_checked_at") or {}
+        checked = checked if isinstance(checked, dict) else {}
+        exists_ttl = getattr(config, "UID_VERIFY_EXISTS_TTL", 604800)
+        missing_ttl = getattr(config, "UID_VERIFY_MISSING_TTL", 3600)
         candidates = []
         for uid in uids:
             saved_card = (resolution.get("candidate_cards") or {}).get(str(uid))
             frozen = isinstance(saved_card, dict) and saved_card.get("uid") == uid
-            status, info = ((saved_card.get("status", "unknown"), saved_card) if frozen else
-                            (verifications or {}).get(uid, ("unknown", {})))
-            note = "最近核验结果" if status != "unknown" else "尚待验证"
-            if status == "unknown" and not frozen:
+            card_at = _as_float(checked.get(str(uid), resolution.get("checked_at", 0)))
+            # 结论来源：核验缓存优先，冻结名片若更新则覆盖（谁更新用谁）。
+            status, info, at, fresh, final = _read_verdict(
+                (verifications or {}).get(uid), exists_ttl, missing_ttl, now)
+            note = {"exists": "已核验存在", "not_exists": "已核验不存在"}.get(status, "尚待验证")
+            if frozen and card_at >= at:
+                status = saved_card.get("status", "unknown")
+                info = saved_card
+                at = card_at
+                final = bool(saved_card.get("final"))
+                fresh = 0 <= now - at < (exists_ttl if status == "exists" else missing_ttl)
+                note = saved_card.get("note") or note
+            if status == "unknown":
+                # 解析时记录过的结论：过期也不当作"未知"（那会让它重新变成可点击名片）
                 previous = recorded.get(str(uid))
-                ttl = getattr(config, "UID_VERIFY_EXISTS_TTL", 604800) if previous == "exists" else getattr(config, "UID_VERIFY_MISSING_TTL", 3600)
-                try:
-                    times = resolution.get("candidate_checked_at") or {}
-                    at = (times if isinstance(times, dict) else {}).get(str(uid), resolution.get("checked_at", 0))
-                    recent = (0 <= now - float(at) < ttl and
-                              (verification_times or {}).get(str(uid), -1) < float(at))
-                except (TypeError, ValueError):
-                    recent = False
-                if previous in ("exists", "not_exists") and recent:
-                    status, note = previous, "解析时的存在性核验"
-                elif previous in ("exists", "not_exists"):
-                    note = "旧存在性核验已过期，需复核"
-            candidates.append({"uid": uid, "status": status, "name": info.get("name", ""),
+                if previous in ("exists", "not_exists"):
+                    prev_at = _as_float(checked.get(str(uid), resolution.get("checked_at", 0)))
+                    ttl = exists_ttl if previous == "exists" else missing_ttl
+                    status, at = previous, prev_at
+                    fresh = 0 <= now - prev_at < ttl
+                    note = "解析时已核验"
+            if status == "not_exists" and not fresh:
+                note = (note or "已核验不存在") + "（结论已过期，待复核）"
+            elif status == "exists" and not fresh:
+                note = (note or "已核验存在") + "（结论已过期，待复核）"
+            # 硬约束：只有"新鲜核验为存在"的账号才允许出现跳转链接——过期的阳性结论
+            # 也可能早已注销，点进去就是 404，因此一律降级为待复核（纯文本）。
+            clickable = status == "exists" and fresh
+            candidates.append({"uid": uid, "status": status, "fresh": fresh, "final": final,
+                               "clickable": clickable,
+                               "name": info.get("name", ""),
                                "face": info.get("face", ""), "sign": info.get("sign", ""),
                                "card_ready": status == "not_exists" or (status == "exists" and "sign" in info and "face" in info),
-                               "note": saved_card.get("note", note) if frozen else "旧报告未保存完整候选资料，请重跑原命令补齐"})
-        exists = [c["uid"] for c in candidates if c["status"] == "exists"]
+                               "note": note})
+        # 判定只用"新鲜且已知"的证据；展示一律采用最新结论（三态见 render_crc_group）。
+        # 过期证据不得用于"唯一存在→升高 UID"，否则等于用陈旧信息给账号定性。
+        exists = [c["uid"] for c in candidates if c["status"] == "exists" and c["fresh"]]
         known = all(c["status"] != "unknown" for c in candidates)
+        fresh_all = all(c["fresh"] for c in candidates)
         complete = sender.get("_candidate_complete", resolution.get("candidate_version") == "mitm-v1")
-        resolved = (complete and known and len(exists) == 1 and sender.get("uid") == exists[0]
+        resolved = (complete and known and fresh_all and len(exists) == 1 and sender.get("uid") == exists[0]
                     and sender.get("confidence") == "高" and sender.get("method") == "CRC32破解")
         if resolved and not include_resolved:
             continue
         predicted = ((exists[0], "高", "CRC32破解") if len(exists) == 1 else
                      (None, "无", "候选歧义" if exists else "CRC32碰撞"))
-        needs_reconcile = known and (not complete or (sender.get("uid"), sender.get("confidence"), sender.get("method")) != predicted)
+        needs_reconcile = known and fresh_all and (not complete or (sender.get("uid"), sender.get("confidence"), sender.get("method")) != predicted)
         output.append({"mid_hash": h, "method": sender.get("method", ""), "reason": resolution.get("reason", ""),
                        "danmaku_count": sender.get("danmaku_count", len(rows)), "spam_level": spam,
                        "problems": problem_items, "samples": contents.most_common(5),
@@ -123,33 +173,56 @@ def render_candidate_card(c: dict, mid_hash: str, endpoint: str, mask: bool, mas
     status = ("高（存在性排除） · 唯一有效候选" if c.get("unique_verified") else
               "账号存在 · 身份未确认" if c.get("status") == "exists" else "存在性待验证 · 身份未确认")
     sign = c.get("sign") or ("未设置签名" if c.get("card_ready") else "签名未取得")
+    # 硬约束：只有"已核验存在"的候选才渲染成可点击链接——报告里绝不能出现点进去 404
+    # 的账号。调用方已按三态分流，这里是第二道防线（即使误传也不产生链接）。
+    clickable = c.get("status") == "exists" and c.get("clickable", True) is not False
+    head = (f'<a class="candidate-card" href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">'
+            if clickable else '<div class="candidate-card candidate-card-plain">')
+    tail_tag = "</a>" if clickable else "</div>"
     return f'''<article class="space-candidate" data-hash="{esc(mid_hash)}" data-uid="{uid}" data-endpoint="{esc(endpoint)}"
         data-card-ready="{'1' if c.get('card_ready') or not auto_load else '0'}">
-        <a class="candidate-card" href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">
+        {head}
             {avatar}<span class="candidate-info"><strong class="candidate-name">{esc(name or '昵称未取得')}</strong>
             <span class="candidate-sign">{esc(sign)}</span><span class="candidate-meta">UID:{esc(uid_disp)}
-            <span class="candidate-status">{esc(status)}</span></span></span><span class="candidate-arrow" aria-hidden="true">↗</span></a>
+            <span class="candidate-status">{esc(status)}</span></span></span><span class="candidate-arrow" aria-hidden="true">↗</span>{tail_tag}
         <div class="candidate-actions"><span class="candidate-card-note">{esc(c.get('note') or '命令行采集快照；缺失资料请重跑原分析命令补齐')}</span></div>
         <div class="space-result">{result or '<p class="chart-hint">命令行尚未保存空间辅助资料；此页不会补采。</p>'}</div></article>'''
 
 
 def render_crc_group(group: dict, endpoint: str, mask: bool, mask_name, mask_uid,
                      assessments: dict | None = None, assessment_renderer=None) -> str:
-    """匿名证据在上，全部候选按长条名片依次排列。"""
+    """匿名证据在上；三态分流——只有已核验存在的候选才可点击。
+
+    exists → 可点击名片；unknown / 结论过期 → 「待复核」纯文本（不给链接，避免点进去 404）；
+    not_exists → 「已排除账号」纯文本。"""
     h = group["mid_hash"]
-    exists = [c for c in group["candidates"] if c["status"] == "exists"]
-    unknown = any(c["status"] == "unknown" for c in group["candidates"])
-    unique = len(exists) == 1 and not unknown and group.get("candidate_complete", False)
-    candidates, missing = [], []
-    for c in group["candidates"]:
+    exists = [c for c in group["candidates"] if c["clickable"]]
+    pending = [c for c in group["candidates"] if not c["clickable"] and c["status"] != "not_exists"]
+    missing = [c for c in group["candidates"] if c["status"] == "not_exists"]
+    unique = (len(exists) == 1 and not pending and group.get("candidate_complete", False)
+              and all(c.get("fresh") for c in group["candidates"]))
+    candidates = []
+    for c in exists:
         uid = c["uid"]
-        uid_disp = mask_uid(uid) if mask else str(uid)
-        if c["status"] == "not_exists":
-            missing.append(f'<li>UID:{esc(uid_disp)} · 明确不存在 · {esc(c["note"])}</li>')
-            continue
         assessment = (assessments or {}).get((h, uid))
         result = assessment_renderer(assessment, mask, mask_name, mask_uid) if assessment and assessment_renderer else ""
         candidates.append(render_candidate_card({**c, "unique_verified": unique}, h, endpoint, mask, mask_name, mask_uid, result))
+
+    # 待复核：保留公开资料名片（便于人工核验），但**不给跳转**——未确认存在的 UID
+    # 点进去可能就是 404（render_candidate_card 内部对非 exists 只会渲染成 div）。
+    pending_cards = []
+    for c in pending:
+        uid = c["uid"]
+        assessment = (assessments or {}).get((h, uid))
+        result = assessment_renderer(assessment, mask, mask_name, mask_uid) if assessment and assessment_renderer else ""
+        pending_cards.append(render_candidate_card({**c, "unique_verified": False, "clickable": False},
+                                                  h, endpoint, mask, mask_name, mask_uid, result))
+
+    def _plain_line(c, tail):
+        uid_disp = mask_uid(c["uid"]) if mask else str(c["uid"])
+        return f'<li>UID:{esc(uid_disp)} · {esc(tail)} · {esc(c.get("note") or "")}</li>'
+
+    missing_html = "".join(_plain_line(c, "明确不存在") for c in missing)
     problems = "".join(f'''<li><span class="method-badge">{esc(it['category'])}</span> {esc(it['content'])}
             <span class="chart-hint">×{it['count']} · {esc(it.get('reason', ''))}</span></li>''' for it in group["problems"])
     matches = "".join(f'<li>{esc(c)}</li>' for c in group["matches"])
@@ -159,14 +232,17 @@ def render_crc_group(group: dict, endpoint: str, mask: bool, mask_name, mask_uid
     if group["spam_level"] in ("高", "中"):
         evidence += f'<details><summary>{esc(group["spam_level"])}风险刷屏 · 内容样本</summary><ul class="ov-list">{samples}</ul></details>'
     conclusion = ("搜索范围内唯一存在候选 · 高（存在性排除）" if unique
-                  else "搜索范围内候选均不存在" if not candidates else "候选身份未确认")
+                  else "搜索范围内候选均不存在" if missing and not candidates and not pending
+                  else f"候选身份未确认（{len(pending)} 个待复核）" if pending
+                  else "候选身份未确认")
     return f'''<section class="crc-sender" data-hash="{esc(h)}" data-endpoint="{esc(endpoint)}"
         data-uid="{group['candidates'][0]['uid']}" data-reconcile="{'1' if group.get('reconcile_needed') else '0'}"
         data-card-ready="{'0' if group.get('reconcile_needed') else '1'}"><div class="crc-heading"><b>匿名发送者 <code>{esc(h)}</code></b>
         <span class="hot-badge">{group['danmaku_count']} 条已采弹幕</span><span class="method-badge">{esc(group['method'])}</span>
         <span class="risk-badge">{esc(conclusion)}</span><span class="crc-status-note candidate-card-note" role="status"></span></div><p class="chart-hint">{esc(group['reason'])}</p>
         {evidence}<div class="crc-candidate-list">{''.join(candidates)}</div>
-        {'<details><summary>已排除账号（明确不存在）</summary><ul class="ov-list">' + ''.join(missing) + '</ul></details>' if missing else ''}</section>'''
+        {'<details open><summary>待复核账号（未确认存在，不提供跳转）</summary><div class="crc-candidate-list">' + ''.join(pending_cards) + '</div></details>' if pending_cards else ''}
+        {'<details><summary>已排除账号（明确不存在）</summary><ul class="ov-list">' + missing_html + '</ul></details>' if missing_html else ''}</section>'''
 
 
 def render_crc_groups(groups: list[dict], endpoint: str, mask: bool, mask_name, mask_uid,

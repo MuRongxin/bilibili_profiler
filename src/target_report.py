@@ -7,7 +7,7 @@ import config
 from report import REPORT_CSS, esc, js_json, generate_user_card
 from candidate_space import candidate_uids
 from crc_candidates import build_crc_groups, render_crc_groups, render_candidate_card
-from storage import load_uid_verify_cache
+from storage import load_uid_verify_verdicts
 from uid_resolver import UID_VERIFY_EXISTS_TTL, UID_VERIFY_MISSING_TTL
 from uid_evidence import confidence_label
 
@@ -88,8 +88,9 @@ def render_target_report(record: dict, args, mask: bool, mask_name, mask_uid,
     disp_uid = mask_uid if mask else str
     disp_name = mask_name if mask else str
     profile_pages = {p["uid"]: i // user_size + 1 for i, p in enumerate(profiles)}
-    verifications = load_uid_verify_cache(sorted({u for s in senders for u in candidate_uids(s)}),
-                                         UID_VERIFY_EXISTS_TTL, UID_VERIFY_MISSING_TTL)
+    # 展示用全部结论（含过期）：过期只标待复核，不把"已确认不存在"当未知而重新给出链接
+    verifications = load_uid_verify_verdicts(sorted({u for s in senders for u in candidate_uids(s)}),
+                                             UID_VERIFY_EXISTS_TTL, UID_VERIFY_MISSING_TTL)
 
     def pager(key, current, pages, tab):
         def link(n, label):
@@ -108,7 +109,13 @@ def render_target_report(record: dict, args, mask: bool, mask_name, mask_uid,
         space_items = []
         if sender.get("confidence") not in ("高", "中"):
             for candidate in candidate_uids(sender):
-                status, info = verifications.get(candidate, ("unknown", {}))
+                verdict = verifications.get(candidate) or {}
+                if isinstance(verdict, dict):        # 新形状：带 verified_at/fresh/final
+                    status = verdict.get("status", "unknown")
+                    info = verdict.get("info") if isinstance(verdict.get("info"), dict) else {}
+                else:                                 # 兼容旧二元组 (status, info)
+                    status = verdict[0] if verdict else "unknown"
+                    info = verdict[1] if len(verdict) > 1 and isinstance(verdict[1], dict) else {}
                 if status == "not_exists":
                     continue
                 assessment = (candidate_checks or {}).get((sender["mid_hash"], candidate))

@@ -1243,6 +1243,43 @@ def load_uid_verify_cache(uids: list[int], exists_ttl: float, missing_ttl: float
     return result
 
 
+def load_uid_verify_verdicts(uids: list, exists_ttl: float, missing_ttl: float) -> dict:
+    """读取**全部**存在性结论（含已过期），供报告展示与终审复核使用。
+
+    与 load_uid_verify_cache 的分工：
+      - load_uid_verify_cache：只返回"仍然有效"的结论 → 用于**判定**（能否作为
+        "唯一存在→升高 UID"的证据；过期证据不可用，语义不变）；
+      - 本函数：结论一律返回，并附带 verified_at / fresh / final → 用于**展示**。
+    展示层若因 TTL 把"已确认不存在"当成"未知"，就会把它重新渲染成可点击名片，
+    这正是"报告里点进去是 404"的根因（阴性结论此前只缓存 1 小时）。
+    """
+    result, now = {}, time.time()
+    with closing(get_db()) as conn:
+        for start in range(0, len(uids), 500):
+            chunk = uids[start:start + 500]
+            marks = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT * FROM uid_verify_cache WHERE uid IN ({marks})", chunk).fetchall()
+            for row in rows:
+                if row["status"] not in ("exists", "not_exists"):
+                    continue
+                try:
+                    info = json.loads(row["info_json"])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(info, dict):
+                    continue
+                # exists 必须与记录的 uid 自洽（防损坏记录被当成有效名片）
+                if row["status"] == "exists" and info.get("uid") != row["uid"]:
+                    continue
+                ttl = exists_ttl if row["status"] == "exists" else missing_ttl
+                result[row["uid"]] = {"status": row["status"], "info": info,
+                                      "verified_at": row["verified_at"],
+                                      "fresh": 0 <= now - row["verified_at"] < ttl,
+                                      "final": bool(info.get("final"))}
+    return result
+
+
 def save_uid_verify_cache(uid: int, status: str, info: dict, verified_at: float | None = None):
     if status not in ("exists", "not_exists"):
         return

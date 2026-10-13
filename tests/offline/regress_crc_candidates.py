@@ -144,7 +144,12 @@ def recorded_status():
     row["resolution"]["candidate_status"] = {str(A): "exists", str(B): "not_exists"}
     assert [c["status"] for c in groups(row=row)[0]["candidates"]] == ["exists", "not_exists"]
     row["resolution"]["checked_at"] = time.time() - 8 * 86400
-    assert all(c["status"] == "unknown" for c in groups(row=row)[0]["candidates"])
+    out = groups(row=row)[0]
+    # 新语义：过期只降级为"待复核/不可点击"，不把结论抹成未知——否则它会被重新
+    # 渲染成可点击名片，点进去就是 404（这正是本用例要防的回归）。
+    assert [c["status"] for c in out["candidates"]] == ["exists", "not_exists"]
+    assert not any(c["clickable"] for c in out["candidates"])
+    assert f"space.bilibili.com/{A}" not in crc.render_crc_groups([out], "/endpoint", False, str, str)
 
 
 @case("新解析保留全部候选的验证状态，不改变原置信度规则")
@@ -350,7 +355,10 @@ def long_card():
     out = groups(verifications={A: ("exists", {"name": "离线昵称甲", "face": "http://i0.hdslb.com/test.png", "sign": "公开签名"})})
     root = parser.fromstring(crc.render_crc_groups(out, "/endpoint", False, str, str))
     anchors = root.xpath('//a[@class="candidate-card"]')
-    assert len(anchors) == 2 and anchors[0].get("href") == f"https://space.bilibili.com/{A}"
+    # 只有 A 有核验结论；B 未核验 → 必须不可点击（旧版会把未核验候选也渲染成链接）
+    assert len(anchors) == 1 and anchors[0].get("href") == f"https://space.bilibili.com/{A}"
+    plain = crc.render_crc_groups(out, "/endpoint", False, str, str)
+    assert f"space.bilibili.com/{B}" not in plain and "待复核账号" in plain
     assert "公开签名" in anchors[0].text_content() and str(A) in anchors[0].text_content()
     assert anchors[0].xpath('.//img')[0].get("src") == "https://i0.hdslb.com/test.png"
     assert not anchors[0].xpath('.//button') and not root.xpath('//details[@class="space-candidate"]')
@@ -484,7 +492,10 @@ def negative_age():
     out = groups(row=row, verifications={A: ("exists", {"uid": A})})
     with patch.object(crc.time, "time", return_value=at + cards.UID_VERIFY_MISSING_TTL + 1):
         out = groups(row=row, verifications={A: ("exists", {"uid": A})})
-    assert out[0]["candidates"][1]["status"] == "unknown"
+    # 阴性结论过期后保留（只降级为不可点击），不再退回"未知"——否则会被重新渲染成
+    # 可点击名片，点进去就是 404
+    assert out[0]["candidates"][1]["status"] == "not_exists"
+    assert out[0]["candidates"][1]["clickable"] is False
 
 
 @case("旧空间样本不覆盖较新的-404存在性结论")
@@ -704,8 +715,12 @@ def expired_negative_does_not_revive_positive():
     latest = time.time() - cards.UID_VERIFY_MISSING_TTL - 1
     storage.save_uid_verify_cache(A, "not_exists", {}, latest)
     storage.save_uid_verify_cache(B, "not_exists", {})
-    out = groups(row=row, verifications={B: ("not_exists", {})}, verification_times={str(A): latest})
-    assert out[0]["candidates"][0]["status"] == "unknown"
+    # 页面按"全部结论"读取（load_uid_verify_verdicts），与真实调用链一致
+    verdicts = storage.load_uid_verify_verdicts([A, B], 7 * 86400, 3600)
+    out = groups(row=row, verifications=verdicts, verification_times={str(A): latest})
+    # 较新的阴性（虽已过期）作准，不复活更旧的阳性快照；且不可点击
+    assert out[0]["candidates"][0]["status"] == "not_exists"
+    assert out[0]["candidates"][0]["clickable"] is False
     updated = cards.reconcile_crc_sender(BV, H)
     assert updated["uid"] is None and updated["method"] == "待验证"
 
@@ -732,7 +747,8 @@ def stale_high_retained():
     row["resolution"].update(candidate_version="mitm-v1", candidate_status={str(A): "exists", str(B): "not_exists"},
                              candidate_checked_at={str(A): time.time(), str(B): time.time() - cards.UID_VERIFY_MISSING_TTL - 1})
     out = groups(row=row, verifications={A: ("exists", {"uid": A})})
-    assert len(out) == 1 and out[0]["candidates"][1]["status"] == "unknown"
+    assert len(out) == 1 and out[0]["candidates"][1]["status"] == "not_exists"
+    assert out[0]["candidates"][1]["clickable"] is False   # 旧核验过期 → 待复核，不给跳转
 
 
 @case("已有完整缓存但尚未同步高分级的条目仍显示，回写完成才移除")

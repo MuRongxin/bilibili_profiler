@@ -146,6 +146,18 @@ MITM_MAX_UID = 10_000_000_000   # MITM 覆盖 ≤10 位 UID；长 UID 可明文�
 UID_VERIFY_EXISTS_TTL = 7 * 86400  # 存在名片缓存 7 天
 UID_VERIFY_MISSING_TTL = 3600     # 明确 -404 缓存 1 小时，风控/网络/空名片不缓存
 UID_VERIFY_FALLBACK_BUDGET = 50   # 一轮解析的单点补验请求上限，批量缺席也需单点确认
+# 终审复核（阶段9）：一个 mid_hash 解出多个 UID 且无明文可交叉验证时，在流程末尾逐一复核
+# 存在性。若出现"之前 404、现在又不是 404"的账号，说明此前那次 404 不可信（疑似风控），
+# 等待后继续复核，直到一轮内没有任何翻案；仍为明确 -404 的候选累计确认达
+# UID_RECHECK_CONFIRMATIONS 次后标 final（彻底判定不存在，报告里不再作为候选展示）。
+# 必须有终止条件：单轮预算 + 最大轮数 + 风控熔断，未收敛的冷却后下次运行继续。
+UID_RECHECK_ENABLED = os.environ.get("UID_RECHECK_ENABLED", "1") not in ("0", "false", "False")
+UID_RECHECK_MAX_ROUNDS = 3          # 同进程最多复核轮数
+UID_RECHECK_INTERVAL = 90           # 轮间隔（秒）；仅在有翻案/未查成、需要重试时等待
+UID_RECHECK_BUDGET = 50             # 单轮复核请求上限
+UID_RECHECK_COOLDOWN = 1800         # 未收敛时下次运行再复核的冷却（秒）
+UID_RECHECK_CONFIRMATIONS = 2       # 连续明确 -404 达该次数才判 final
+UID_RECHECK_FINAL_TTL = 30 * 86400  # final 结论 30 天后允许被新的"存在"结论覆盖
 UID_RESOLUTION_CACHE_TTL = 86400  # 解析结论一天复核；版本/证据变化立即失效
 UID_HARVEST_REFRESH_MAX_PAGES = 10  # 已完成 UID 收割后的刷新请求上限，按本视频评论 ID 停止
 UID_REPLY_TOTAL_PAGES = 10        # 每轮面向未关联兴趣 hash 的楼中楼 UID 补采总请求预算，0=关闭
