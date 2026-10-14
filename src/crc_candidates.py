@@ -312,8 +312,8 @@ def render_crc_groups(groups: list[dict], endpoint: str, mask: bool, mask_name, 
                       assessments: dict | None = None, assessment_renderer=None,
                       target_mode: bool = False) -> str:
     if not groups:
-        return '''<div class="crc-candidates" data-count="0"><p class="empty-note">暂无待复核的纯 CRC32 候选记录。
-            未完成的核验已在命令行阶段隐藏；请重跑命令行分析后再生成报告。</p></div>'''
+        return '''<div class="crc-candidates" data-count="0"><p class="empty-note">暂无可展示的纯 CRC32 候选记录（暂无待复核项）。
+            已完成终审并排除的候选不会显示；若本次命令行分析中断，请重跑分析后再生成报告。</p></div>'''
     scope = ("本页列出本次目标筛选中的纯破解候选；命中筛选不等于问题判定。"
              if target_mode else "本页集中列出有问题弹幕或高中风险刷屏、且解析时没有明文来源佐证的记录。")
     head = f'''<p class="chart-hint">{scope} 共 <span data-crc-total>{len(groups)}</span> 个匿名发送者。候选核验在命令行阶段完成，未完成的候选不会在报告中展示。</p>

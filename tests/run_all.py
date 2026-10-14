@@ -11,6 +11,7 @@
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,7 @@ def pick_python() -> str:
 
 PY = pick_python()
 SCRIPTS = [
+    "tests/offline/regress_runner.py",        # 脚本超时与异常退出隔离，超时后继续后续测试
     "tests/offline/regress_target_analysis.py", # 目标筛选、存档隔离、多分P原文和命令行接线
     "tests/offline/regress_target_lookup.py",   # 目标轻量取数、找到即停、原文留存与独立续页
     "tests/offline/regress_candidate_space.py", # 候选空间按需核验、缓存隔离、关联边界与路由防护
@@ -73,6 +75,7 @@ SCRIPTS = [
     "tests/offline/regress_web_review.py",      # Web 报告审查：回复前缀遮蔽、页缓存、删除互斥等
 ]
 SUMMARY_RE = re.compile(r"(\d+) 项通过,\s*(\d+) 项失败")
+OFFLINE_TIMEOUT_SECONDS = 180
 
 
 def ensure_local_config() -> None:
@@ -88,12 +91,24 @@ def run_offline() -> tuple[int, int, list[str]]:
     passed = failed = 0
     bad: list[str] = []
     for rel in SCRIPTS:
-        print(f"\n=== {rel} ===")
+        print(f"\n=== {rel} ===", flush=True)
         # 显式 UTF-8：用例打印 ✔/✘ 与中文，Windows 默认 cp1252 会 UnicodeEncodeError
-        proc = subprocess.run([PY, str(ROOT / rel)], cwd=str(ROOT),
-                              capture_output=True, text=True,
-                              encoding="utf-8", errors="replace")
-        out = (proc.stdout or "") + (proc.stderr or "")
+        # 文件捕获避免 Windows 管道读取线程因继承的句柄长期等待；单脚本超时须记失败而非挂住整轮。
+        with tempfile.TemporaryFile() as output:
+            try:
+                proc = subprocess.run([PY, "-u", str(ROOT / rel)], cwd=str(ROOT),
+                                      stdout=output, stderr=subprocess.STDOUT,
+                                      timeout=OFFLINE_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                output.seek(0)
+                out = output.read().decode("utf-8", errors="replace")
+                print(f"  脚本超过 {OFFLINE_TIMEOUT_SECONDS}s，已终止并记为失败；最后输出：")
+                print("  " + "\n  ".join(out.strip().splitlines()[-12:]))
+                failed += 1
+                bad.append(rel)
+                continue
+            output.seek(0)
+            out = output.read().decode("utf-8", errors="replace")
         hits = SUMMARY_RE.findall(out)
         if hits:
             p, f = int(hits[-1][0]), int(hits[-1][1])

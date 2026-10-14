@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import traceback
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -333,6 +333,46 @@ def _():
         assert "订阅凭证不可输出" not in text and "abcd1234" not in text
 
 
+@case("Windows 存活查询只读句柄，绝不发送 os.kill 控制台信号")
+def _():
+    kernel = Mock()
+    kernel.OpenProcess.return_value = 123
+    with patch.object(pc.sys, "platform", "win32"), \
+            patch.object(pc.ctypes, "WinDLL", return_value=kernel, create=True), \
+            patch.object(pc.os, "kill", side_effect=AssertionError("Windows 不允许用信号探测进程")):
+        kernel.WaitForSingleObject.return_value = 258  # WAIT_TIMEOUT：仍在运行
+        assert pc._pid_alive(1000) is True
+        kernel.WaitForSingleObject.return_value = 0    # WAIT_OBJECT_0：已退出
+        assert pc._pid_alive(1000) is False
+        kernel.WaitForSingleObject.return_value = 0xFFFFFFFF  # WAIT_FAILED：保守保留目录
+        assert pc._pid_alive(1000) is True
+    assert kernel.OpenProcess.call_args.args == (0x00100000, False, 1000)
+    assert kernel.WaitForSingleObject.call_args.args == (123, 0)
+    assert kernel.CloseHandle.call_count == 3
+
+
+@case("Windows 无效PID可排除，访问拒绝及查询失败不误删目录")
+def _():
+    kernel = Mock()
+    kernel.OpenProcess.return_value = None
+    with patch.object(pc.sys, "platform", "win32"), \
+            patch.object(pc.ctypes, "WinDLL", return_value=kernel, create=True), \
+            patch.object(pc.ctypes, "get_last_error", return_value=87, create=True) as error, \
+            patch.object(pc.os, "kill", side_effect=AssertionError("不得发信号")):
+        assert pc._pid_alive(1000) is False
+        error.return_value = 5  # ERROR_ACCESS_DENIED
+        assert pc._pid_alive(1000) is True
+        error.return_value = 999
+        assert pc._pid_alive(1000) is True
+        assert not pc._pid_alive(0) and not pc._pid_alive(0x100000000)
+        kernel.CloseHandle.assert_not_called()
+
+
+@case("进程存活探测自身不会退出或向控制台发送中断")
+def _():
+    assert pc._pid_alive(pc.os.getpid()) is True
+
+
 @case("有摘要则必须一致才执行，无摘要的手动二进制允许并警告")
 def _():
     import hashlib
@@ -356,6 +396,7 @@ def _():
 def main():
     passed = failed = 0
     for name, fn in CASES:
+        print(f"  执行: {name}", flush=True)
         try:
             fn()
             passed += 1

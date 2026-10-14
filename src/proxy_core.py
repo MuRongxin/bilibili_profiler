@@ -238,10 +238,39 @@ def _popen_on_spawn_thread(*args, **kwargs) -> subprocess.Popen:
     return value
 
 
+def _windows_pid_alive(pid: int) -> bool:
+    """Windows 只查询进程句柄，不发送控制台事件或终止进程。失败保守视为存活。"""
+    from ctypes import wintypes
+
+    try:
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        # 只申请 SYNCHRONIZE，0 毫秒等待：运行中返回 WAIT_TIMEOUT，已退出返回 WAIT_OBJECT_0。
+        handle = kernel.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER：PID 不存在；其余错误不贸然删除。
+        try:
+            return kernel.WaitForSingleObject(handle, 0) != 0
+        finally:
+            kernel.CloseHandle(handle)
+    except OSError:
+        return True
+
+
 def _pid_alive(pid: int) -> bool:
     """pid 是否仍有进程。权限不足视为存活，避免误删别人的运行目录。"""
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        # Windows 的 os.kill(pid, 0) 会发送 CTRL_C_EVENT，可能中断同控制台的 CI 父进程。
+        if pid > 0xFFFFFFFF:
+            return False
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
