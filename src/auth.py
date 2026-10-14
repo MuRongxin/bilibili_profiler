@@ -39,6 +39,42 @@ def _pop_local_fields(cookie_dict: dict) -> tuple:
     return token, stamp
 
 
+def _replace_cookie_jar(client, cookies: dict) -> None:
+    """用去重后的 dict 清空并重建 jar，domain 统一为 .bilibili.com。
+
+    刷新成功后空域旧 SESSDATA 会和 .bilibili.com 的新 SESSDATA 并存。
+    本地伪字段（refresh_token 等）绝不写进 session。没有真实 jar 的替身客户端直接跳过。
+    """
+    session = getattr(client, "session", None)
+    jar = getattr(session, "cookies", None) if session is not None else None
+    if jar is None or not hasattr(jar, "clear") or not hasattr(jar, "set"):
+        return
+    clean = {}
+    for name, value in cookies.items():
+        if name in _LOCAL_FIELDS or value is None:
+            continue
+        clean[str(name)] = str(value)
+    lock = getattr(client, "_lock", None)
+
+    def _rebuild():
+        jar.clear()
+        for name, value in clean.items():
+            jar.set(name, value, domain=".bilibili.com")
+
+    if lock is not None:
+        with lock:
+            _rebuild()
+    else:
+        _rebuild()
+
+
+def _clear_refresh_state(client) -> None:
+    """重扫成功前丢掉旧令牌，避免响应没下发新令牌时把失效令牌写回。"""
+    for attr in _LOCAL_FIELDS:
+        if hasattr(client, attr):
+            delattr(client, attr)
+
+
 class RefreshResult(str):
     """cookie 刷新结果三态。
 
@@ -252,8 +288,10 @@ def save_cookie_if_current(client, path: str | None = None) -> bool:
     与刷新动作串行化。返回是否真的写了。"""
     with _refresh_lock(path):
         disk = load_cookie(path) or {}
-        current = getattr(client, "_refresh_token", None)
-        if current and disk.get("_refresh_token") not in (None, "", current):
+        current = getattr(client, "_refresh_token", None) or ""
+        disk_token = disk.get("_refresh_token") or ""
+        # 磁盘有令牌且与本进程不同（含本进程为空）就跳过，避免抹掉别的进程刚写的令牌
+        if disk_token and disk_token != current:
             print("[Auth] 跳过回写: 磁盘上的登录态比本进程新（另一进程已刷新）")
             return False
         save_cookie(client, path)
@@ -339,6 +377,7 @@ def _try_refresh_cookie(client: BiliAPIClient, path: str | None = None) -> Refre
                     "source": "main_web",
                 },
                 cookies={"buvid3": str(uuid.uuid1())},
+                max_attempts=1,
             )
             if data.get("code") != 0:
                 code = data.get("code")
@@ -350,6 +389,8 @@ def _try_refresh_cookie(client: BiliAPIClient, path: str | None = None) -> Refre
             # Step 4: 更新 cookies（Step 3 的新 cookie 已自动写入 session，直接读取）
             new_cookies = client.get_cookies_dict()
             new_refresh_token = (data.get("data") or {}).get("refresh_token", "")
+            # 去重重建 jar。refresh_token 只留在客户端属性上，不进 session。
+            _replace_cookie_jar(client, new_cookies)
 
             client._refresh_token = new_refresh_token or refresh_token
             client._refreshed_at = time.time()      # 续期节流依据（随文件落盘）
@@ -369,6 +410,7 @@ def _try_refresh_cookie(client: BiliAPIClient, path: str | None = None) -> Refre
                     "csrf": new_cookies.get("bili_jct", ""),
                     "refresh_token": refresh_token,
                 },
+                max_attempts=1,
             )
             if confirm.get("code") != 0:
                 print(f"[Auth] 警告: 刷新确认接口返回异常: code={confirm.get('code')} "
@@ -389,10 +431,12 @@ def login_by_qrcode() -> BiliAPIClient:
     # 尝试加载已有cookie
     cookie_dict = load_cookie()
     if cookie_dict:
-        refresh_token = cookie_dict.pop("_refresh_token", None)
+        refresh_token, stamp = _pop_local_fields(cookie_dict)
         client.update_cookies(cookie_dict)
         if refresh_token:
             client._refresh_token = refresh_token
+        if stamp:
+            client._refreshed_at = stamp
 
         if verify_cookie(client):
             # 主号同样到期前主动续期（失败不影响本次使用）
@@ -431,7 +475,8 @@ def login_by_qrcode() -> BiliAPIClient:
         code = (result.get("data") or {}).get("code", -1)
 
         if code == 0:
-            # 从扫码响应中提取 refresh_token
+            # 先清掉加载阶段留下的旧令牌，再按本次响应赋值
+            _clear_refresh_state(client)
             refresh_token = (result.get("data") or {}).get("refresh_token", "")
             if refresh_token:
                 client._refresh_token = refresh_token

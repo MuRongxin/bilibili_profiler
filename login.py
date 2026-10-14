@@ -106,7 +106,10 @@ def main():
         code = (result.get("data") or {}).get("code", -1)
 
         if code == 0:
-            # 从扫码响应中提取 refresh_token（用于后续 cookie 自动刷新）
+            # 先清掉旧的刷新令牌和时间戳，响应没有新令牌就不要把失效令牌写回
+            for attr in ("_refresh_token", "_refreshed_at"):
+                if hasattr(client, attr):
+                    delattr(client, attr)
             refresh_token = (result.get("data") or {}).get("refresh_token", "")
             if refresh_token:
                 client._refresh_token = refresh_token

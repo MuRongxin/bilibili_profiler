@@ -207,6 +207,27 @@ same._refresh_token = "disk_new"
 wrote2 = auth.save_cookie_if_current(same, path)
 check("令牌一致时正常回写", wrote2 is True and read_cookie(path).get("SESSDATA") == "S")
 
+write_cookie(path, token="disk_kept", sessdata="KEEP")
+empty = FakeClient()
+wrote3 = auth.save_cookie_if_current(empty, path)
+after3 = read_cookie(path)
+check("本进程没有令牌但磁盘有时不整份覆盖",
+      wrote3 is False and after3.get("_refresh_token") == "disk_kept"
+      and after3.get("SESSDATA") == "KEEP")
+
+# 刷新后的 jar：空域旧值和统一域新值不能并存，刷新令牌不进 session
+from api_client import BiliAPIClient
+jar_client = BiliAPIClient()
+jar_client.session.cookies.set("SESSDATA", "old", domain="")
+jar_client.session.cookies.set("SESSDATA", "new", domain=".bilibili.com")
+auth._replace_cookie_jar(jar_client, {
+    "SESSDATA": "new", "bili_jct": "J", "_refresh_token": "不得入库", "_refreshed_at": "1"})
+kept = [(c.name, c.value, c.domain) for c in jar_client.session.cookies]
+check("刷新后重建 jar：只留统一域，刷新令牌不进 session",
+      ("_refresh_token", "不得入库") not in [(n, v) for n, v, _d in kept]
+      and [item for item in kept if item[0] == "SESSDATA"] == [("SESSDATA", "new", ".bilibili.com")]
+      and ("bili_jct", "J", ".bilibili.com") in kept)
+
 
 # ---------- 9) 跨进程锁：真实互斥 ----------
 order = []

@@ -80,5 +80,46 @@ finally:
 check("刷新令牌缺失时进入扫码", bool(qr_calls))
 check("扫码成功保存对应小号文件", saved == [COOKIE_PATH])
 
+
+print("=== 3. 重扫成功先清旧令牌，响应没下发新令牌就不写回 ===")
+client = FakeClient()
+client._refresh_token = "expired"
+client._refreshed_at = 1.0
+saved_clients = []
+login.BiliAPIClient = lambda: client
+login.load_cookie = lambda path: {
+    "SESSDATA": "masked", "_refresh_token": "expired", "_refreshed_at": "1"}
+login.verify_cookie = lambda c: False
+login._try_refresh_cookie = lambda c, path: False
+login.get_qrcode = lambda: ("https://qrcode.invalid", "key")
+login.generate_qrcode_image = lambda url, path: None
+login.poll_qrcode = lambda key, c: {"data": {"code": 0}}
+login.save_cookie = lambda c, path: saved_clients.append((path, hasattr(c, "_refresh_token"), hasattr(c, "_refreshed_at")))
+sys.argv = ["login.py", "alt1"]
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        login.main()
+finally:
+    sys.argv = old_argv
+check("无新令牌时旧刷新令牌和时间戳都不再写回",
+      saved_clients == [(COOKIE_PATH, False, False)])
+
+client = FakeClient()
+client._refresh_token = "expired"
+client._refreshed_at = 1.0
+login.BiliAPIClient = lambda: client
+login.poll_qrcode = lambda key, c: {"data": {"code": 0, "refresh_token": "fresh"}}
+captured = {}
+login.save_cookie = lambda c, path: captured.update(
+    token=getattr(c, "_refresh_token", None), stamp=getattr(c, "_refreshed_at", None))
+sys.argv = ["login.py", "alt1"]
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        login.main()
+finally:
+    sys.argv = old_argv
+check("响应有新令牌时按本次响应重新赋值",
+      captured.get("token") == "fresh" and captured.get("stamp"))
+
 print("\n回归结果: %d 项通过, %d 项失败" % (ok, fail))
 sys.exit(1 if fail else 0)

@@ -310,7 +310,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（517 项离线回归，无需外网与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查。代理改动可额外运行 `python tests/offline/regress_proxy_pool.py --mihomo`，用已有核心和本机临时 HTTPS 服务验证真实路由，不访问外网。
+- 现有离线检查手段：**`python tests/run_all.py`**（608 项离线回归，无需外网与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查。代理改动可额外运行 `python tests/offline/regress_proxy_pool.py --mihomo`，用已有核心和本机临时 HTTPS 服务验证真实路由，不访问外网。
 
 ## 免责声明
 
@@ -381,3 +381,5 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ---
 
 如果这个项目对你有帮助，欢迎 Star 或 Fork。
+
+CRC32 候选解析先核验账号是否存在，再检查已存在账号的等级。明确 404 或明确 Lv0 的候选被排除；全部 404 时跳过等级检查。报告只展示尚未排除的候选，唯一可行 UID 可进入高置信度画像，全部排除时不分配 UID。等级字段缺失时最多补读一次，网络异常和风控由 API 层退避重试并保留未知，绝不按缺失字段排除。

@@ -188,8 +188,34 @@ def safe_url(url):
 
 
 def js_json(obj):
-    """json.dumps 后转义 </，防 </script> 截断逃逸"""
-    return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
+    """json.dumps 后把 < 换成 \\u003c。
+
+    只转义 </ 挡不住 <!--：HTML 解析器会把 <script> 里的注释一直吃到页面后面。
+    \\u003c 仍是合法 JSON 转义，JS 解析后还原为 <。"""
+    return json.dumps(obj, ensure_ascii=False).replace("<", "\\u003c")
+
+
+# 楼中楼正文开头的「回复 @昵称 :」。昵称本身可能含空格，以冒号收束。
+_REPLY_AT_RE = re.compile(r"^(\s*回复\s*@)(.+?)(\s*[:：])")
+
+
+def mask_reply_prefix(text, mask, mask_name) -> str:
+    """mask 为真时，把正文开头「回复 @昵称」里的昵称按 mask_name 同规则遮蔽。
+
+    mask_name 由调用方传入（与昵称遮蔽同一实现，只留末字、其余用颜文字）。
+    没有该前缀的正文原样返回。"""
+    if text is None:
+        return ""
+    s = str(text)
+    if not mask or mask_name is None:
+        return s
+    m = _REPLY_AT_RE.match(s)
+    if not m:
+        return s
+    nick = m.group(2).strip()
+    if not nick:
+        return s
+    return m.group(1) + mask_name(nick) + m.group(3) + s[m.end():]
 
 
 # 纯 CRC 来源的解析方式：这些 UID 是"算出来的"，必须新鲜核验为存在才允许跳转；
@@ -202,7 +228,7 @@ def uid_linkable(profile: dict) -> bool:
 
     硬要求：报告里不能出现点进去 404 的账号。明文来源直接放行；纯 CRC 来源必须满足
     candidate_status[uid] == "exists" 且核验时间在 UID_VERIFY_EXISTS_TTL 内——过期的
-    阳性结论也可能早已注销，一律降级为不可点击（纯文本）。"""
+    账号存在结论也可能早已注销，一律降级为不可点击（纯文本）。"""
     method = str(profile.get("resolve_method") or "")
     if method not in _CRC_RESOLVE_METHODS:
         return True
@@ -214,8 +240,12 @@ def uid_linkable(profile: dict) -> bool:
     if not isinstance(status_map, dict) or status_map.get(str(uid)) != "exists":
         return False
     checked = resolution.get("candidate_checked_at")
-    at = (checked or {}).get(str(uid)) if isinstance(checked, dict) else None
-    at = at or resolution.get("checked_at")
+    # checked_at 是解析时刻，不是名片核验时刻，缺核验时间不得回退、不可点击
+    if not isinstance(checked, dict):
+        return False
+    at = checked.get(str(uid))
+    if at is None:
+        return False
     try:
         ttl = getattr(config, "UID_VERIFY_EXISTS_TTL", 7 * 86400)
         return 0 <= time.time() - float(at) < ttl
@@ -223,8 +253,11 @@ def uid_linkable(profile: dict) -> bool:
         return False
 
 
-def generate_user_card(profile: dict) -> str:
-    """生成单个用户的画像卡片HTML"""
+def generate_user_card(profile: dict, mask: bool = False, mask_name=None) -> str:
+    """生成单个用户的画像卡片HTML。
+
+    mask/mask_name：隐藏信息开启时遮蔽评论正文里「回复 @昵称」前缀（与昵称同一规则）。
+    不传则不遮蔽，既有调用保持原样。"""
     uid = profile.get("uid", 0)
     # 隐藏信息（web.py mask Cookie 开启时注入 _uid_disp）：可见 UID 文本用遮蔽值；
     # href/id 锚点/data-* 保持原值（链接仍指向真实 /user/<uid>，属已知取舍）
@@ -428,7 +461,8 @@ def generate_user_card(profile: dict) -> str:
             date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
             sub_mark = '<span class="dm-time">回复</span> ' if c.get("is_sub") else ""
             problem_chip = _category_chips([c["problem"]]) if c.get("problem") else ""
-            items.append(f"<li>{sub_mark}{esc(c.get('content',''))} "
+            content = mask_reply_prefix(c.get("content", ""), mask, mask_name)
+            items.append(f"<li>{sub_mark}{esc(content)} "
                          f"<span class=\"dm-time\">👍{c.get('like',0)} {date}</span>{problem_chip}</li>")
         cmt_section = f'''
             <div class="section">
@@ -459,7 +493,8 @@ def generate_user_card(profile: dict) -> str:
                 date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
                 sub_mark = '<span class="dm-time">回复</span> ' if c.get("is_sub") else ""
                 problem_chip = _category_chips([c["problem"]]) if c.get("problem") else ""
-                cmt_lis.append(f'<li>{sub_mark}{esc(c.get("content", ""))} '
+                content = mask_reply_prefix(c.get("content", ""), mask, mask_name)
+                cmt_lis.append(f'<li>{sub_mark}{esc(content)} '
                                f'<span class="dm-time">👍{c.get("like", 0)} {date}</span>{problem_chip}</li>')
             cmt_html = "".join(cmt_lis) or (
                 '<li class="ov-none">评论未留存（该视频为旧版本分析）</li>'
