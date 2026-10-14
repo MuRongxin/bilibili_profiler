@@ -332,6 +332,21 @@ check("标注失败静默降级、不挂峰值",
       failed is not None and not any(p.get("peaks") for p in failed["pages"]))
 
 
+# 长条卡片只展示未生成画像用户，并保留本视频发言和安全链接。
+light_senders = [{"uid": 778899, "mid_hash": "abcd", "method": "评论区验证", "danmaku_count": 2,
+                  "contents": ["<script>弹幕</script>", "第二条"], "resolution": {}, "spam_level": "中"},
+                 {"uid": 998877, "mid_hash": "efgh", "method": "CRC32破解", "danmaku_count": 1,
+                  "contents": ["待核验"], "resolution": {}}]
+with patch.object(web, "load_senders", return_value=light_senders), patch.object(web, "load_comments", return_value=[
+    {"uid": 778899, "uname": "轻量用户甲", "content": REPLY}]):
+    light = web._light_user_cards("BVlight", [], False, set())
+    hidden = web._light_user_cards("BVlight", [], True, set())
+    covered = web._light_user_cards("BVlight", [{"uid": 778899}], False, set())
+check("长条展示弹幕评论并转义脚本", "第二条" in light and REPLY in light and "&lt;script&gt;" in light)
+check("明文账号卡片可直达空间，未知CRC不给空间链接", 'href="https://space.bilibili.com/778899"' in light and 'href="https://space.bilibili.com/998877"' not in light)
+check("长条遮蔽昵称UID及回复前缀", "轻量用户甲" not in hidden and NICK not in hidden and "UID:778899" not in hidden)
+check("已有完整画像不重复展示长条", "第二条" not in covered and "待核验" in covered)
+
 print("")
 print("==== Web 报告审查: %d 项通过, %d 项失败 ====" % (ok, fail))
 sys.exit(1 if fail else 0)

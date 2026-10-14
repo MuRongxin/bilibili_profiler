@@ -14,6 +14,7 @@ import threading
 import time
 from datetime import datetime
 
+import config
 from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USERS_RATIO,
                     LLM_API_KEY, LLM_DEEP_ENABLED, HISTORY_DANMAKU_ENABLED, REPORT_DIR,
                     COMMENT_AUTHOR_MIN_SEVERITY, COMMENT_AUTHOR_MIN_HITS,
@@ -575,7 +576,7 @@ def phase_comment_cringe(comments: list, video_info: dict) -> dict | None:
 def phase_collect_users(resolved: dict, pool, max_users: int | None = None, force: bool = False,
                          cache_only: bool = False):
     """阶段5: 深度采集用户数据（名单已由阶段4兴趣定员；max_users 为手动硬上限
-    （--max-users 传入时），None 不截断；成功立即落库可断点续采；force=True 跳过缓存强制重采）
+    （--max-users 传入时），None 默认采集100人；成功立即落库可断点续采；force=True 跳过缓存强制重采）
 
     cache_only=True（--skip-collect）：只读库内已采数据，完全不发起网络请求——阶段5
     请求量最大（每人约 21 个请求）、最易触发风控；未采用户本轮不生成画像，去掉参数重跑即续采。
@@ -583,6 +584,8 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
     组合池（ComboPool）：每个请求由池透明接管，风控保留节点并进入出口冷却，
     代理连接故障才切节点；预算耗尽抛 RiskControlError，本 uid 按失败跳过。"""
     print("\n[Phase 5/6] 深度采集用户信息...")
+    if max_users is None:
+        max_users = max(1, int(getattr(config, "PROFILE_DEEP_MAX_USERS", 100)))
 
     # 筛选需要采集的用户（有UID且置信度 acceptable）
     uids_to_collect = []
@@ -1071,7 +1074,8 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
 
     # 阶段5: 用户采集（组合池透明接管风控轮换）
     user_data_map = timer.run("阶段5 用户采集", phase_collect_users, resolved, pool,
-                              max_users=max_users, force=force, cache_only=skip_collect)
+                              max_users=max_users if max_users is not None else getattr(config, "PROFILE_DEEP_MAX_USERS", 100),
+                              force=force, cache_only=skip_collect)
 
     # 阶段6: 画像分析（评论IP属地/本视频评论/问题弹幕在此贯通进画像）
     profiles = timer.run("阶段6 画像分析", phase_analyze, resolved, spam_results, user_data_map,

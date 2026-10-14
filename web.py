@@ -1569,6 +1569,49 @@ def _truncate(text: str, limit: int = 80) -> str:
 
 # ========== 隐藏信息开关（Cookie mask=1，全站展示层遮蔽昵称/UID） ==========
 
+def _light_user_cards(bvid: str, profiles: list, mask: bool, fp: set) -> str:
+    """未生成深度画像的已解析用户展示本视频发言，只读数据库，不补采。"""
+    covered = {p.get("uid") for p in profiles}
+    grouped = {}
+    for sender in load_senders(bvid):
+        uid = sender.get("uid")
+        if not uid or uid in covered:
+            continue
+        item = grouped.setdefault(uid, {"sender": sender, "contents": [], "count": 0})
+        item["contents"].extend(sender.get("contents") or [])
+        item["count"] += sender.get("danmaku_count", 0)
+    if not grouped:
+        return ""
+    comments = {}
+    for comment in load_comments(bvid):
+        if comment["uid"] in grouped:
+            comments.setdefault(comment["uid"], []).append(comment)
+    result = []
+    for uid, item in sorted(grouped.items(), key=lambda pair: pair[1]["count"], reverse=True):
+        sender = item["sender"]
+        record = sender.get("resolution") or {}
+        card = (record.get("candidate_cards") or {}).get(str(uid)) or {}
+        replies = comments.get(uid, [])
+        name = card.get("name") or next((c.get("uname") for c in replies if c.get("uname")), None) or f"用户 {uid}"
+        shown_name = _mask_name(name) if mask else name
+        shown_uid = _mask_uid(uid) if mask else uid
+        linkable = uid_linkable({"uid": uid, "resolve_method": sender.get("method"), "_resolution": record})
+        tag = "a" if linkable else "div"
+        attrs = f' href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener noreferrer"' if linkable else ""
+        texts = list(dict.fromkeys(item["contents"]))[:10]
+        replies = replies[:10]
+        dm = "".join(f"<li>{esc(text)}</li>" for text in texts)
+        cmt = "".join(f"<li>{esc(mask_reply_prefix(c['content'], mask, _mask_name))}</li>" for c in replies)
+        spam = "低" if ("spam", sender["mid_hash"]) in fp else sender.get("spam_level", "低")
+        result.append(f'''<article class="user-card light-user-card" id="uid-{uid}"
+            data-danmaku-count="{item['count']}" data-spam="{esc(spam)}" data-spam-score="{sender.get('spam_score', 0)}">
+            <{tag}{attrs} class="light-user-link"><strong class="username">{esc(shown_name)}</strong>
+            <span class="uid">UID:{esc(shown_uid)}</span><span>未深度采集 · 弹幕 {item['count']} 条 · 评论 {len(replies)} 条</span>
+            <h4>弹幕</h4><ul>{dm or '<li>无弹幕记录</li>'}</ul>
+            <h4>评论</h4><ul>{cmt or '<li>本视频已采评论中无记录</li>'}</ul></{tag}></article>''')
+    return "".join(result)
+
+
 def _mask_on() -> bool:
     """隐藏信息开关是否开启（Cookie mask=1）；无请求上下文（后台线程/直调）时不遮蔽"""
     try:
@@ -2511,8 +2554,9 @@ def video_page(bvid: str):
     profiles = sort_profiles_by_risk(profiles)
     stats = generate_summary_stats(profiles)
     chart = generate_chart_data(profiles)
-    cards_html = "".join(generate_user_card(p, mask=mask, mask_name=_mask_name) for p in profiles) \
-        or '<p class="empty-note">暂无画像数据</p>'
+    cards_html = "".join(generate_user_card(p, mask=mask, mask_name=_mask_name) for p in profiles)
+    cards_html += _light_user_cards(bvid, profiles, mask, fp)
+    cards_html = cards_html or '<p class="empty-note">暂无已解析用户数据</p>'
     hot_tab = _hot_comments_html(bvid, row["aid"], fp_cmt)   # 高回复评论页（潜在争执热点）
     attack_tab = _attack_focus_tab_html(bvid, fp_cmt)        # 争执焦点页（谁攻击谁+连线）
     cmtwar_tab = _cmt_war_html(bvid, row["aid"], fp_cmt)     # 问题评论榜（热度加权）

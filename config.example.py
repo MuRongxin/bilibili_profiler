@@ -212,6 +212,7 @@ SPAM_MEDIUM_THRESHOLD = (3, 0.5)   # (弹幕数, 重复率)：>2 条且半数重
 # 动态定员（兴趣命中者全进，仅超上限才按兴趣分截断）：上限随视频发送者规模浮动——
 # 小视频保底 FLOOR，大视频按独立发送者数 × RATIO 上浮，HARD_CAP 为防爆绝对天花板
 ANALYZE_USERS_FLOOR = 300        # 保底名额（小视频的默认上限）
+PROFILE_DEEP_MAX_USERS = 100     # 常规报告默认深度采集人数，其余已解析用户展示发言长条卡片
 ANALYZE_USERS_RATIO = 0.05       # 上限 = max(FLOOR, 独立发送者数 × 该比例)
 MAX_ANALYZE_USERS_HARD_CAP = 1000  # 绝对上限（保险丝；采集成本与风控暴露的硬约束）
 
